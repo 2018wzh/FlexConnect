@@ -1,6 +1,6 @@
 param(
   [string]$BinDir = "dist\windows",
-  [string]$ServiceName = "FlexConnectD",
+  [string]$ServiceName = "FlexConnect",
   [string]$SocketPath = "",
   [string]$StatePath = ""
 )

@@ -13,6 +13,9 @@ import (
 )
 
 func ensureElevated() error {
+	if isWindowsService() {
+		return nil
+	}
 	if os.Getenv("FLEXCONNECTD_NO_ELEVATE") == "1" {
 		return nil
 	}

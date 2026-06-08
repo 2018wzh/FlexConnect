@@ -1,5 +1,5 @@
 param(
-  [string]$ServiceName = "FlexConnectD"
+  [string]$ServiceName = "FlexConnect"
 )
 
 $ErrorActionPreference = "Stop"

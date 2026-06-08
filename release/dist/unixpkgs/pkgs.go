@@ -105,10 +105,10 @@ func buildLinuxPackage(b *dist.Build, pkgType, goarch string) ([]string, error) 
 		Arch:        linuxPkgArch(pkgType, goarch),
 		Platform:    "linux",
 		Version:     b.Version,
-		Maintainer:  "FlexConnect Maintainers <maintainers@flexconnect.local>",
-		Description: "Cross-platform AnyConnect client with daemon, CLI, and tray",
-		Homepage:    "https://example.invalid/flexconnect",
-		License:     "Proprietary",
+		Maintainer:  "2018wzh <wzh20070720@outlook.com>",
+		Description: "Flexible Cross-platform AnyConnect client",
+		Homepage:    "https://github.com/2018wzh/flexconnect",
+		License:     "MIT",
 		Overridables: nfpm.Overridables{
 			Contents: contents,
 			Scripts: nfpm.Scripts{

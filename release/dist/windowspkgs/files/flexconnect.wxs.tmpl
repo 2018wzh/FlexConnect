@@ -1,5 +1,5 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="FlexConnect" Manufacturer="FlexConnect" Version="{{ .Version }}" UpgradeCode="{{ .UpgradeCode }}">
+  <Package Name="FlexConnect" Manufacturer="2018wzh" Version="{{ .Version }}" UpgradeCode="{{ .UpgradeCode }}">
     <MajorUpgrade DowngradeErrorMessage="A newer version of FlexConnect is already installed." />
     <MediaTemplate />
     <Icon Id="FlexIcon.ico" SourceFile="{{ .IconPath }}" />
@@ -9,21 +9,44 @@
     </Feature>
   </Package>
   <Fragment>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="FlexConnect">
+        <Component Id="cmpStartMenuShortcut" Guid="*">
+          <Shortcut
+            Id="scFlexTray"
+            Name="FlexConnect"
+            Description="Launch FlexConnect tray"
+            Target="[#filFlexTray]"
+            WorkingDirectory="INSTALLDIR" />
+          <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\FlexConnect" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+  </Fragment>
+  <Fragment>
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLDIR" Name="FlexConnect">
-        <Component Id="cmpFlexConnectd" Guid="*">
-          <File Source="{{ .FlexConnectD }}" KeyPath="yes" />
-          <ServiceInstall Id="svcFlexConnectd" Name="FlexConnectD" DisplayName="FlexConnectD" Description="FlexConnect daemon" Start="auto" Type="ownProcess" ErrorControl="normal" />
-          <ServiceControl Id="ctlFlexConnectd" Name="FlexConnectD" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <Component Id="cmpFlexConnectd" Guid="*" Bitness="always64">
+          <File Id="filFlexConnectD" Source="{{ .FlexConnectD }}" KeyPath="yes" />
+          <ServiceInstall Id="svcFlexConnectd" Name="FlexConnect" DisplayName="FlexConnect" Description="FlexConnect daemon" Start="auto" Type="ownProcess" ErrorControl="normal" />
+          <ServiceControl Id="ctlFlexConnectd" Name="FlexConnect" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
         </Component>
-        <Component Id="cmpFlexConnect" Guid="*">
-          <File Source="{{ .FlexConnect }}" KeyPath="yes" />
+        <Component Id="cmpFlexConnect" Guid="*" Bitness="always64">
+          <File Id="filFlexConnect" Source="{{ .FlexConnect }}" KeyPath="yes" />
+          <Environment
+            Id="envFlexConnectPath"
+            Action="set"
+            Name="PATH"
+            Part="last"
+            System="yes"
+            Value="[INSTALLDIR]" />
         </Component>
-        <Component Id="cmpFlexTray" Guid="*">
-          <File Source="{{ .FlexTray }}" KeyPath="yes" />
+        <Component Id="cmpFlexTray" Guid="*" Bitness="always64">
+          <File Id="filFlexTray" Source="{{ .FlexTray }}" KeyPath="yes" />
         </Component>
-        <Component Id="cmpWintun" Guid="*">
-          <File Source="{{ .WintunDLL }}" KeyPath="yes" />
+        <Component Id="cmpWintun" Guid="*" Bitness="always64">
+          <File Id="filWintun" Source="{{ .WintunDLL }}" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
@@ -34,6 +57,7 @@
       <ComponentRef Id="cmpFlexConnect" />
       <ComponentRef Id="cmpFlexTray" />
       <ComponentRef Id="cmpWintun" />
+      <ComponentRef Id="cmpStartMenuShortcut" />
     </ComponentGroup>
   </Fragment>
 </Wix>

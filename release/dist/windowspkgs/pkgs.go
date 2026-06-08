@@ -79,7 +79,7 @@ func (t *msiTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, err
 	}
 
-	cmd := exec.Command("wix", "build", wxsPath, "-o", msiPath)
+	cmd := exec.Command("wix", "build", "-arch", "x64", wxsPath, "-o", msiPath)
 	cmd.Dir = workDir
 	if b.Verbose {
 		cmd.Stdout = os.Stdout

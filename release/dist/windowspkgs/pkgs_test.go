@@ -93,3 +93,60 @@ func TestRenderWXSUsesCustomUpgradeCode(t *testing.T) {
 		t.Fatalf("expected version in template output, got %q", string(got))
 	}
 }
+
+func TestRenderWXSIncludesStartMenuShortcut(t *testing.T) {
+	repo := t.TempDir()
+	tmplDir := filepath.Join(repo, "release", "dist", "windowspkgs", "files")
+	if err := os.MkdirAll(tmplDir, 0o755); err != nil {
+		t.Fatalf("mkdir template dir: %v", err)
+	}
+	templateBody := `
+ShortcutTarget=[#filFlexTray]
+ProgramsFolder=ApplicationProgramsFolder
+RegistryKey=Software\FlexConnect
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "flexconnect.wxs.tmpl"), []byte(templateBody), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+
+	build := &dist.Build{Repo: repo, Version: "1.2.3"}
+	got, err := renderWXS(build, dist.CommonArtifacts{})
+	if err != nil {
+		t.Fatalf("renderWXS error: %v", err)
+	}
+	if !bytes.Contains(got, []byte("[#filFlexTray]")) {
+		t.Fatalf("expected start menu shortcut target in template output, got %q", string(got))
+	}
+	if !bytes.Contains(got, []byte("ApplicationProgramsFolder")) {
+		t.Fatalf("expected program menu folder in template output, got %q", string(got))
+	}
+}
+
+func TestRenderWXSIncludesPathEnvironment(t *testing.T) {
+	repo := t.TempDir()
+	tmplDir := filepath.Join(repo, "release", "dist", "windowspkgs", "files")
+	if err := os.MkdirAll(tmplDir, 0o755); err != nil {
+		t.Fatalf("mkdir template dir: %v", err)
+	}
+	templateBody := `
+EnvName=PATH
+EnvValue=[INSTALLDIR]
+EnvSystem=yes
+EnvPart=last
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "flexconnect.wxs.tmpl"), []byte(templateBody), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+
+	build := &dist.Build{Repo: repo, Version: "1.2.3"}
+	got, err := renderWXS(build, dist.CommonArtifacts{})
+	if err != nil {
+		t.Fatalf("renderWXS error: %v", err)
+	}
+	if !bytes.Contains(got, []byte("EnvName=PATH")) {
+		t.Fatalf("expected PATH environment entry in template output, got %q", string(got))
+	}
+	if !bytes.Contains(got, []byte("EnvValue=[INSTALLDIR]")) {
+		t.Fatalf("expected INSTALLDIR environment value in template output, got %q", string(got))
+	}
+}
