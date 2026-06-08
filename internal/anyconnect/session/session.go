@@ -8,10 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"go.uber.org/atomic"
 	"flexconnect/internal/anyconnect/base"
 	"flexconnect/internal/anyconnect/proto"
 	"flexconnect/internal/anyconnect/utils"
+	"flexconnect/internal/osnet"
+	"go.uber.org/atomic"
 )
 
 var (
@@ -37,16 +38,16 @@ type stat struct {
 type ConnSession struct {
 	Sess *Session `json:"-"`
 
-	ServerAddress string
-	LocalAddress  string
-	Hostname      string
-	TunName       string
-	VPNAddress    string // The IPv4 address of the client
-	VPNMask       string // IPv4 netmask
-	DNS           []string
-	MTU           int
-	SplitInclude  []string
-	SplitExclude  []string
+	ServerAddress            string
+	LocalAddress             string
+	Hostname                 string
+	TunName                  string
+	VPNAddress               string // The IPv4 address of the client
+	VPNMask                  string // IPv4 netmask
+	DNS                      []string
+	MTU                      int
+	SplitInclude             []string
+	SplitExclude             []string
 	UseDefaultRouteWhenEmpty bool
 
 	DynamicSplitTunneling       bool
@@ -54,6 +55,8 @@ type ConnSession struct {
 	DynamicSplitIncludeResolved sync.Map // https://github.com/golang/go/issues/31136
 	DynamicSplitExcludeDomains  []string
 	DynamicSplitExcludeResolved sync.Map
+
+	NetworkManager osnet.Manager `json:"-"`
 
 	TLSCipherSuite    string
 	TLSDpdTime        int // https://datatracker.ietf.org/doc/html/rfc3706
@@ -252,4 +255,3 @@ func (dSess *DtlsSession) Close() {
 		}
 	})
 }
-

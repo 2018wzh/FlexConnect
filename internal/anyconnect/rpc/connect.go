@@ -1,13 +1,14 @@
 package rpc
 
 import (
+	"context"
 	"strings"
 
 	"flexconnect/internal/anyconnect/auth"
 	"flexconnect/internal/anyconnect/base"
 	"flexconnect/internal/anyconnect/session"
 	acvpn "flexconnect/internal/anyconnect/tunnel"
-	"flexconnect/internal/anyconnect/utils/vpnc"
+	"flexconnect/internal/osnet"
 )
 
 // Connect 调用之前必须由前端填充 auth.Prof，建议填充 base.Interface
@@ -33,7 +34,7 @@ func SetupTunnel(reconnect bool) error {
 	// 为适应复杂网络环境，必须能够感知网卡变化，建议由前端获取当前网络信息发送过来，而不是登陆前由 Go 处理
 	// 断网重连时网卡信息可能已经变化，所以建立隧道时重新获取网卡信息
 	if reconnect && !auth.Prof.Initialized {
-		err := vpnc.GetLocalInterface()
+		err := refreshLocalInterface()
 		if err != nil {
 			base.Error("reconnect get local interface failed:", err)
 			return err
@@ -51,7 +52,7 @@ func prepareConnection() error {
 	}
 	if !auth.Prof.Initialized {
 		base.Info("prepare connection: fetch local interface")
-		err := vpnc.GetLocalInterface()
+		err := refreshLocalInterface()
 		if err != nil {
 			base.Error("prepare connection failed to get local interface:", err)
 			return err
@@ -69,7 +70,21 @@ func DisConnect() {
 		auth.Conn = nil
 	}
 	if session.Sess.CSess != nil {
-		vpnc.ResetRoutes(session.Sess.CSess) // 蛋疼的循环引用
+		if session.Sess.CSess.NetworkManager != nil {
+			_ = session.Sess.CSess.NetworkManager.Close(context.Background())
+		}
 		session.Sess.CSess.Close()
 	}
+}
+
+func refreshLocalInterface() error {
+	info, err := osnet.GetLocalInterface(context.Background())
+	if err != nil {
+		return err
+	}
+	base.LocalInterface.Name = info.Name
+	base.LocalInterface.Ip4 = info.IP4
+	base.LocalInterface.Mac = info.MAC
+	base.LocalInterface.Gateway = info.Gateway
+	return nil
 }

@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"flexconnect/internal/anyconnect/base"
 	"flexconnect/internal/anyconnect/session"
 	"flexconnect/internal/anyconnect/utils"
-	"flexconnect/internal/anyconnect/utils/vpnc"
 )
 
 var (
@@ -111,12 +111,21 @@ func SetupTunnel() error {
 	}
 	base.Info("tun created", "name", cSess.TunName, "mtu", cSess.MTU, "dtlsPort", cSess.DTLSPort)
 
-	// 为了靠谱，不再异步设置，路由多的话可能要等等
-	err = vpnc.SetRoutes(cSess)
+	netCfg, err := buildOSNetConfig(cSess)
 	if err != nil {
 		auth.Conn.Close()
 		cSess.Close()
-		base.Error("set routes failed:", err)
+		base.Error("build network config failed:", err)
+		return err
+	}
+	err = cSess.NetworkManager.Set(context.Background(), netCfg)
+	if err != nil {
+		auth.Conn.Close()
+		if cSess.NetworkManager != nil {
+			_ = cSess.NetworkManager.Close(context.Background())
+		}
+		cSess.Close()
+		base.Error("set network config failed:", err)
 		return err
 	}
 	base.Info("tls channel negotiation succeeded", "remote", cSess.ServerAddress, "port", auth.Prof.HostWithPort)

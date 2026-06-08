@@ -9,14 +9,13 @@ require (
 	github.com/gen2brain/beeep v0.11.2
 	github.com/gopacket/gopacket v1.5.0
 	github.com/goreleaser/nfpm/v2 v2.10.0
-	github.com/jackpal/gateway v1.2.0
 	github.com/pion/dtls/v3 v3.1.2
+	github.com/tailscale/wireguard-go v0.0.0-20260604164555-58f7aaceb304
 	github.com/vishvananda/netlink v1.3.1
 	github.com/zalando/go-keyring v0.2.8
 	go.uber.org/atomic v1.11.0
-	golang.org/x/net v0.53.0
 	golang.org/x/sys v0.45.0
-	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
+	golang.zx2c4.com/wireguard/windows v0.5.3
 )
 
 require (
@@ -60,11 +59,14 @@ require (
 	github.com/sergeymakinen/go-bmp v1.0.0 // indirect
 	github.com/sergeymakinen/go-ico v1.0.0 // indirect
 	github.com/sergi/go-diff v1.2.0 // indirect
+	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
 	github.com/ulikunitz/xz v0.5.10 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/xanzy/ssh-agent v0.3.1 // indirect
 	golang.org/x/crypto v0.50.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

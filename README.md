@@ -110,5 +110,5 @@ flexconnect logs
 - `scripts/`：构建、打包、安装和运行脚本
 
 ## Credits
-* [Tailscale](https://tailscale.com/) - 设计灵感和架构参考
+* [Tailscale](https://tailscale.com/) - 架构参考与实现参考
 * [sslcon](https://github.com/tlslink/sslcon) - AnyConnect 协议实现参考
