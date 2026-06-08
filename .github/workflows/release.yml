@@ -40,7 +40,7 @@ jobs:
           go run ./cmd/dist build \
             --version "${{ steps.version.outputs.value }}" \
             --verbose \
-            --manifest dist/linux-manifest.txt \
+            --manifest linux-manifest.txt \
             linux/amd64/tgz \
             linux/amd64/deb \
             linux/amd64/rpm
@@ -51,7 +51,7 @@ jobs:
         run: |
           {
             echo "paths<<EOF"
-            cat dist/linux-manifest.txt
+            cat linux-manifest.txt
             echo
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -84,7 +84,7 @@ jobs:
       - name: Install WiX CLI
         shell: pwsh
         run: |
-          dotnet tool install --global wix
+          dotnet tool install --global wix --version 6.0.2
           "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Derive release version
@@ -98,7 +98,7 @@ jobs:
           go run ./cmd/dist build \
             --version "${{ steps.version.outputs.value }}" \
             --verbose \
-            --manifest dist/windows-manifest.txt \
+            --manifest windows-manifest.txt \
             windows/amd64/zip \
             windows/amd64/msi
 
@@ -108,7 +108,7 @@ jobs:
         run: |
           {
             echo "paths<<EOF"
-            cat dist/windows-manifest.txt
+            cat windows-manifest.txt
             echo
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -128,7 +128,7 @@ jobs:
       matrix:
         include:
           - goarch: amd64
-            runner: macos-13
+            runner: macos-15-intel
           - goarch: arm64
             runner: macos-latest
 
@@ -152,7 +152,7 @@ jobs:
           go run ./cmd/dist build \
             --version "${{ steps.version.outputs.value }}" \
             --verbose \
-            --manifest dist/macos-manifest.txt \
+            --manifest macos-manifest-${{ matrix.goarch }}.txt \
             darwin/${{ matrix.goarch }}/pkg
 
       - name: Read macOS manifest
@@ -161,7 +161,7 @@ jobs:
         run: |
           {
             echo "paths<<EOF"
-            cat dist/macos-manifest.txt
+            cat macos-manifest-${{ matrix.goarch }}.txt
             echo
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
