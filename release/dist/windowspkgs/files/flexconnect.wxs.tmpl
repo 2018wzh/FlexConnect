@@ -1,0 +1,39 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="FlexConnect" Manufacturer="FlexConnect" Version="{{ .Version }}" UpgradeCode="{{ .UpgradeCode }}">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of FlexConnect is already installed." />
+    <MediaTemplate />
+    <Icon Id="FlexIcon.ico" SourceFile="{{ .IconPath }}" />
+    <Property Id="ARPPRODUCTICON" Value="FlexIcon.ico" />
+    <Feature Id="MainFeature" Title="FlexConnect" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Package>
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="FlexConnect">
+        <Component Id="cmpFlexConnectd" Guid="*">
+          <File Source="{{ .FlexConnectD }}" KeyPath="yes" />
+          <ServiceInstall Id="svcFlexConnectd" Name="FlexConnectD" DisplayName="FlexConnectD" Description="FlexConnect daemon" Start="auto" Type="ownProcess" ErrorControl="normal" />
+          <ServiceControl Id="ctlFlexConnectd" Name="FlexConnectD" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+        <Component Id="cmpFlexConnect" Guid="*">
+          <File Source="{{ .FlexConnect }}" KeyPath="yes" />
+        </Component>
+        <Component Id="cmpFlexTray" Guid="*">
+          <File Source="{{ .FlexTray }}" KeyPath="yes" />
+        </Component>
+        <Component Id="cmpWintun" Guid="*">
+          <File Source="{{ .WintunDLL }}" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+  </Fragment>
+  <Fragment>
+    <ComponentGroup Id="ProductComponents">
+      <ComponentRef Id="cmpFlexConnectd" />
+      <ComponentRef Id="cmpFlexConnect" />
+      <ComponentRef Id="cmpFlexTray" />
+      <ComponentRef Id="cmpWintun" />
+    </ComponentGroup>
+  </Fragment>
+</Wix>

@@ -19,7 +19,7 @@ import (
 	"flexconnect/internal/vpn"
 )
 
-const version = "0.1.0"
+const version = "1.0.0"
 const autoReconnectDelay = 2 * time.Second
 
 var appdDebug bool

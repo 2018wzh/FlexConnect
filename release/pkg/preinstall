@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+mkdir -p /usr/local/var/flexconnect
+mkdir -p /usr/local/var/log
+exit 0

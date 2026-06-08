@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/flexconnectd --socket /var/run/flexconnect.sock --state /var/lib/flexconnect/state.json
+ExecStart=/usr/sbin/flexconnectd --socket /var/run/flexconnect.sock --state /var/lib/flexconnect/state.json
 Restart=on-failure
 RestartSec=5
 

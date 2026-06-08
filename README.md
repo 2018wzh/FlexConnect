@@ -61,13 +61,6 @@ flexconnect logs
 
 ## 构建与安装
 
-### Windows
-
-```powershell
-.\scripts\build-windows.ps1
-.\scripts\package-windows.ps1 -Version 0.1.0
-```
-
 ### Windows 服务
 
 ```powershell
@@ -82,13 +75,20 @@ flexconnect logs
 ./scripts/install-macos.sh
 ```
 
-### Linux 打包
+### 统一打包
 
-```bash
-./scripts/package-linux.sh --version 0.1.0 --type tgz
-./scripts/package-linux.sh --version 0.1.0 --type deb
-./scripts/package-linux.sh --version 0.1.0 --type rpm
+```powershell
+go run .\cmd\dist list
+go run .\cmd\dist build --version 1.0.0 linux/amd64/tgz
+go run .\cmd\dist build --version 1.0.0 linux/amd64/deb
+go run .\cmd\dist build --version 1.0.0 linux/amd64/rpm
+go run .\cmd\dist build --version 1.0.0 windows/amd64/zip
+go run .\cmd\dist build --version 1.0.0 windows/amd64/msi
+go run .\cmd\dist build --version 1.0.0 darwin/amd64/pkg
+go run .\cmd\dist build --version 1.0.0 darwin/arm64/pkg
 ```
+
+推送形如 `v1.0.0` 的 Git tag 后，GitHub Actions 会自动构建这些产物并创建对应的 GitHub Release。
 
 ## 运行与配置
 

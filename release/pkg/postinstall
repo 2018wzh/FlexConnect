@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+PLIST="/Library/LaunchDaemons/com.flexconnect.flexconnectd.plist"
+
+launchctl unload "$PLIST" >/dev/null 2>&1 || true
+launchctl load "$PLIST"
+exit 0

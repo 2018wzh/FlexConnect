@@ -16,7 +16,7 @@ SOCKS5 proxying, and real AnyConnect password-auth sessions.
   - `flexconnect/` is the CLI.
   - `flexconnectd/` is the daemon.
   - `flextray/` is the tray process.
-  - `mkpkg/` builds Linux packages and tarballs.
+  - `dist/` builds release artifacts across Linux, Windows, and macOS.
 - `dist/` is generated packaging output and should not be treated as source.
 - `docs/` contains project audit and acceptance notes.
 - `internal/` contains daemon, API, VPN, routing, IPC, storage, logging, and type code.
@@ -28,7 +28,7 @@ SOCKS5 proxying, and real AnyConnect password-auth sessions.
   - `secret/` stores passwords through the OS keyring or an in-memory test store.
   - `store/file/` persists non-secret profile state as JSON.
   - `vpn/` defines the backend interface and the AnyConnect adapter.
-- `release/` contains Debian and RPM lifecycle scripts.
+- `release/` contains packaging metadata, lifecycle scripts, and release target assets.
 - `scripts/` contains build, packaging, install, smoke-test, and live-test scripts.
   - `launchd/` contains the macOS daemon plist.
   - `systemd/` contains the Linux daemon service unit.
@@ -66,11 +66,17 @@ Build all Go packages:
 go build ./...
 ```
 
-Build Windows artifacts, preserving the documented command sequence:
+Build distribution artifacts through the unified dist entrypoint:
 
 ```powershell
-.\scripts\build-windows.ps1
-.\scripts\package-windows.ps1 -Version 0.1.0
+go run .\cmd\dist list
+go run .\cmd\dist build --version 1.0.0 linux/amd64/tgz
+go run .\cmd\dist build --version 1.0.0 linux/amd64/deb
+go run .\cmd\dist build --version 1.0.0 linux/amd64/rpm
+go run .\cmd\dist build --version 1.0.0 windows/amd64/zip
+go run .\cmd\dist build --version 1.0.0 windows/amd64/msi
+go run .\cmd\dist build --version 1.0.0 darwin/amd64/pkg
+go run .\cmd\dist build --version 1.0.0 darwin/arm64/pkg
 ```
 
 Install or remove the Windows service:
@@ -85,14 +91,6 @@ Install Linux or macOS service templates after building binaries into `bin/`:
 ```bash
 ./scripts/install-linux.sh
 ./scripts/install-macos.sh
-```
-
-Package Linux artifacts:
-
-```bash
-./scripts/package-linux.sh --version 0.1.0 --type tgz
-./scripts/package-linux.sh --version 0.1.0 --type deb
-./scripts/package-linux.sh --version 0.1.0 --type rpm
 ```
 
 Run unit and integration tests:
@@ -244,7 +242,7 @@ go test ./...
 > TODO: Add a dependency-vulnerability workflow such as `govulncheck` and document the expected
 > remediation process.
 
-- `cmd/mkpkg` marks Linux package metadata as `Proprietary`; no root `LICENSE` file was found.
+- `cmd/dist` marks Linux package metadata as `Proprietary`; no root `LICENSE` file was found.
 
 > TODO: Add or link the authoritative project license before external distribution.
 
@@ -280,7 +278,7 @@ go test ./...
   the CLI or tray callers.
 - Add CLI commands under `cmd/flexconnect` and keep help text in sync with behavior.
 - Add tray behavior in `client/systray`, using existing status, diagnostics, and watch flows.
-- Add package formats or install behavior through `cmd/mkpkg`, `scripts/`, and `release/`.
+- Add package formats or install behavior through `cmd/dist`, `release/dist`, `scripts/`, and `release/`.
 - Useful flags and environment variables:
   - `--socket` selects the daemon socket or named pipe for daemon, CLI, and tray.
   - `--state` selects the daemon state file.
@@ -290,8 +288,8 @@ go test ./...
   - `FLEXCONNECT_ENV_FILE` points the live test at an env file.
   - `FLEXCONNECT_LIVE_ELEVATED` is used by the live-test elevation wrapper.
   - `SOCKET_PATH` and `STATE_PATH` customize Unix smoke-test paths.
-  - `GOARCH` and `OUTDIR` customize Linux packaging.
-  - `PREFIX`, `SYSTEMD_DIR`, and `PLIST_TARGET` customize install locations.
+  - `--version` and `--out` customize `cmd/dist build` output.
+  - `SYSTEMD_DIR` and `PLIST_TARGET` customize install locations.
 
 > TODO: No feature-flag system was found. Add one before introducing runtime feature toggles.
 

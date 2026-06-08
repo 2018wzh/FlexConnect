@@ -9,6 +9,10 @@
 # Build outputs
 bin/
 dist/
+!cmd/dist/
+!cmd/dist/**
+!release/dist/
+!release/dist/**
 *.log
 *.exe
 *.dll

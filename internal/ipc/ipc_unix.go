@@ -9,7 +9,7 @@ import (
 )
 
 func DefaultSocketPath() string {
-	return "/var/lib/flexconnectd.sock"
+	return "/var/run/flexconnect.sock"
 }
 
 func Listen(path string) (net.Listener, error) {
@@ -21,4 +21,3 @@ func DialContext(ctx context.Context, path string) (net.Conn, error) {
 	var d net.Dialer
 	return d.DialContext(ctx, "unix", path)
 }
-
