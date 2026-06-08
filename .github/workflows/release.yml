@@ -39,6 +39,7 @@ jobs:
         run: |
           go run ./cmd/dist build \
             --version "${{ steps.version.outputs.value }}" \
+            --verbose \
             --manifest dist/linux-manifest.txt \
             linux/amd64/tgz \
             linux/amd64/deb \
@@ -51,6 +52,7 @@ jobs:
           {
             echo "paths<<EOF"
             cat dist/linux-manifest.txt
+            echo
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -95,6 +97,7 @@ jobs:
         run: |
           go run ./cmd/dist build \
             --version "${{ steps.version.outputs.value }}" \
+            --verbose \
             --manifest dist/windows-manifest.txt \
             windows/amd64/zip \
             windows/amd64/msi
@@ -106,6 +109,7 @@ jobs:
           {
             echo "paths<<EOF"
             cat dist/windows-manifest.txt
+            echo
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -117,8 +121,16 @@ jobs:
           path: ${{ steps.manifest.outputs.paths }}
 
   build-macos:
-    name: Build macOS Packages
-    runs-on: macos-latest
+    name: Build macOS Packages (${{ matrix.goarch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            runner: macos-13
+          - goarch: arm64
+            runner: macos-latest
 
     steps:
       - name: Check out repository
@@ -139,9 +151,9 @@ jobs:
         run: |
           go run ./cmd/dist build \
             --version "${{ steps.version.outputs.value }}" \
+            --verbose \
             --manifest dist/macos-manifest.txt \
-            darwin/amd64/pkg \
-            darwin/arm64/pkg
+            darwin/${{ matrix.goarch }}/pkg
 
       - name: Read macOS manifest
         id: manifest
@@ -150,13 +162,14 @@ jobs:
           {
             echo "paths<<EOF"
             cat dist/macos-manifest.txt
+            echo
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-release-assets
+          name: macos-release-assets-${{ matrix.goarch }}
           if-no-files-found: error
           path: ${{ steps.manifest.outputs.paths }}
 

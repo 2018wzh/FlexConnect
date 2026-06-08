@@ -16,6 +16,7 @@ dist/
 *.log
 *.exe
 *.dll
+!assets/windows/wintun.dll
 *.msi
 *.deb
 *.rpm

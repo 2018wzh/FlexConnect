@@ -236,7 +236,11 @@ func (b *Build) WriteManifest(path string, files []string) error {
 		}
 		lines = append(lines, rel)
 	}
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
+	data := strings.Join(lines, "\n")
+	if len(lines) > 0 {
+		data += "\n"
+	}
+	return os.WriteFile(path, []byte(data), 0o644)
 }
 
 func FilterTargets(targets []Target, filters []string) ([]Target, error) {
