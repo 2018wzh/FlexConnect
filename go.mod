@@ -15,6 +15,7 @@ require (
 	github.com/zalando/go-keyring v0.2.8
 	go.uber.org/atomic v1.11.0
 	golang.org/x/sys v0.45.0
+	golang.org/x/term v0.42.0
 	golang.zx2c4.com/wireguard/windows v0.5.3
 )
 

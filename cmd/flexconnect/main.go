@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -16,9 +17,15 @@ import (
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
 	"flexconnect/internal/types"
+	"golang.org/x/term"
 )
 
 var verbose bool
+var (
+	cliIn  io.Reader = os.Stdin
+	cliOut io.Writer = os.Stdout
+	cliErr io.Writer = os.Stderr
+)
 
 type helpTopic struct {
 	Name        string
@@ -47,25 +54,25 @@ func main() {
 	flag.Parse()
 	verbose = parsedVerbose || *verboseShort || *verboseLong
 	local.SetDebug(verbose)
-	logging.Init(os.Stderr, condLevel(verbose), true)
+	logging.Init(cliErr, condLevel(verbose), true)
 	args := flag.Args()
 	debugf("socket=%q verbose=%t args=%v", *socket, verbose, args)
 	if len(args) == 0 || isHelpArg(args[0]) {
-		_, _ = io.WriteString(os.Stdout, rootHelp())
+		_, _ = io.WriteString(cliOut, rootHelp())
 		return
 	}
 	client := &local.Client{Socket: *socket}
 	runCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := run(runCtx, client, args); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(cliErr, err)
 		os.Exit(1)
 	}
 }
 
 func run(ctx context.Context, client *local.Client, args []string) error {
 	if len(args) == 0 {
-		_, err := io.WriteString(os.Stdout, rootHelp())
+		_, err := io.WriteString(cliOut, rootHelp())
 		return err
 	}
 	debugf("run command=%q args=%v", args[0], args)
@@ -87,7 +94,7 @@ func run(ctx context.Context, client *local.Client, args []string) error {
 			return printJSON(status)
 		}
 		profiles, _ := client.Profiles(ctx)
-		_, err = io.WriteString(os.Stdout, formatStatusWithProfiles(status, profiles))
+		_, err = io.WriteString(cliOut, formatStatusWithProfiles(status, profiles))
 		return err
 	case "login":
 		debugf("handling login args=%v", args)
@@ -141,7 +148,7 @@ func run(ctx context.Context, client *local.Client, args []string) error {
 				return err
 			}
 			debugf("diagnostics wrote to %q bytes=%d", path, len(data))
-			_, err = fmt.Fprintf(os.Stdout, "Wrote diagnostics to %s\n", path)
+			_, err = fmt.Fprintf(cliOut, "Wrote diagnostics to %s\n", path)
 			return err
 		}
 		debugf("diagnostics status=%q current=%q connected=%q profiles=%d logs=%d routes=%d",
@@ -184,7 +191,14 @@ func run(ctx context.Context, client *local.Client, args []string) error {
 
 func runLogin(ctx context.Context, client *local.Client, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("run `flexconnect login` to add a connection")
+		req, err := promptLoginRequest(cliIn, cliOut)
+		if err != nil {
+			return err
+		}
+		if err := client.Login(ctx, req); err != nil {
+			return err
+		}
+		return printCurrentStatus(ctx, client)
 	}
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -212,6 +226,89 @@ func runLogin(ctx context.Context, client *local.Client, args []string) error {
 		return err
 	}
 	return printCurrentStatus(ctx, client)
+}
+
+func promptLoginRequest(in io.Reader, out io.Writer) (types.LoginRequest, error) {
+	reader := bufio.NewReader(in)
+	server, err := promptRequiredValue(reader, out, "Server URL")
+	if err != nil {
+		return types.LoginRequest{}, err
+	}
+	user, err := promptRequiredValue(reader, out, "Username")
+	if err != nil {
+		return types.LoginRequest{}, err
+	}
+	password, err := promptSecretValue(reader, in, out, "Password")
+	if err != nil {
+		return types.LoginRequest{}, err
+	}
+	name, err := promptValue(reader, out, "Profile name", true)
+	if err != nil {
+		return types.LoginRequest{}, err
+	}
+	group, err := promptValue(reader, out, "VPN group", true)
+	if err != nil {
+		return types.LoginRequest{}, err
+	}
+	return types.LoginRequest{
+		Name:      name,
+		ServerURL: server,
+		Username:  user,
+		Group:     group,
+		Password:  password,
+	}, nil
+}
+
+func promptRequiredValue(reader *bufio.Reader, out io.Writer, label string) (string, error) {
+	for {
+		value, err := promptValue(reader, out, label, false)
+		if err != nil {
+			return "", err
+		}
+		if value != "" {
+			return value, nil
+		}
+		if _, err := fmt.Fprintf(out, "%s is required.\n", label); err != nil {
+			return "", err
+		}
+	}
+}
+
+func promptValue(reader *bufio.Reader, out io.Writer, label string, optional bool) (string, error) {
+	suffix := ""
+	if optional {
+		suffix = " (optional)"
+	}
+	if _, err := fmt.Fprintf(out, "%s%s: ", label, suffix); err != nil {
+		return "", err
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	value := strings.TrimSpace(line)
+	if err == io.EOF && value == "" {
+		return "", io.ErrUnexpectedEOF
+	}
+	return value, nil
+}
+
+func promptSecretValue(reader *bufio.Reader, in io.Reader, out io.Writer, label string) (string, error) {
+	file, ok := in.(*os.File)
+	if !ok || !term.IsTerminal(int(file.Fd())) {
+		return promptValue(reader, out, label, false)
+	}
+	if _, err := fmt.Fprintf(out, "%s: ", label); err != nil {
+		return "", err
+	}
+	line, err := term.ReadPassword(int(file.Fd()))
+	if _, writeErr := fmt.Fprintln(out); writeErr != nil && err == nil {
+		err = writeErr
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(line)), nil
 }
 
 func runUp(ctx context.Context, client *local.Client, args []string) error {
@@ -546,10 +643,10 @@ func runProxy(ctx context.Context, client *local.Client, args []string) error {
 			return err
 		}
 		if status.SOCKS5Enabled {
-			_, err = fmt.Fprintf(os.Stdout, "SOCKS5: enabled on %s\n", status.SOCKS5Listen)
+			_, err = fmt.Fprintf(cliOut, "SOCKS5: enabled on %s\n", status.SOCKS5Listen)
 			return err
 		}
-		_, err = fmt.Fprintln(os.Stdout, "SOCKS5: disabled")
+		_, err = fmt.Fprintln(cliOut, "SOCKS5: disabled")
 		return err
 	case "enable":
 		debugf("proxy enable args=%v", args)
@@ -632,14 +729,14 @@ func hasJSONFlag(args []string) bool {
 
 func mustArg(args []string, index int, label string) string {
 	if len(args) <= index {
-		fmt.Fprintf(os.Stderr, "missing %s\n", label)
+		fmt.Fprintf(cliErr, "missing %s\n", label)
 		os.Exit(2)
 	}
 	return args[index]
 }
 
 func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(cliOut)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }
@@ -650,7 +747,7 @@ func printCurrentStatus(ctx context.Context, client *local.Client) error {
 		return err
 	}
 	profiles, _ := client.Profiles(ctx)
-	_, err = io.WriteString(os.Stdout, formatStatusWithProfiles(status, profiles))
+	_, err = io.WriteString(cliOut, formatStatusWithProfiles(status, profiles))
 	return err
 }
 
@@ -710,7 +807,7 @@ func formatStatusWithProfiles(status *types.Status, profiles []types.Profile) st
 }
 
 func usage() {
-	_, _ = io.WriteString(os.Stdout, rootHelp())
+	_, _ = io.WriteString(cliOut, rootHelp())
 }
 
 func isHelpArg(arg string) bool {
@@ -723,7 +820,7 @@ func wantCommandHelp(args []string) bool {
 
 func printHelpTopic(path []string) error {
 	if len(path) == 0 {
-		_, err := io.WriteString(os.Stdout, rootHelp())
+		_, err := io.WriteString(cliOut, rootHelp())
 		return err
 	}
 	return printNamedHelp(strings.Join(path, " "))
@@ -734,7 +831,7 @@ func printNamedHelp(name string) error {
 	if !ok {
 		return fmt.Errorf("unknown help topic: %s", name)
 	}
-	_, err := io.WriteString(os.Stdout, renderHelpTopic(topic))
+	_, err := io.WriteString(cliOut, renderHelpTopic(topic))
 	return err
 }
 
@@ -812,6 +909,7 @@ func rootHelpTopic() helpTopic {
 		},
 		Examples: []string{
 			"flexconnect status",
+			"flexconnect login",
 			"flexconnect login --server https://vpn.example.com --user alice --password secret --name corp",
 			"flexconnect up",
 			"flexconnect up -p corp",
@@ -833,8 +931,9 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 		"login": {
 			Name:        "login",
 			Usage:       "flexconnect login [--server <url> --user <username> --password <password> --name <profile-name> --group <group>]",
-			Description: "Create or update a profile, log in, and keep it as the last used profile.",
+			Description: "Create or update a profile, log in, and keep it as the last used profile. With no flags, prompts for the connection details interactively.",
 			Examples: []string{
+				"flexconnect login",
 				"flexconnect login --server https://vpn.example.com --user alice --password secret --name corp",
 			},
 		},
