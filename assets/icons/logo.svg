@@ -1,23 +1,26 @@
-<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+<svg width="512" height="128" viewBox="0 0 512 128" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="fc-gradient" x1="112" y1="96" x2="400" y2="392" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#2DB4D7"/>
-      <stop offset="0.55" stop-color="#1D95CF"/>
-      <stop offset="1" stop-color="#59D184"/>
+    <linearGradient id="fc-gradient" x1="0" y1="0" x2="512" y2="128" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#00F2FE"/>
+      <stop offset="0.5" stop-color="#4FACFE"/>
+      <stop offset="1" stop-color="#00FF87"/>
     </linearGradient>
   </defs>
-  <g transform="translate(52 52)" stroke="url(#fc-gradient)" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="204" cy="204" r="170" stroke-width="16"/>
-    <path d="M34 204H374" stroke-width="14"/>
-    <path d="M68 122C114 156 294 156 340 122" stroke-width="12"/>
-    <path d="M68 286C114 252 294 252 340 286" stroke-width="12"/>
-    <path d="M204 34V374" stroke-width="14"/>
-    <path d="M126 52C170 102 182 306 126 356" stroke-width="12"/>
-    <path d="M282 52C238 102 226 306 282 356" stroke-width="12"/>
-    <circle cx="204" cy="34" r="14" fill="url(#fc-gradient)" stroke="none"/>
-    <circle cx="204" cy="204" r="16" fill="url(#fc-gradient)" stroke="none"/>
-    <circle cx="204" cy="374" r="14" fill="url(#fc-gradient)" stroke="none"/>
-    <circle cx="34" cy="204" r="14" fill="url(#fc-gradient)" stroke="none"/>
-    <circle cx="374" cy="204" r="14" fill="url(#fc-gradient)" stroke="none"/>
+  <!-- Logo Icon on the left -->
+  <g transform="translate(64 64) scale(0.24)">
+    <circle cx="0" cy="0" r="200" stroke="url(#fc-gradient)" stroke-width="24" fill="none"/>
+    <g stroke="url(#fc-gradient)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <path d="M 0 0 L 0 -96 Q 120 -96 173.2 100" />
+      <path d="M 0 0 L 0 -96 Q 120 -96 173.2 100" transform="rotate(120)" />
+      <path d="M 0 0 L 0 -96 Q 120 -96 173.2 100" transform="rotate(240)" />
+    </g>
+    <g fill="url(#fc-gradient)" stroke="none">
+      <circle cx="0" cy="-200" r="16" />
+      <circle cx="0" cy="-200" r="16" transform="rotate(120)" />
+      <circle cx="0" cy="-200" r="16" transform="rotate(240)" />
+      <circle cx="0" cy="0" r="24" />
+    </g>
   </g>
+  <!-- Logo Text on the right -->
+  <text x="136" y="80" fill="url(#fc-gradient)" font-family="Inter, system-ui, -apple-system, sans-serif" font-size="48" font-weight="800" letter-spacing="-0.03em">FlexConnect</text>
 </svg>

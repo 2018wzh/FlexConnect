@@ -17,7 +17,7 @@ $trayPackageDir = Join-Path $root "cmd\flextray"
 $traySyso = Join-Path $trayPackageDir "flextray_windows_amd64.syso"
 
 if (-not (Test-Path $trayIcon)) {
-  throw "Missing tray icon source at $trayIcon. Run .\\scripts\\generate-icons.ps1 first."
+  throw "Missing tray icon source at $trayIcon. Run go run .\scripts\generate-icons.go first."
 }
 
 Push-Location $trayPackageDir

@@ -6,8 +6,8 @@ This directory contains the current FlexConnect brand assets derived from the us
 - `logo.svg`: horizontal product logo used in the local dashboard header
 - `favicon.ico`, `favicon-32.png`, `tray.ico`: generated runtime assets
 
-Regenerate the bitmap and `.ico` outputs with:
+Regenerate the brand assets, bitmaps, and `.ico` outputs with:
 
 ```powershell
-.\scripts\generate-icons.ps1
+go run .\scripts\generate-icons.go
 ```
