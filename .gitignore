@@ -1,0 +1,31 @@
+.idea/
+.vscode/
+.DS_Store
+
+# Local secrets and env
+.env
+.env.*
+
+# Build outputs
+bin/
+dist/
+*.log
+*.exe
+*.dll
+*.msi
+*.deb
+*.rpm
+*.tgz
+*.zip
+*.syso
+coverage.out
+
+# Runtime state
+*-state.json
+flexconnect-state.json
+flexd-sslcon-state.json
+flexd-test-state.json
+
+# Temp/cache
+tmp/
+temp/
