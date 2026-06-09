@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
+	"sort"
 	"strings"
 	"text/template"
 
@@ -167,14 +167,13 @@ func collectWindowsOutputs(workDir, outDir, msiName string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	allowedExts := []string{".msi", ".cab"}
 	var out []string
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
-		if name != msiName && !slices.Contains(allowedExts, filepath.Ext(name)) {
+		if name != msiName {
 			continue
 		}
 		src := filepath.Join(workDir, name)
@@ -184,7 +183,7 @@ func collectWindowsOutputs(workDir, outDir, msiName string) ([]string, error) {
 		}
 		out = append(out, dst)
 	}
-	slices.Sort(out)
+	sort.Strings(out)
 	return out, nil
 }
 

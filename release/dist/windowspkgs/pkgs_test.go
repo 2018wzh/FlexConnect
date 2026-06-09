@@ -39,7 +39,7 @@ func TestCollectWindowsOutputs(t *testing.T) {
 
 	for name := range map[string]bool{
 		"flexconnect_1.0.1_windows_amd64.msi":    true,
-		"cab1.cab":                               true,
+		"cab1.cab":                               false,
 		"flexconnect_1.0.1_windows_amd64.wixpdb": false,
 		"flexconnect.wxs":                        false,
 	} {
@@ -52,8 +52,8 @@ func TestCollectWindowsOutputs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collectWindowsOutputs error: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("expected 2 distributable outputs, got %d (%v)", len(got), got)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 distributable output, got %d (%v)", len(got), got)
 	}
 	for _, path := range got {
 		if filepath.Ext(path) == ".wixpdb" {
