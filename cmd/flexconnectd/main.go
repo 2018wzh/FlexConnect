@@ -53,7 +53,25 @@ type daemonOptions struct {
 }
 
 func runDaemon(ctx context.Context, opts daemonOptions) error {
+	return runDaemonReady(ctx, opts, nil)
+}
+
+func runDaemonReady(ctx context.Context, opts daemonOptions, ready chan<- error) (err error) {
 	startedAt := time.Now()
+	readySent := false
+	sendReady := func(readyErr error) {
+		if ready == nil || readySent {
+			return
+		}
+		ready <- readyErr
+		close(ready)
+		readySent = true
+	}
+	defer func() {
+		if !readySent {
+			sendReady(err)
+		}
+	}()
 	appd.SetDebug(opts.verbose)
 	logging.Init(os.Stdout, logging.LevelInfo, true)
 	logging.SetLevel(condLevel(opts.verbose))
@@ -77,10 +95,12 @@ func runDaemon(ctx context.Context, opts daemonOptions) error {
 
 	listener, err := ipc.Listen(opts.socket)
 	if err != nil {
+		sendReady(err)
 		return err
 	}
 	defer listener.Close()
 	serverLog.Printf("ipc listener ready at %s", opts.socket)
+	sendReady(nil)
 
 	server := &http.Server{Handler: apiserver.New(service).Handler()}
 	errCh := make(chan error, 1)

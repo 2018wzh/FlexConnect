@@ -38,9 +38,9 @@ func TestCollectWindowsOutputs(t *testing.T) {
 	}
 
 	for name := range map[string]bool{
-		"flexconnect_1.0.0_windows_amd64.msi":    true,
+		"flexconnect_1.0.1_windows_amd64.msi":    true,
 		"cab1.cab":                               true,
-		"flexconnect_1.0.0_windows_amd64.wixpdb": false,
+		"flexconnect_1.0.1_windows_amd64.wixpdb": false,
 		"flexconnect.wxs":                        false,
 	} {
 		if err := os.WriteFile(filepath.Join(workDir, name), []byte(name), 0o644); err != nil {
@@ -48,7 +48,7 @@ func TestCollectWindowsOutputs(t *testing.T) {
 		}
 	}
 
-	got, err := collectWindowsOutputs(workDir, outDir, "flexconnect_1.0.0_windows_amd64.msi")
+	got, err := collectWindowsOutputs(workDir, outDir, "flexconnect_1.0.1_windows_amd64.msi")
 	if err != nil {
 		t.Fatalf("collectWindowsOutputs error: %v", err)
 	}

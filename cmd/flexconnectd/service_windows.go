@@ -36,12 +36,27 @@ func (s *daemonService) Execute(_ []string, requests <-chan svc.ChangeRequest, c
 	defer cancel()
 
 	runErrCh := make(chan error, 1)
+	readyCh := make(chan error, 1)
 	go func() {
-		runErrCh <- runDaemon(ctx, s.opts)
+		runErrCh <- runDaemonReady(ctx, s.opts, readyCh)
 	}()
+
+	select {
+	case err := <-readyCh:
+		if err != nil {
+			cancel()
+			return false, uint32(windows.ERROR_SERVICE_SPECIFIC_ERROR)
+		}
+	case err := <-runErrCh:
+		if err != nil {
+			return false, uint32(windows.ERROR_SERVICE_SPECIFIC_ERROR)
+		}
+		return false, windows.NO_ERROR
+	}
 
 	changes <- svc.Status{State: svc.Running, Accepts: accepts}
 
+	stopping := false
 	for {
 		select {
 		case err := <-runErrCh:
@@ -52,8 +67,11 @@ func (s *daemonService) Execute(_ []string, requests <-chan svc.ChangeRequest, c
 		case req := <-requests:
 			switch req.Cmd {
 			case svc.Stop, svc.Shutdown:
-				changes <- svc.Status{State: svc.StopPending}
-				cancel()
+				if !stopping {
+					stopping = true
+					changes <- svc.Status{State: svc.StopPending}
+					cancel()
+				}
 			case svc.Interrogate:
 				changes <- req.CurrentStatus
 			}

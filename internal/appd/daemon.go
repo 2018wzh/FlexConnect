@@ -19,8 +19,12 @@ import (
 	"flexconnect/internal/vpn"
 )
 
-const version = "1.0.0"
-const autoReconnectDelay = 2 * time.Second
+const version = "1.0.1"
+
+var (
+	autoReconnectMinDelay = 2 * time.Second
+	autoReconnectMaxDelay = 1 * time.Minute
+)
 
 var appdDebug bool
 var errNoCurrentProfile = errors.New("no current profile selected")
@@ -71,7 +75,6 @@ type Service struct {
 	profiles            []types.Profile
 	currentID           string
 	connectedID         string
-	autoReconnect       bool
 	status              types.Status
 	logs                *logbuf.Buffer
 	watchers            map[int]chan types.Notify
@@ -80,6 +83,11 @@ type Service struct {
 	disconnectSeq       uint64
 	manualDisconnectSeq uint64
 	manualProfileID     string
+	reconnectTimer      *time.Timer
+	reconnectProfileID  string
+	reconnectAttempt    int
+	reconnectSeq        uint64
+	reconnectID         uint64
 }
 
 func New(store Store, secrets secret.Store, backend vpn.Backend, planner router.Planner) (*Service, error) {
@@ -356,6 +364,9 @@ func (s *Service) DeleteProfile(id string) error {
 		s.mu.Unlock()
 		return fmt.Errorf("profile not found: %s", id)
 	}
+	if s.reconnectProfileID == id {
+		s.stopReconnectLocked()
+	}
 	wasConnected = s.connectedID == id
 	_ = s.secrets.Delete(s.profiles[index].SecretRef)
 	s.profiles = append(s.profiles[:index], s.profiles[index+1:]...)
@@ -399,6 +410,9 @@ func (s *Service) SwitchProfile(_ context.Context, id string) error {
 		s.mu.Unlock()
 		return err
 	}
+	if s.currentID != id {
+		s.stopReconnectLocked()
+	}
 	s.currentID = id
 	s.status.CurrentProfileID = id
 	if err := s.persist(); err != nil {
@@ -415,6 +429,7 @@ func (s *Service) SwitchProfile(_ context.Context, id string) error {
 func (s *Service) Connect(ctx context.Context, id string) error {
 	appdDebugf("connect start profile=%s current=%s connected=%s", id, s.status.CurrentProfileID, s.connectedID)
 	s.mu.Lock()
+	s.stopReconnectLocked()
 	profile, err := s.findProfileLocked(id)
 	if err != nil {
 		s.mu.Unlock()
@@ -423,7 +438,7 @@ func (s *Service) Connect(ctx context.Context, id string) error {
 	password, _ := s.secrets.Get(profile.SecretRef)
 	s.mu.Unlock()
 	connectStart := time.Now()
-	if err := s.connectPreparedProfile(ctx, profile, password); err != nil {
+	if err := s.connectPreparedProfile(ctx, profile, password, false); err != nil {
 		appdLog.Printf("connect failed profile=%s err=%v", profile.ID, err)
 		return err
 	}
@@ -452,6 +467,9 @@ func (s *Service) disconnect(ctx context.Context, manual bool) error {
 	s.mu.Lock()
 	appdDebugf("disconnect requested current_connected=%s", s.connectedID)
 	connected := s.connectedID != ""
+	if manual {
+		s.stopReconnectLocked()
+	}
 	if manual && connected {
 		s.disconnectSeq++
 		s.manualDisconnectSeq = s.disconnectSeq
@@ -461,7 +479,6 @@ func (s *Service) disconnect(ctx context.Context, manual bool) error {
 	if !connected {
 		return nil
 	}
-	s.autoReconnect = false
 	if err := s.backend.Disconnect(ctx); err != nil {
 		return err
 	}
@@ -552,7 +569,7 @@ func (s *Service) Login(ctx context.Context, req types.LoginRequest) error {
 	s.emitLocked(types.Notify{Event: "profile", Profile: &profile})
 	s.emitLocked(types.Notify{Event: "profiles", Profiles: append([]types.Profile(nil), s.profiles...)})
 	s.mu.Unlock()
-	return s.connectPreparedProfile(ctx, profile, password)
+	return s.connectPreparedProfile(ctx, profile, password, false)
 }
 
 func (s *Service) Watch(ctx context.Context) <-chan types.Notify {
@@ -610,8 +627,7 @@ func (s *Service) consumeBackendEvents() {
 			}
 			if !manual && s.currentID == disconnectedProfileID &&
 				autoProfileFound && types.BoolValue(autoProfile.AutoReconnect, false) &&
-				!s.autoReconnect {
-				s.autoReconnect = true
+				s.reconnectTimer == nil {
 				manualSeq = s.disconnectSeq
 				scheduleAutoReconnect = true
 			}
@@ -647,7 +663,9 @@ func (s *Service) consumeBackendEvents() {
 		})
 		s.mu.Unlock()
 		if scheduleAutoReconnect {
-			go s.scheduleAutoReconnect(context.Background(), disconnectedProfileID, manualSeq)
+			s.mu.Lock()
+			s.startReconnectLocked(disconnectedProfileID, manualSeq, 1)
+			s.mu.Unlock()
 		}
 	}
 }
@@ -664,44 +682,109 @@ func (s *Service) profileAutoReconnect(profileID string) (types.Profile, bool) {
 	return types.Profile{}, false
 }
 
-func (s *Service) scheduleAutoReconnect(ctx context.Context, profileID string, manualSeq uint64) {
-	time.Sleep(autoReconnectDelay)
-	s.mu.Lock()
-	if !s.autoReconnect {
-		s.mu.Unlock()
-		return
-	}
+func (s *Service) startReconnectLocked(profileID string, manualSeq uint64, attempt int) {
 	profile, ok := s.profileAutoReconnect(profileID)
 	if !ok {
-		s.autoReconnect = false
-		s.mu.Unlock()
 		return
 	}
 	if s.currentID != profileID || s.connectedID != "" || s.disconnectSeq != manualSeq ||
 		!types.BoolValue(profile.AutoReconnect, false) {
-		s.autoReconnect = false
+		return
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if s.reconnectTimer != nil {
+		s.reconnectTimer.Stop()
+	}
+	delay := reconnectDelay(attempt)
+	s.reconnectID++
+	reconnectID := s.reconnectID
+	s.reconnectTimer = time.AfterFunc(delay, func() {
+		s.runScheduledReconnect(profileID, manualSeq, attempt, reconnectID)
+	})
+	s.reconnectProfileID = profileID
+	s.reconnectAttempt = attempt
+	s.reconnectSeq = manualSeq
+	s.logs.Add("info", fmt.Sprintf("appd: auto reconnect scheduled id=%q attempt=%d delay=%s", profileID, attempt, delay))
+	appdLog.Printf("auto reconnect scheduled id=%q attempt=%d delay=%s", profileID, attempt, delay)
+}
+
+func (s *Service) runScheduledReconnect(profileID string, manualSeq uint64, attempt int, reconnectID uint64) {
+	s.mu.Lock()
+	if s.reconnectID != reconnectID || s.reconnectProfileID != profileID || s.reconnectSeq != manualSeq {
+		s.mu.Unlock()
+		return
+	}
+	s.reconnectTimer = nil
+	profile, ok := s.profileAutoReconnect(profileID)
+	if !ok || s.currentID != profileID || s.connectedID != "" || s.disconnectSeq != manualSeq ||
+		!types.BoolValue(profile.AutoReconnect, false) {
+		s.stopReconnectLocked()
 		s.mu.Unlock()
 		return
 	}
 	s.status.State = types.StateReconnecting
 	s.status.LastError = ""
 	s.status.UpdatedAt = now()
+	s.logs.Add("info", fmt.Sprintf("appd: auto reconnect attempt=%d id=%q", attempt, profileID))
 	s.emitLocked(types.Notify{
 		Event:   "status",
 		Status:  ptrStatus(s.status),
 		Message: "Reconnecting profile " + profileID,
 	})
 	s.mu.Unlock()
-	err := s.reconnectProfile(ctx, profileID, "auto reconnect for profile "+profileID)
+
+	s.logs.Add("info", fmt.Sprintf("appd: reconnect reason=%q", fmt.Sprintf("auto reconnect attempt %d for profile %s", attempt, profileID)))
+	if err := s.disconnect(context.Background(), false); err != nil {
+		s.mu.Lock()
+		s.logs.Add("error", fmt.Sprintf("appd: auto reconnect failed id=%q err=%q", profileID, err.Error()))
+		appdLog.Printf("auto reconnect failed id=%q attempt=%d err=%v", profileID, attempt, err)
+		s.startReconnectLocked(profileID, manualSeq, attempt+1)
+		s.mu.Unlock()
+		return
+	}
+	password, _ := s.secrets.Get(profile.SecretRef)
+	err := s.connectPreparedProfile(context.Background(), profile, password, true)
+
 	s.mu.Lock()
-	s.autoReconnect = false
 	if err != nil {
 		s.logs.Add("error", fmt.Sprintf("appd: auto reconnect failed id=%q err=%q", profileID, err.Error()))
+		appdLog.Printf("auto reconnect failed id=%q attempt=%d err=%v", profileID, attempt, err)
+		s.startReconnectLocked(profileID, manualSeq, attempt+1)
+		s.mu.Unlock()
+		return
 	}
+	s.stopReconnectLocked()
 	s.mu.Unlock()
-	if err != nil {
-		appdLog.Printf("auto reconnect failed id=%q err=%v", profileID, err)
+}
+
+func (s *Service) stopReconnectLocked() {
+	if s.reconnectTimer != nil {
+		s.reconnectTimer.Stop()
 	}
+	s.reconnectTimer = nil
+	s.reconnectProfileID = ""
+	s.reconnectAttempt = 0
+	s.reconnectSeq = 0
+	s.reconnectID++
+}
+
+func reconnectDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := autoReconnectMinDelay
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay >= autoReconnectMaxDelay {
+			return autoReconnectMaxDelay
+		}
+	}
+	if delay > autoReconnectMaxDelay {
+		return autoReconnectMaxDelay
+	}
+	return delay
 }
 
 func (s *Service) findProfileLocked(id string) (types.Profile, error) {
@@ -822,7 +905,7 @@ func (s *Service) prepareLoginProfileLocked(req types.LoginRequest) (types.Profi
 	return profile, password, nil
 }
 
-func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Profile, password string) error {
+func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Profile, password string, allowReconnectState bool) error {
 	if err := validateProfileForConnect(profile); err != nil {
 		return err
 	}
@@ -832,13 +915,15 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 
 	s.mu.Lock()
 	if s.status.State == types.StateConnecting || s.status.State == types.StateReconnecting {
-		if s.status.CurrentProfileID == profile.ID {
+		if !s.connectAllowedFromStateLocked(profile.ID, allowReconnectState) && s.status.CurrentProfileID == profile.ID {
 			appdLog.Printf("connect ignored profile=%s reason=already_connecting", profile.ID)
 			s.mu.Unlock()
 			return nil
 		}
-		s.mu.Unlock()
-		return errConnectInProgress
+		if !s.connectAllowedFromStateLocked(profile.ID, allowReconnectState) {
+			s.mu.Unlock()
+			return errConnectInProgress
+		}
 	}
 	if s.status.State == types.StateConnected && s.connectedID == profile.ID {
 		appdLog.Printf("connect ignored profile=%s reason=already_connected", profile.ID)
@@ -855,20 +940,26 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 
 	s.mu.Lock()
 	if s.status.State == types.StateConnecting || s.status.State == types.StateReconnecting {
-		if s.status.CurrentProfileID == profile.ID {
+		if !s.connectAllowedFromStateLocked(profile.ID, allowReconnectState) && s.status.CurrentProfileID == profile.ID {
 			appdLog.Printf("connect ignored profile=%s reason=already_connecting", profile.ID)
 			s.mu.Unlock()
 			return nil
 		}
-		s.mu.Unlock()
-		return errConnectInProgress
+		if !s.connectAllowedFromStateLocked(profile.ID, allowReconnectState) {
+			s.mu.Unlock()
+			return errConnectInProgress
+		}
 	}
 	if s.status.State == types.StateConnected && s.connectedID == profile.ID {
 		appdLog.Printf("connect ignored profile=%s reason=already_connected", profile.ID)
 		s.mu.Unlock()
 		return nil
 	}
-	s.status.State = types.StateConnecting
+	if allowReconnectState {
+		s.status.State = types.StateReconnecting
+	} else {
+		s.status.State = types.StateConnecting
+	}
 	s.currentID = profile.ID
 	s.status.CurrentProfileID = profile.ID
 	s.status.ConnectedProfileID = ""
@@ -914,6 +1005,10 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 	})
 	s.mu.Unlock()
 	return s.applyProxyProfile(profile)
+}
+
+func (s *Service) connectAllowedFromStateLocked(profileID string, allowReconnectState bool) bool {
+	return allowReconnectState && s.status.State == types.StateReconnecting && s.status.CurrentProfileID == profileID
 }
 
 func validateProfileForConnect(profile types.Profile) error {
