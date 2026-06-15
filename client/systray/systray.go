@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	systraylib "fyne.io/systray"
 
@@ -53,7 +54,7 @@ func (m *Menu) Run() {
 }
 
 func (m *Menu) onReady() {
-	systraylib.SetIcon(brandicons.TrayICO())
+	setTrayIcon()
 	setTooltip("FlexConnect")
 	m.init()
 	m.refresh(context.Background())
@@ -134,6 +135,7 @@ func (m *Menu) rebuild() {
 		return strings.ToLower(profileTitle(profiles[i])) < strings.ToLower(profileTitle(profiles[j]))
 	})
 	systraylib.ResetMenu()
+	setTrayIcon()
 	setTooltip(tooltipText(status, profiles))
 
 	m.addStatusSection(status, profiles)
@@ -453,6 +455,17 @@ func setTooltip(text string) {
 		return
 	}
 	systraylib.SetTooltip(text)
+}
+
+func setTrayIcon() {
+	// Use PNG on Linux for better tray backend compatibility.
+	// Keep ICO for non-Linux platforms.
+	if runtime.GOOS == "linux" {
+		systraylib.SetIcon(brandicons.Favicon32PNG())
+		time.Sleep(10 * time.Millisecond)
+		return
+	}
+	systraylib.SetIcon(brandicons.TrayICO())
 }
 
 func toggleForStatus(status *types.Status) toggleState {
