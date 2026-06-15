@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FlexConnect
+Comment=A Flexible AnyConnect Client
+Exec=flextray
+Icon=flexconnect
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=true

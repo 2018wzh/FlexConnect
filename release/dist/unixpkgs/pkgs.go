@@ -65,6 +65,20 @@ func (t *tgzTarget) Build(b *dist.Build) ([]string, error) {
 	if err := addTarFile(tw, artifacts.ServiceFile, filepath.Join(systemdDir, "flexconnectd.service"), 0o644); err != nil {
 		return nil, err
 	}
+	appsDir := filepath.Join(root, "usr", "share", "applications")
+	if err := addTarDir(tw, appsDir, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	if err := addTarFile(tw, b.RepoPath("release", "dist", "unixpkgs", "files", "flexconnect.desktop"), filepath.Join(appsDir, "flexconnect.desktop"), 0o644); err != nil {
+		return nil, err
+	}
+	iconsDir := filepath.Join(root, "usr", "share", "icons", "hicolor", "256x256", "apps")
+	if err := addTarDir(tw, iconsDir, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	if err := addTarFile(tw, b.RepoPath("assets", "icons", "app-256.png"), filepath.Join(iconsDir, "flexconnect.png"), 0o644); err != nil {
+		return nil, err
+	}
 	return []string{outPath}, nil
 }
 
@@ -95,6 +109,8 @@ func buildLinuxPackage(b *dist.Build, pkgType, goarch string) ([]string, error) 
 		&files.Content{Source: packageSourcePath(b.Repo, artifacts.FlexConnectD), Destination: "/usr/sbin/flexconnectd", FileInfo: &files.ContentFileInfo{Mode: 0o755}},
 		&files.Content{Source: packageSourcePath(b.Repo, artifacts.FlexTray), Destination: "/usr/bin/flextray", FileInfo: &files.ContentFileInfo{Mode: 0o755}},
 		&files.Content{Source: packageSourcePath(b.Repo, artifacts.ServiceFile), Destination: "/lib/systemd/system/flexconnectd.service", FileInfo: &files.ContentFileInfo{Mode: 0o644}},
+		&files.Content{Source: packageSourcePath(b.Repo, b.RepoPath("release", "dist", "unixpkgs", "files", "flexconnect.desktop")), Destination: "/usr/share/applications/flexconnect.desktop", FileInfo: &files.ContentFileInfo{Mode: 0o644}},
+		&files.Content{Source: packageSourcePath(b.Repo, b.RepoPath("assets", "icons", "app-256.png")), Destination: "/usr/share/icons/hicolor/256x256/apps/flexconnect.png", FileInfo: &files.ContentFileInfo{Mode: 0o644}},
 	}, false)
 	if err != nil {
 		return nil, err
