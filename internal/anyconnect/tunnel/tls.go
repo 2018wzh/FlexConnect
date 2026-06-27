@@ -76,7 +76,7 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 				return
 			}
 		}
-		cSess.Stat.BytesReceived += uint64(bytesReceived)
+		cSess.Stat.BytesReceived.Add(uint64(bytesReceived))
 	}
 }
 
@@ -124,10 +124,9 @@ func payloadOutTLSToServer(conn *tls.Conn, cSess *session.ConnSession) {
 			base.Error("tls payloadOut to server error:", err)
 			return
 		}
-		cSess.Stat.BytesSent += uint64(bytesSent)
+		cSess.Stat.BytesSent.Add(uint64(bytesSent))
 
 		// 释放由 tunToPayloadOut 申请的内存
 		putPayloadBuffer(pl)
 	}
 }
-

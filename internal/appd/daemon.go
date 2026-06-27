@@ -19,7 +19,7 @@ import (
 	"flexconnect/internal/vpn"
 )
 
-const version = "1.0.4"
+const version = "1.0.5"
 
 var (
 	autoReconnectMinDelay = 2 * time.Second
@@ -50,6 +50,7 @@ type Store interface {
 
 type Daemon interface {
 	Status() types.Status
+	Traffic() types.TrafficSnapshot
 	ListProfiles() []types.Profile
 	CurrentProfile() (types.Profile, error)
 	CreateProfile(types.Profile, string) (types.Profile, error)
@@ -88,6 +89,9 @@ type Service struct {
 	reconnectAttempt    int
 	reconnectSeq        uint64
 	reconnectID         uint64
+	traffic             types.TrafficSnapshot
+	lastTraffic         *types.TrafficStats
+	lastTrafficAt       time.Time
 }
 
 func New(store Store, secrets secret.Store, backend vpn.Backend, planner router.Planner) (*Service, error) {
@@ -108,6 +112,7 @@ func New(store Store, secrets secret.Store, backend vpn.Backend, planner router.
 	appdLog.Printf("loaded service count=%d", len(s.profiles))
 	appdDebugf("service initialized current=%s profile_count=%d", s.currentID, len(s.profiles))
 	go s.consumeBackendEvents()
+	go s.sampleTrafficLoop()
 	return s, nil
 }
 
@@ -156,7 +161,14 @@ func (s *Service) persist() error {
 func (s *Service) Status() types.Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.refreshConnectedStatusLocked()
 	return s.status
+}
+
+func (s *Service) Traffic() types.TrafficSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.traffic
 }
 
 func (s *Service) Logs() []types.LogEntry {
@@ -169,14 +181,9 @@ func (s *Service) Diagnostics() types.Diagnostics {
 
 	status := s.status
 	profiles := append([]types.Profile(nil), s.profiles...)
-	var traffic *types.TrafficStats
 	if status.State == types.StateConnected {
-		if session := s.backend.SessionInfo(); session != nil {
-			status.Session = session
-		}
-		if t := s.backend.Traffic(); t != nil {
-			traffic = t
-		}
+		s.refreshConnectedStatusLocked()
+		status = s.status
 	}
 	var current *types.Profile
 	for _, profile := range profiles {
@@ -192,10 +199,68 @@ func (s *Service) Diagnostics() types.Diagnostics {
 		CurrentProfile: current,
 		Profiles:       profiles,
 		ServerConfig:   s.backend.ReadServerConfig(),
-		Traffic:        traffic,
+		Traffic:        ptrTraffic(s.traffic),
 		Logs:           s.logs.Snapshot(),
 		GeneratedAt:    now(),
 	}
+}
+
+func (s *Service) refreshConnectedStatusLocked() {
+	if session := s.backend.SessionInfo(); session != nil {
+		s.status.Session = session
+	}
+}
+
+func (s *Service) sampleTrafficLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for t := range ticker.C {
+		s.sampleTrafficAt(t.UTC())
+	}
+}
+
+func (s *Service) sampleTrafficAt(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.sampleTrafficLocked(t) {
+		return
+	}
+	s.emitLocked(types.Notify{Event: "traffic", Traffic: ptrTraffic(s.traffic)})
+}
+
+func (s *Service) sampleTrafficLocked(t time.Time) bool {
+	if s.status.State != types.StateConnected {
+		return s.clearTrafficLocked()
+	}
+	totals := s.backend.Traffic()
+	if totals == nil {
+		return s.clearTrafficLocked()
+	}
+	next := types.TrafficSnapshot{
+		Connected:     true,
+		BytesSent:     totals.BytesSent,
+		BytesReceived: totals.BytesReceived,
+		SampledAt:     t.Format(time.RFC3339),
+	}
+	if s.lastTraffic != nil && !s.lastTrafficAt.IsZero() {
+		if seconds := t.Sub(s.lastTrafficAt).Seconds(); seconds > 0 {
+			next.BytesSentPerSecond = float64(totals.BytesSent-s.lastTraffic.BytesSent) / seconds
+			next.BytesReceivedPerSecond = float64(totals.BytesReceived-s.lastTraffic.BytesReceived) / seconds
+		}
+	}
+	s.lastTraffic = &types.TrafficStats{BytesSent: totals.BytesSent, BytesReceived: totals.BytesReceived}
+	s.lastTrafficAt = t
+	s.traffic = next
+	return true
+}
+
+func (s *Service) clearTrafficLocked() bool {
+	changed := s.traffic.Connected || s.traffic.BytesSent != 0 || s.traffic.BytesReceived != 0 ||
+		s.traffic.BytesSentPerSecond != 0 || s.traffic.BytesReceivedPerSecond != 0
+	s.traffic = types.TrafficSnapshot{}
+	s.lastTraffic = nil
+	s.lastTrafficAt = time.Time{}
+	return changed
 }
 
 func (s *Service) ListProfiles() []types.Profile {
@@ -383,6 +448,7 @@ func (s *Service) DeleteProfile(id string) error {
 		s.status.ConnectedProfileID = ""
 		s.status.Session = nil
 		s.status.EffectiveRoutes = nil
+		s.clearTrafficLocked()
 		s.status.UpdatedAt = now()
 	}
 	if err := s.persist(); err != nil {
@@ -393,6 +459,7 @@ func (s *Service) DeleteProfile(id string) error {
 	appdLog.Printf("delete profile done id=%s remaining=%d", id, len(s.profiles))
 	if wasConnected {
 		s.emitLocked(types.Notify{Event: "status", Status: ptrStatus(s.status)})
+		s.emitLocked(types.Notify{Event: "traffic", Traffic: ptrTraffic(s.traffic)})
 	}
 	s.emitLocked(types.Notify{Event: "profiles", Profiles: append([]types.Profile(nil), s.profiles...)})
 	s.mu.Unlock()
@@ -489,6 +556,7 @@ func (s *Service) disconnect(ctx context.Context, manual bool) error {
 	s.status.Session = nil
 	s.status.EffectiveRoutes = nil
 	s.status.LastError = ""
+	s.clearTrafficLocked()
 	s.status.UpdatedAt = now()
 	s.logs.Add("info", fmt.Sprintf("appd: profile disconnected id=%s", s.status.CurrentProfileID))
 	appdLog.Printf("disconnect done previous_profile=%s", s.status.CurrentProfileID)
@@ -497,6 +565,7 @@ func (s *Service) disconnect(ctx context.Context, manual bool) error {
 		Status:  ptrStatus(s.status),
 		Message: "Disconnected.",
 	})
+	s.emitLocked(types.Notify{Event: "traffic", Traffic: ptrTraffic(s.traffic)})
 	s.mu.Unlock()
 	_ = s.stopProxy()
 	return nil
@@ -585,6 +654,7 @@ func (s *Service) Watch(ctx context.Context) <-chan types.Notify {
 		Version:  version,
 		Event:    "snapshot",
 		Status:   ptrStatus(s.status),
+		Traffic:  ptrTraffic(s.traffic),
 		Profiles: append([]types.Profile(nil), s.profiles...),
 		Time:     now(),
 	}
@@ -616,6 +686,7 @@ func (s *Service) consumeBackendEvents() {
 			}
 			s.status.State = types.StateConnected
 			s.status.Session = event.Session
+			s.sampleTrafficLocked(time.Now().UTC())
 			s.logs.Add("info", "appd: backend event=connected")
 		case "disconnected":
 			disconnectedProfileID = s.connectedID
@@ -638,6 +709,7 @@ func (s *Service) consumeBackendEvents() {
 			s.status.EffectiveRoutes = nil
 			s.status.SOCKS5Enabled = false
 			s.status.SOCKS5Listen = ""
+			s.clearTrafficLocked()
 			s.logs.Add("info", "appd: backend event=disconnected")
 		}
 		message := ""
@@ -661,6 +733,9 @@ func (s *Service) consumeBackendEvents() {
 			Error:   s.status.LastError,
 			Message: message,
 		})
+		if event.Type == "connected" || event.Type == "disconnected" {
+			s.emitLocked(types.Notify{Event: "traffic", Traffic: ptrTraffic(s.traffic)})
+		}
 		s.mu.Unlock()
 		if scheduleAutoReconnect {
 			s.mu.Lock()
@@ -814,6 +889,11 @@ func ptrStatus(status types.Status) *types.Status {
 	return &copy
 }
 
+func ptrTraffic(traffic types.TrafficSnapshot) *types.TrafficSnapshot {
+	copy := traffic
+	return &copy
+}
+
 func (s *Service) reconnectProfile(ctx context.Context, id, reason string) error {
 	appdDebugf("reconnect profile id=%s reason=%s", id, reason)
 	s.logs.Add("info", fmt.Sprintf("appd: reconnect reason=%q", reason))
@@ -964,6 +1044,7 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 	s.status.CurrentProfileID = profile.ID
 	s.status.ConnectedProfileID = ""
 	s.status.LastError = ""
+	s.clearTrafficLocked()
 	s.status.UpdatedAt = now()
 	s.logs.Add("info", fmt.Sprintf("appd: connecting id=%s server=%q", profile.ID, profile.ServerURL))
 	s.emitLocked(types.Notify{
@@ -997,12 +1078,14 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 	s.status.Session = session
 	s.status.EffectiveRoutes = s.planner.Plan(session.SplitInclude, session.SplitExclude, profile)
 	s.status.UpdatedAt = now()
+	s.sampleTrafficLocked(time.Now().UTC())
 	s.logs.Add("info", fmt.Sprintf("appd: connected profile=%s", profile.ID))
 	s.emitLocked(types.Notify{
 		Event:   "status",
 		Status:  ptrStatus(s.status),
 		Message: "Connected to profile " + profile.ID,
 	})
+	s.emitLocked(types.Notify{Event: "traffic", Traffic: ptrTraffic(s.traffic)})
 	s.mu.Unlock()
 	return s.applyProxyProfile(profile)
 }

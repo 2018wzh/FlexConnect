@@ -37,6 +37,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/disconnect", s.handleDisconnect)
 	s.mux.HandleFunc("/v1/routes/", s.handleRoutes)
 	s.mux.HandleFunc("/v1/logs", s.handleLogs)
+	s.mux.HandleFunc("/v1/traffic", s.handleTraffic)
 	s.mux.HandleFunc("/v1/diagnostics", s.handleDiagnostics)
 	s.mux.HandleFunc("/v1/watch", s.handleWatch)
 }
@@ -178,6 +179,17 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusOK)
 	writeJSON(w, s.daemon.Diagnostics())
+}
+
+func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
+	logfRequest(r)
+	if r.Method != http.MethodGet {
+		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusOK)
+	writeJSON(w, s.daemon.Traffic())
 }
 
 func (s *Server) handleConnectCurrent(w http.ResponseWriter, r *http.Request) {

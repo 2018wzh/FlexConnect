@@ -8,7 +8,7 @@ import (
 )
 
 func TestMenuModelUnavailableHasCoreItems(t *testing.T) {
-	model := buildMenuModel(nil, nil, nil)
+	model := buildMenuModel(nil, types.TrafficSnapshot{}, nil)
 
 	assertHasItem(t, model.Items, "Status: Unavailable")
 	connect := assertHasItem(t, model.Items, "Connect")
@@ -22,7 +22,7 @@ func TestMenuModelUnavailableHasCoreItems(t *testing.T) {
 }
 
 func TestMenuModelConnectingDisablesMainAction(t *testing.T) {
-	model := buildMenuModel(&types.Status{State: types.StateConnecting, CurrentProfileID: "p1"}, nil, []types.Profile{
+	model := buildMenuModel(&types.Status{State: types.StateConnecting, CurrentProfileID: "p1"}, types.TrafficSnapshot{}, []types.Profile{
 		{ID: "p1", Name: "Work"},
 	})
 
@@ -42,14 +42,33 @@ func TestMenuModelConnectedShowsDisconnectAndVPNIP(t *testing.T) {
 		ConnectedProfileID: "p1",
 		Session:            &types.SessionInfo{VPNAddress: "10.0.0.8"},
 	}
-	model := buildMenuModel(status, nil, []types.Profile{{ID: "p1", Name: "Work"}})
+	traffic := types.TrafficSnapshot{
+		Connected:              true,
+		BytesSent:              1024,
+		BytesReceived:          2048,
+		BytesSentPerSecond:     512,
+		BytesReceivedPerSecond: 1536,
+	}
+	model := buildMenuModel(status, traffic, []types.Profile{{ID: "p1", Name: "Work"}})
 
 	disconnect := assertHasItem(t, model.Items, "Disconnect")
 	if disconnect.Disabled || disconnect.Action != menuActionToggle || disconnect.Toggle != toggleDisconnect {
 		t.Fatalf("Disconnect item = %+v", disconnect)
 	}
+	wantTooltip := strings.Join([]string{
+		"FlexConnect: Connected",
+		"Work · 10.0.0.8",
+		"Traffic ↑1.00 KiB ↓2.00 KiB",
+		"Speed ↑512 B/s ↓1.50 KiB/s",
+	}, "\n")
+	if model.Tooltip != wantTooltip {
+		t.Fatalf("tooltip = %q, want %q", model.Tooltip, wantTooltip)
+	}
 	info := assertHasItem(t, model.Items, "Information: 10.0.0.8")
-	assertHasItem(t, info.Children, "VPN IP: 10.0.0.8")
+	assertHasItem(t, info.Children, "FlexConnect: Connected")
+	assertHasItem(t, info.Children, "Work · 10.0.0.8")
+	assertHasItem(t, info.Children, "Traffic ↑1.00 KiB ↓2.00 KiB")
+	assertHasItem(t, info.Children, "Speed ↑512 B/s ↓1.50 KiB/s")
 	profile := assertHasItem(t, model.Items, "Profiles")
 	child := assertHasItem(t, profile.Children, "Work")
 	if !child.Checked {
@@ -61,7 +80,7 @@ func TestMenuModelConnectedShowsDisconnectAndVPNIP(t *testing.T) {
 }
 
 func TestMenuModelErrorShowsLastError(t *testing.T) {
-	model := buildMenuModel(&types.Status{State: types.StateError, LastError: "bad password"}, nil, nil)
+	model := buildMenuModel(&types.Status{State: types.StateError, LastError: "bad password"}, types.TrafficSnapshot{}, nil)
 
 	assertHasItem(t, model.Items, "Last Error: bad password")
 	if trayIconColorForStatus(&types.Status{State: types.StateError}) != trayIconRed {

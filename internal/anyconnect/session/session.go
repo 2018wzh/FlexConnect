@@ -30,8 +30,8 @@ type Session struct {
 
 type stat struct {
 	// be sure to use the double type when parsing
-	BytesSent     uint64 `json:"bytesSent"`
-	BytesReceived uint64 `json:"bytesReceived"`
+	BytesSent     *atomic.Uint64 `json:"bytesSent"`
+	BytesReceived *atomic.Uint64 `json:"bytesReceived"`
 }
 
 // ConnSession used for both TLS and DTLS
@@ -89,9 +89,12 @@ type DtlsSession struct {
 
 func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
 	cSess := &ConnSession{
-		Sess:              sess,
-		LocalAddress:      base.LocalInterface.Ip4,
-		Stat:              &stat{0, 0},
+		Sess:         sess,
+		LocalAddress: base.LocalInterface.Ip4,
+		Stat: &stat{
+			BytesSent:     atomic.NewUint64(0),
+			BytesReceived: atomic.NewUint64(0),
+		},
 		closeOnce:         sync.Once{},
 		CloseChan:         make(chan struct{}),
 		DtlsSetupChan:     make(chan struct{}),

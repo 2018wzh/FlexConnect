@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +38,7 @@ type Menu struct {
 	rebuildMu  sync.Mutex
 	mu         sync.Mutex
 	status     *types.Status
-	diag       *types.Diagnostics
+	traffic    types.TrafficSnapshot
 	profiles   []types.Profile
 	rebuildCh  chan struct{}
 	runCancel  context.CancelFunc
@@ -104,7 +103,7 @@ func (m *Menu) refresh(ctx context.Context) {
 	if err != nil {
 		systrayLog.Error(err)
 	}
-	diag, err := m.Client.Diagnostics(ctx)
+	traffic, err := m.Client.Traffic(ctx)
 	if err != nil {
 		systrayLog.Error(err)
 	}
@@ -116,15 +115,8 @@ func (m *Menu) refresh(ctx context.Context) {
 	if profiles != nil {
 		m.profiles = profiles
 	}
-	if diag != nil {
-		m.diag = diag
-		if m.status == nil {
-			statusCopy := diag.Status
-			m.status = &statusCopy
-		}
-		if len(m.profiles) == 0 {
-			m.profiles = append([]types.Profile(nil), diag.Profiles...)
-		}
+	if traffic != nil {
+		m.traffic = *traffic
 	}
 }
 
@@ -134,7 +126,7 @@ func (m *Menu) rebuild() {
 
 	m.mu.Lock()
 	status := copyStatus(m.status)
-	diag := copyDiagnostics(m.diag)
+	traffic := m.traffic
 	profiles := append([]types.Profile(nil), m.profiles...)
 	if m.menuCancel != nil {
 		m.menuCancel()
@@ -143,7 +135,7 @@ func (m *Menu) rebuild() {
 	m.menuCancel = cancel
 	m.mu.Unlock()
 
-	m.renderMenu(ctx, buildMenuModel(status, diag, profiles))
+	m.renderMenu(ctx, buildMenuModel(status, traffic, profiles))
 }
 
 func (m *Menu) handleProfileSelection(ctx context.Context, profileID string) {
@@ -392,6 +384,10 @@ func (m *Menu) watch(ctx context.Context) {
 				m.profiles = append([]types.Profile(nil), notify.Profiles...)
 				changed = true
 			}
+			if notify.Traffic != nil {
+				m.traffic = *notify.Traffic
+				changed = true
+			}
 			m.mu.Unlock()
 			if changed {
 				m.requestRebuild()
@@ -473,160 +469,35 @@ func toggleForStatus(status *types.Status) toggleState {
 	}
 }
 
-func tooltipText(status *types.Status, profiles []types.Profile) string {
+func tooltipText(status *types.Status, traffic types.TrafficSnapshot, profiles []types.Profile) string {
+	return strings.Join(trafficSummaryRows(status, traffic, profiles), "\n")
+}
+
+func trafficSummaryRows(status *types.Status, traffic types.TrafficSnapshot, profiles []types.Profile) []string {
+	rows := []string{"FlexConnect: " + stateText(status)}
+	identity := trafficIdentity(status, profiles)
+	if identity != "" {
+		rows = append(rows, identity)
+	}
+	rows = append(rows,
+		fmt.Sprintf("Traffic ↑%s ↓%s", formatByteSize(traffic.BytesSent), formatByteSize(traffic.BytesReceived)),
+		fmt.Sprintf("Speed ↑%s ↓%s", formatByteRate(traffic.BytesSentPerSecond), formatByteRate(traffic.BytesReceivedPerSecond)),
+	)
+	return rows
+}
+
+func trafficIdentity(status *types.Status, profiles []types.Profile) string {
 	if status == nil {
-		return "FlexConnect: unavailable"
+		return ""
 	}
-	parts := []string{"FlexConnect: " + string(status.State)}
+	parts := []string{}
 	if status.CurrentProfileID != "" {
-		parts = append(parts, "profile: "+profileNameByID(profiles, status.CurrentProfileID))
+		parts = append(parts, profileNameByID(profiles, status.CurrentProfileID))
 	}
-	if status.Session != nil && status.Session.VPNAddress != "" {
-		parts = append(parts, "VPN IP: "+status.Session.VPNAddress)
+	if status.Session != nil && strings.TrimSpace(status.Session.VPNAddress) != "" {
+		parts = append(parts, status.Session.VPNAddress)
 	}
-	if status.LastError != "" {
-		parts = append(parts, "error: "+status.LastError)
-	}
-	return strings.Join(parts, " | ")
-}
-
-func diagnosticsSummaryRows(diag *types.Diagnostics, status *types.Status, profiles []types.Profile) []string {
-	if status == nil && diag != nil {
-		statusCopy := diag.Status
-		status = &statusCopy
-	}
-	rows := []string{}
-	if diag != nil {
-		if strings.TrimSpace(diag.Version) != "" {
-			rows = append(rows, "Version: "+diag.Version)
-		}
-		if diag.Traffic != nil {
-			rows = append(rows, "Traffic Sent: "+formatByteSize(diag.Traffic.BytesSent))
-			rows = append(rows, "Traffic Received: "+formatByteSize(diag.Traffic.BytesReceived))
-		}
-		if strings.TrimSpace(diag.GeneratedAt) != "" {
-			rows = append(rows, "Generated: "+diag.GeneratedAt)
-		}
-	}
-	rows = append(rows, "State: "+stateText(status))
-	if status != nil {
-		if status.CurrentProfileID != "" {
-			rows = append(rows, "Profile: "+profileNameByID(profiles, status.CurrentProfileID))
-		}
-		if status.Session != nil {
-			if strings.TrimSpace(status.Session.ServerAddress) != "" {
-				rows = append(rows, "Server: "+status.Session.ServerAddress)
-			}
-			if strings.TrimSpace(status.Session.VPNAddress) != "" {
-				rows = append(rows, "VPN IP: "+status.Session.VPNAddress)
-			}
-		}
-		rows = append(rows, fmt.Sprintf("Routes: %d effective", len(status.EffectiveRoutes)))
-		if status.SOCKS5Enabled {
-			if strings.TrimSpace(status.SOCKS5Listen) != "" {
-				rows = append(rows, "SOCKS5: "+status.SOCKS5Listen)
-			} else {
-				rows = append(rows, "SOCKS5: enabled")
-			}
-		} else {
-			rows = append(rows, "SOCKS5: disabled")
-		}
-		if status.LastError != "" {
-			rows = append(rows, "Last Error: "+status.LastError)
-		}
-	}
-	if len(rows) == 0 {
-		rows = append(rows, "Diagnostics unavailable")
-	}
-	return rows
-}
-
-func diagnosticsDetailRows(diag *types.Diagnostics, status *types.Status, profiles []types.Profile) []string {
-	if status == nil && diag != nil {
-		statusCopy := diag.Status
-		status = &statusCopy
-	}
-	rows := diagnosticsSummaryRows(diag, status, profiles)
-	if status != nil && status.Session != nil {
-		s := status.Session
-		rows = append(rows, "-", "Session")
-		if strings.TrimSpace(s.Hostname) != "" {
-			rows = append(rows, "Hostname: "+s.Hostname)
-		}
-		if strings.TrimSpace(s.TUNName) != "" {
-			rows = append(rows, "Tunnel: "+s.TUNName)
-		}
-		if strings.TrimSpace(s.VPNMask) != "" {
-			rows = append(rows, "VPN Mask: "+s.VPNMask)
-		}
-		rows = append(rows, fmt.Sprintf("MTU: %d", s.MTU))
-		if len(s.DNS) > 0 {
-			rows = append(rows, "DNS: "+strings.Join(s.DNS, ", "))
-		}
-		if strings.TrimSpace(s.TLSCipher) != "" {
-			rows = append(rows, "TLS: "+s.TLSCipher)
-		}
-		if strings.TrimSpace(s.DTLSCipher) != "" {
-			rows = append(rows, "DTLS: "+s.DTLSCipher)
-		}
-	}
-	if diag != nil && diag.Traffic != nil {
-		rows = append(rows, "-", "Traffic")
-		rows = append(rows, "Sent: "+formatByteSize(diag.Traffic.BytesSent))
-		rows = append(rows, "Received: "+formatByteSize(diag.Traffic.BytesReceived))
-	}
-	if diag != nil && diag.CurrentProfile != nil {
-		p := *diag.CurrentProfile
-		rows = append(rows, "-", "Current Profile")
-		rows = append(rows, "Name: "+profileTitle(p))
-		if strings.TrimSpace(p.ServerURL) != "" {
-			rows = append(rows, "Server: "+p.ServerURL)
-		}
-		if strings.TrimSpace(p.Username) != "" {
-			rows = append(rows, "Username: "+p.Username)
-		}
-		if strings.TrimSpace(p.Group) != "" {
-			rows = append(rows, "Group: "+p.Group)
-		}
-		rows = append(rows, fmt.Sprintf("Accept Routes: %t", p.AcceptServerRoutes))
-		rows = append(rows, fmt.Sprintf("Auto Reconnect: %t", types.BoolValue(p.AutoReconnect, false)))
-		rows = append(rows, fmt.Sprintf("Apply DNS: %t", types.BoolValue(p.ApplyDNS, true)))
-		if len(p.CustomInclude) > 0 {
-			rows = append(rows, "Include: "+strings.Join(p.CustomInclude, ", "))
-		}
-		if len(p.CustomExclude) > 0 {
-			rows = append(rows, "Exclude: "+strings.Join(p.CustomExclude, ", "))
-		}
-	}
-	if status != nil && len(status.EffectiveRoutes) > 0 {
-		rows = append(rows, "-", "Routes")
-		limit := min(len(status.EffectiveRoutes), 8)
-		for _, route := range status.EffectiveRoutes[:limit] {
-			rows = append(rows, fmt.Sprintf("%s %s metric=%d", route.Action, route.Destination, route.Metric))
-		}
-		if len(status.EffectiveRoutes) > limit {
-			rows = append(rows, fmt.Sprintf("... %d more", len(status.EffectiveRoutes)-limit))
-		}
-	}
-	if diag != nil && len(diag.ServerConfig) > 0 {
-		keys := make([]string, 0, len(diag.ServerConfig))
-		for key := range diag.ServerConfig {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		rows = append(rows, "-", "Server Config")
-		for _, key := range keys {
-			rows = append(rows, fmt.Sprintf("%s: %v", key, diag.ServerConfig[key]))
-		}
-	}
-	if diag != nil && len(diag.Logs) > 0 {
-		rows = append(rows, "-", "Recent Logs")
-		start := max(0, len(diag.Logs)-5)
-		for _, entry := range diag.Logs[start:] {
-			rows = append(rows, fmt.Sprintf("%s %s: %s", entry.Time, entry.Level, entry.Message))
-		}
-	}
-	return rows
+	return strings.Join(parts, " · ")
 }
 
 func profileTitle(profile types.Profile) string {
@@ -671,30 +542,6 @@ func copyStatus(status *types.Status) *types.Status {
 	return &copy
 }
 
-func copyDiagnostics(diag *types.Diagnostics) *types.Diagnostics {
-	if diag == nil {
-		return nil
-	}
-	copy := *diag
-	if diag.CurrentProfile != nil {
-		profile := *diag.CurrentProfile
-		copy.CurrentProfile = &profile
-	}
-	copy.Profiles = append([]types.Profile(nil), diag.Profiles...)
-	copy.Logs = append([]types.LogEntry(nil), diag.Logs...)
-	if diag.ServerConfig != nil {
-		copy.ServerConfig = map[string]any{}
-		for key, value := range diag.ServerConfig {
-			copy.ServerConfig[key] = value
-		}
-	}
-	if diag.Traffic != nil {
-		traffic := *diag.Traffic
-		copy.Traffic = &traffic
-	}
-	return &copy
-}
-
 func formatByteSize(bytes uint64) string {
 	const (
 		kibi = 1024
@@ -710,5 +557,27 @@ func formatByteSize(bytes uint64) string {
 		return fmt.Sprintf("%.2f KiB", float64(bytes)/float64(kibi))
 	default:
 		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+func formatByteRate(bytesPerSecond float64) string {
+	return formatByteFloat(bytesPerSecond) + "/s"
+}
+
+func formatByteFloat(bytes float64) string {
+	const (
+		kibi = 1024
+		mebi = 1024 * 1024
+		gibi = 1024 * 1024 * 1024
+	)
+	switch {
+	case bytes >= gibi:
+		return fmt.Sprintf("%.2f GiB", bytes/float64(gibi))
+	case bytes >= mebi:
+		return fmt.Sprintf("%.2f MiB", bytes/float64(mebi))
+	case bytes >= kibi:
+		return fmt.Sprintf("%.2f KiB", bytes/float64(kibi))
+	default:
+		return fmt.Sprintf("%.0f B", bytes)
 	}
 }

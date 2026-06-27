@@ -50,17 +50,17 @@ type menuItemModel struct {
 	Children  []menuItemModel
 }
 
-func buildMenuModel(status *types.Status, diag *types.Diagnostics, profiles []types.Profile) menuModel {
+func buildMenuModel(status *types.Status, traffic types.TrafficSnapshot, profiles []types.Profile) menuModel {
 	profiles = append([]types.Profile(nil), profiles...)
 	sort.Slice(profiles, func(i, j int) bool {
 		return strings.ToLower(profileTitle(profiles[i])) < strings.ToLower(profileTitle(profiles[j]))
 	})
 
-	model := menuModel{Icon: trayIconColorForStatus(status), Tooltip: tooltipText(status, profiles)}
+	model := menuModel{Icon: trayIconColorForStatus(status), Tooltip: tooltipText(status, traffic, profiles)}
 	model.Items = append(model.Items, statusItems(status, profiles)...)
 	model.Items = append(model.Items, separatorItem())
 	model.Items = append(model.Items, toggleItemForStatus(status))
-	if info := informationItem(diag, status, profiles); len(info.Children) > 0 {
+	if info := informationItem(status, traffic, profiles); len(info.Children) > 0 {
 		model.Items = append(model.Items, info)
 	}
 	model.Items = append(model.Items, separatorItem(), profileMenuItem(status, profiles), separatorItem(), settingsMenuItem(status, profiles), separatorItem(), menuItemModel{
@@ -98,12 +98,12 @@ func toggleItemForStatus(status *types.Status) menuItemModel {
 	return item
 }
 
-func informationItem(diag *types.Diagnostics, status *types.Status, profiles []types.Profile) menuItemModel {
+func informationItem(status *types.Status, traffic types.TrafficSnapshot, profiles []types.Profile) menuItemModel {
 	title := "Information"
 	if status != nil && status.Session != nil && status.Session.VPNAddress != "" {
 		title = "Information: " + status.Session.VPNAddress
 	}
-	rows := diagnosticsSummaryRows(diag, status, profiles)
+	rows := trafficSummaryRows(status, traffic, profiles)
 	item := menuItemModel{Title: title}
 	for _, row := range rows {
 		if strings.TrimSpace(row) != "" {

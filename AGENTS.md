@@ -70,13 +70,13 @@ Build distribution artifacts through the unified dist entrypoint:
 
 ```powershell
 go run .\cmd\dist list
-go run .\cmd\dist build --version 1.0.4 linux/amd64/tgz
-go run .\cmd\dist build --version 1.0.4 linux/amd64/deb
-go run .\cmd\dist build --version 1.0.4 linux/amd64/rpm
-go run .\cmd\dist build --version 1.0.4 windows/amd64/zip
-go run .\cmd\dist build --version 1.0.4 windows/amd64/msi
-go run .\cmd\dist build --version 1.0.4 darwin/amd64/pkg
-go run .\cmd\dist build --version 1.0.4 darwin/arm64/pkg
+go run .\cmd\dist build --version 1.0.5 linux/amd64/tgz
+go run .\cmd\dist build --version 1.0.5 linux/amd64/deb
+go run .\cmd\dist build --version 1.0.5 linux/amd64/rpm
+go run .\cmd\dist build --version 1.0.5 windows/amd64/zip
+go run .\cmd\dist build --version 1.0.5 windows/amd64/msi
+go run .\cmd\dist build --version 1.0.5 darwin/amd64/pkg
+go run .\cmd\dist build --version 1.0.5 darwin/arm64/pkg
 ```
 
 Install or remove the Windows service:

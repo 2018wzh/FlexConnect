@@ -37,6 +37,7 @@ type fakeBackend struct {
 	events   chan vpn.Event
 	connects int
 	failures []error
+	traffic  *types.TrafficStats
 }
 
 func newFakeBackend(failures ...error) *fakeBackend {
@@ -59,7 +60,15 @@ func (b *fakeBackend) Connect(context.Context, types.Profile, string) (*types.Se
 
 func (b *fakeBackend) Disconnect(context.Context) error { return nil }
 func (b *fakeBackend) SessionInfo() *types.SessionInfo  { return nil }
-func (b *fakeBackend) Traffic() *types.TrafficStats     { return nil }
+func (b *fakeBackend) Traffic() *types.TrafficStats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.traffic == nil {
+		return nil
+	}
+	traffic := *b.traffic
+	return &traffic
+}
 func (b *fakeBackend) ReadServerConfig() map[string]any { return nil }
 func (b *fakeBackend) Events() <-chan vpn.Event         { return b.events }
 
@@ -71,6 +80,63 @@ func (b *fakeBackend) connectCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.connects
+}
+
+func (b *fakeBackend) setTraffic(sent, received uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.traffic = &types.TrafficStats{BytesSent: sent, BytesReceived: received}
+}
+
+func TestTrafficSamplesTotalsAndSpeed(t *testing.T) {
+	profile := testProfile("p1", false)
+	backend := newFakeBackend()
+	service := newTestService(t, backend, profile)
+
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	backend.setTraffic(1000, 2000)
+	service.sampleTrafficAt(time.Unix(10, 0).UTC())
+	backend.setTraffic(1500, 2600)
+	service.sampleTrafficAt(time.Unix(11, 0).UTC())
+
+	traffic := service.Traffic()
+	if !traffic.Connected {
+		t.Fatal("traffic should be connected")
+	}
+	if traffic.BytesSent != 1500 || traffic.BytesReceived != 2600 {
+		t.Fatalf("totals = sent %d received %d", traffic.BytesSent, traffic.BytesReceived)
+	}
+	if traffic.BytesSentPerSecond != 500 || traffic.BytesReceivedPerSecond != 600 {
+		t.Fatalf("speed = sent %.1f received %.1f", traffic.BytesSentPerSecond, traffic.BytesReceivedPerSecond)
+	}
+	if traffic.SampledAt != "1970-01-01T00:00:11Z" {
+		t.Fatalf("sampled_at = %q", traffic.SampledAt)
+	}
+}
+
+func TestTrafficClearsOnDisconnect(t *testing.T) {
+	profile := testProfile("p1", false)
+	backend := newFakeBackend()
+	service := newTestService(t, backend, profile)
+
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	backend.setTraffic(1000, 2000)
+	service.sampleTrafficAt(time.Unix(10, 0).UTC())
+
+	if err := service.Disconnect(context.Background()); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	traffic := service.Traffic()
+	if traffic.Connected {
+		t.Fatal("traffic should be disconnected")
+	}
+	if traffic.BytesSent != 0 || traffic.BytesReceived != 0 || traffic.BytesSentPerSecond != 0 || traffic.BytesReceivedPerSecond != 0 {
+		t.Fatalf("traffic after disconnect = %+v", traffic)
+	}
 }
 
 func TestAutoReconnectRetriesWithBackoff(t *testing.T) {

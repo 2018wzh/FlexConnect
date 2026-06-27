@@ -85,6 +85,15 @@ type TrafficStats struct {
 	BytesReceived uint64 `json:"bytes_received"`
 }
 
+type TrafficSnapshot struct {
+	Connected              bool    `json:"connected"`
+	BytesSent              uint64  `json:"bytes_sent"`
+	BytesReceived          uint64  `json:"bytes_received"`
+	BytesSentPerSecond     float64 `json:"bytes_sent_per_second"`
+	BytesReceivedPerSecond float64 `json:"bytes_received_per_second"`
+	SampledAt              string  `json:"sampled_at"`
+}
+
 type Status struct {
 	State              State        `json:"state"`
 	CurrentProfileID   string       `json:"current_profile_id"`
@@ -119,26 +128,27 @@ type LogEntry struct {
 }
 
 type Notify struct {
-	Version  string     `json:"version"`
-	Event    string     `json:"event"`
-	Status   *Status    `json:"status,omitempty"`
-	Profile  *Profile   `json:"profile,omitempty"`
-	Profiles []Profile  `json:"profiles,omitempty"`
-	Logs     []LogEntry `json:"logs,omitempty"`
-	Message  string     `json:"message,omitempty"`
-	Error    string     `json:"error,omitempty"`
-	Time     string     `json:"time"`
+	Version  string           `json:"version"`
+	Event    string           `json:"event"`
+	Status   *Status          `json:"status,omitempty"`
+	Traffic  *TrafficSnapshot `json:"traffic,omitempty"`
+	Profile  *Profile         `json:"profile,omitempty"`
+	Profiles []Profile        `json:"profiles,omitempty"`
+	Logs     []LogEntry       `json:"logs,omitempty"`
+	Message  string           `json:"message,omitempty"`
+	Error    string           `json:"error,omitempty"`
+	Time     string           `json:"time"`
 }
 
 type Diagnostics struct {
-	Version        string         `json:"version"`
-	Status         Status         `json:"status"`
-	CurrentProfile *Profile       `json:"current_profile,omitempty"`
-	Profiles       []Profile      `json:"profiles"`
-	ServerConfig   map[string]any `json:"server_config,omitempty"`
-	Traffic        *TrafficStats  `json:"traffic,omitempty"`
-	Logs           []LogEntry     `json:"logs"`
-	GeneratedAt    string         `json:"generated_at"`
+	Version        string           `json:"version"`
+	Status         Status           `json:"status"`
+	CurrentProfile *Profile         `json:"current_profile,omitempty"`
+	Profiles       []Profile        `json:"profiles"`
+	ServerConfig   map[string]any   `json:"server_config,omitempty"`
+	Traffic        *TrafficSnapshot `json:"traffic,omitempty"`
+	Logs           []LogEntry       `json:"logs"`
+	GeneratedAt    string           `json:"generated_at"`
 }
 
 func BoolPtr(v bool) *bool {

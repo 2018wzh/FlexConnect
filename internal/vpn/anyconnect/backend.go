@@ -111,8 +111,8 @@ func (b *Backend) Traffic() *types.TrafficStats {
 		return nil
 	}
 	return &types.TrafficStats{
-		BytesSent:     c.Stat.BytesSent,
-		BytesReceived: c.Stat.BytesReceived,
+		BytesSent:     c.Stat.BytesSent.Load(),
+		BytesReceived: c.Stat.BytesReceived.Load(),
 	}
 }
 

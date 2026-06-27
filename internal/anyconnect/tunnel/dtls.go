@@ -7,10 +7,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/pion/dtls/v3"
 	"flexconnect/internal/anyconnect/base"
 	"flexconnect/internal/anyconnect/proto"
 	"flexconnect/internal/anyconnect/session"
+	"github.com/pion/dtls/v3"
 )
 
 // 新建 dtls.Conn
@@ -140,7 +140,7 @@ func dtlsChannel(cSess *session.ConnSession) {
 				return
 			}
 		}
-		cSess.Stat.BytesReceived += uint64(bytesReceived)
+		cSess.Stat.BytesReceived.Add(uint64(bytesReceived))
 	}
 }
 
@@ -186,7 +186,7 @@ func payloadOutDTLSToServer(conn *dtls.Conn, dSess *session.DtlsSession, cSess *
 			base.Error("dtls payloadOut to server error:", err)
 			return
 		}
-		cSess.Stat.BytesSent += uint64(bytesSent)
+		cSess.Stat.BytesSent.Add(uint64(bytesSent))
 
 		// 释放由 tunToPayloadOut 申请的内存
 		putPayloadBuffer(pl)
@@ -208,4 +208,3 @@ func (store *SessionStore) Get([]byte) (dtls.Session, error) {
 func (store *SessionStore) Del([]byte) error {
 	return nil
 }
-

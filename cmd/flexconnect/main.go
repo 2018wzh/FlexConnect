@@ -155,6 +155,20 @@ func run(ctx context.Context, client *local.Client, args []string) error {
 			diag.Status.State, diag.Status.CurrentProfileID, diag.Status.ConnectedProfileID,
 			len(diag.Profiles), len(diag.Logs), len(diag.Status.EffectiveRoutes))
 		return printJSON(diag)
+	case "traffic":
+		debugf("handling traffic")
+		if wantCommandHelp(args[1:]) {
+			return printNamedHelp("traffic")
+		}
+		traffic, err := client.Traffic(ctx)
+		if err != nil {
+			return err
+		}
+		if hasJSONFlag(args[1:]) {
+			return printJSON(traffic)
+		}
+		_, err = io.WriteString(cliOut, formatTrafficSnapshot(*traffic))
+		return err
 	case "profile":
 		debugf("handling profile args=%v", args)
 		return runProfile(ctx, client, args[1:])
@@ -806,6 +820,19 @@ func formatStatusWithProfiles(status *types.Status, profiles []types.Profile) st
 	return buf.String()
 }
 
+func formatTrafficSnapshot(traffic types.TrafficSnapshot) string {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Connected: %t\n", traffic.Connected)
+	fmt.Fprintf(&buf, "Traffic Sent: %d B\n", traffic.BytesSent)
+	fmt.Fprintf(&buf, "Traffic Received: %d B\n", traffic.BytesReceived)
+	fmt.Fprintf(&buf, "Speed Sent: %.0f B/s\n", traffic.BytesSentPerSecond)
+	fmt.Fprintf(&buf, "Speed Received: %.0f B/s\n", traffic.BytesReceivedPerSecond)
+	if traffic.SampledAt != "" {
+		fmt.Fprintf(&buf, "Sampled: %s\n", traffic.SampledAt)
+	}
+	return buf.String()
+}
+
 func usage() {
 	_, _ = io.WriteString(cliOut, rootHelp())
 }
@@ -905,6 +932,7 @@ func rootHelpTopic() helpTopic {
 			{Name: "proxy", Summary: "Control the built-in local SOCKS5 proxy"},
 			{Name: "logs", Summary: "Show recent daemon logs"},
 			{Name: "diag", Summary: "Export diagnostics as JSON"},
+			{Name: "traffic", Summary: "Show traffic totals and speeds"},
 			{Name: "watch", Summary: "Stream daemon events as NDJSON"},
 		},
 		Examples: []string{
@@ -914,6 +942,7 @@ func rootHelpTopic() helpTopic {
 			"flexconnect up",
 			"flexconnect up -p corp",
 			"flexconnect down",
+			"flexconnect traffic",
 			"flexconnect profile update -p corp --user alice --server vpn.example.com --password secret --auto-reconnect true --apply-dns true --socks5-listen 127.0.0.1:1080",
 			"flexconnect proxy enable 127.0.0.1:1080",
 		},
@@ -959,6 +988,12 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 			Usage:       "flexconnect diag [file]",
 			Description: "Print diagnostics as JSON or write them to a file.",
 			Examples:    []string{"flexconnect diag", "flexconnect diag diag.json"},
+		},
+		"traffic": {
+			Name:        "traffic",
+			Usage:       "flexconnect traffic [--json]",
+			Description: "Show VPN traffic totals and sampled upload/download speeds.",
+			Examples:    []string{"flexconnect traffic", "flexconnect traffic --json"},
 		},
 		"watch": {
 			Name:        "watch",
