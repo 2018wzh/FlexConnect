@@ -12,7 +12,6 @@ import (
 
 	systraylib "fyne.io/systray"
 
-	brandicons "flexconnect/assets/icons"
 	"flexconnect/client/local"
 	"flexconnect/internal/logging"
 	"flexconnect/internal/types"
@@ -37,12 +36,14 @@ type toggleState struct {
 type Menu struct {
 	Client *local.Client
 
-	mu          sync.Mutex
-	status      *types.Status
-	diag        *types.Diagnostics
-	profiles    []types.Profile
-	rebuildCh   chan struct{}
-	eventCancel context.CancelFunc
+	rebuildMu  sync.Mutex
+	mu         sync.Mutex
+	status     *types.Status
+	diag       *types.Diagnostics
+	profiles   []types.Profile
+	rebuildCh  chan struct{}
+	runCancel  context.CancelFunc
+	menuCancel context.CancelFunc
 }
 
 func (m *Menu) Run() {
@@ -54,18 +55,26 @@ func (m *Menu) Run() {
 }
 
 func (m *Menu) onReady() {
-	setTrayIcon()
+	setTrayIconColor(trayIconBlue)
 	setTooltip("FlexConnect")
 	m.init()
-	m.refresh(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	m.mu.Lock()
+	m.runCancel = cancel
+	m.mu.Unlock()
+	m.refresh(ctx)
 	m.rebuild()
-	go m.watch()
+	go m.rebuildLoop(ctx)
+	go m.watch(ctx)
 }
 
 func (m *Menu) onExit() {
 	m.mu.Lock()
-	if m.eventCancel != nil {
-		m.eventCancel()
+	if m.runCancel != nil {
+		m.runCancel()
+	}
+	if m.menuCancel != nil {
+		m.menuCancel()
 	}
 	m.mu.Unlock()
 }
@@ -120,96 +129,21 @@ func (m *Menu) refresh(ctx context.Context) {
 }
 
 func (m *Menu) rebuild() {
+	m.rebuildMu.Lock()
+	defer m.rebuildMu.Unlock()
+
 	m.mu.Lock()
 	status := copyStatus(m.status)
 	diag := copyDiagnostics(m.diag)
 	profiles := append([]types.Profile(nil), m.profiles...)
-	if m.eventCancel != nil {
-		m.eventCancel()
+	if m.menuCancel != nil {
+		m.menuCancel()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m.eventCancel = cancel
+	m.menuCancel = cancel
 	m.mu.Unlock()
 
-	sort.Slice(profiles, func(i, j int) bool {
-		return strings.ToLower(profileTitle(profiles[i])) < strings.ToLower(profileTitle(profiles[j]))
-	})
-	systraylib.ResetMenu()
-	setTrayIcon()
-	setTooltip(tooltipText(status, profiles))
-
-	m.addStatusSection(status, profiles)
-	systraylib.AddSeparator()
-
-	toggle := toggleForStatus(status)
-	toggleItem := systraylib.AddMenuItem(toggle.Title, "")
-	if toggle.Enabled {
-		onClick(ctx, toggleItem, func(context.Context) {
-			m.handleToggle(toggle.Action)
-		})
-	} else {
-		toggleItem.Disable()
-	}
-	m.addInformationSection(diag, status, profiles)
-	systraylib.AddSeparator()
-
-	m.addProfileSection(ctx, status, profiles)
-	systraylib.AddSeparator()
-
-	m.addSettingsSection(ctx, status, profiles)
-}
-
-func (m *Menu) addStatusSection(status *types.Status, profiles []types.Profile) {
-	addDisabled("Status: " + stateText(status))
-	if status == nil {
-		return
-	}
-	if status.CurrentProfileID != "" {
-		addDisabled("Current Profile: " + profileNameByID(profiles, status.CurrentProfileID))
-	}
-	if status.ConnectedProfileID != "" {
-		addDisabled("Connected Profile: " + profileNameByID(profiles, status.ConnectedProfileID))
-	}
-	if status.LastError != "" {
-		addDisabled("Last Error: " + status.LastError)
-	}
-}
-
-func (m *Menu) addInformationSection(diag *types.Diagnostics, status *types.Status, profiles []types.Profile) {
-	infoTitle := "Information"
-	if status != nil && status.Session != nil && status.Session.VPNAddress != "" {
-		infoTitle = "Information: " + status.Session.VPNAddress
-	}
-	info := systraylib.AddMenuItem(infoTitle, "")
-	for _, row := range diagnosticsSummaryRows(diag, status, profiles) {
-		info.AddSubMenuItem(row, "").Disable()
-	}
-}
-
-func (m *Menu) addProfileSection(ctx context.Context, status *types.Status, profiles []types.Profile) {
-	currentID := ""
-	if status != nil {
-		currentID = status.CurrentProfileID
-	}
-	title := "Profile"
-	if currentID != "" {
-		title = "Profile: " + profileNameByID(profiles, currentID)
-	}
-	profileMenu := systraylib.AddMenuItem(title, "")
-	if len(profiles) == 0 {
-		profileMenu.AddSubMenuItem("No profiles", "").Disable()
-		return
-	}
-	for _, profile := range profiles {
-		profile := profile
-		item := profileMenu.AddSubMenuItemCheckbox(profileTitle(profile), profile.ServerURL, profile.ID == currentID)
-		if profile.ID == currentID {
-			item.Check()
-		}
-		onClick(ctx, item, func(context.Context) {
-			m.handleProfileSelection(ctx, profile.ID)
-		})
-	}
+	m.renderMenu(ctx, buildMenuModel(status, diag, profiles))
 }
 
 func (m *Menu) handleProfileSelection(ctx context.Context, profileID string) {
@@ -239,48 +173,6 @@ func (m *Menu) handleProfileSelection(ctx context.Context, profileID string) {
 	}
 	m.refresh(ctx)
 	m.requestRebuild()
-}
-
-func (m *Menu) addSettingsSection(ctx context.Context, status *types.Status, profiles []types.Profile) {
-	settings := systraylib.AddMenuItem("Settings", "")
-	socks5Enabled := false
-	if status != nil {
-		socks5Enabled = status.SOCKS5Enabled
-	}
-	currentProfile := currentProfileByID(profiles, statusCurrentID(status))
-	autoReconnectEnabled := false
-	applyDNSEnabled := true
-	if currentProfile != nil {
-		autoReconnectEnabled = types.BoolValue(currentProfile.AutoReconnect, false)
-		applyDNSEnabled = types.BoolValue(currentProfile.ApplyDNS, true)
-	}
-	socks5Item := settings.AddSubMenuItemCheckbox("Enable SOCKS5 Proxy", "", socks5Enabled)
-	if status == nil || status.CurrentProfileID == "" {
-		socks5Item.Disable()
-	} else {
-		onClick(ctx, socks5Item, func(context.Context) { m.handleSocks5Toggle(!socks5Enabled) })
-	}
-	autoReconnectItem := settings.AddSubMenuItemCheckbox("Auto Reconnect", "", autoReconnectEnabled)
-	if currentProfile == nil {
-		autoReconnectItem.Disable()
-	} else {
-		onClick(ctx, autoReconnectItem, func(context.Context) {
-			m.handleAutoReconnectToggle(!autoReconnectEnabled)
-		})
-	}
-	applyDNSItem := settings.AddSubMenuItemCheckbox("Apply DNS", "", applyDNSEnabled)
-	if currentProfile == nil {
-		applyDNSItem.Disable()
-	} else {
-		onClick(ctx, applyDNSItem, func(context.Context) {
-			m.handleApplyDNSToggle(!applyDNSEnabled)
-		})
-	}
-	copyItem := settings.AddSubMenuItem("Copy Diagnostics", "")
-	onClick(ctx, copyItem, func(context.Context) { m.copyDiagnostics() })
-	systraylib.AddSeparator()
-	quit := systraylib.AddMenuItem("Quit", "Quit the app")
-	onClick(ctx, quit, func(context.Context) { systraylib.Quit() })
 }
 
 func statusCurrentID(status *types.Status) string {
@@ -378,25 +270,117 @@ func (m *Menu) copyDiagnostics() {
 	}
 }
 
-func (m *Menu) watch() {
+func (m *Menu) renderMenu(ctx context.Context, model menuModel) {
+	systraylib.ResetMenu()
+	setTrayIconColor(model.Icon)
+	setTooltip(model.Tooltip)
+	for _, item := range model.Items {
+		m.renderMenuItem(ctx, nil, item)
+	}
+}
+
+func (m *Menu) renderMenuItem(ctx context.Context, parent *systraylib.MenuItem, item menuItemModel) {
+	if item.Separator {
+		if parent == nil {
+			systraylib.AddSeparator()
+		} else {
+			parent.AddSeparator()
+		}
+		return
+	}
+
+	menuItem := addMenuItem(parent, item)
+	if item.Checked {
+		menuItem.Check()
+	}
+	if item.Disabled {
+		menuItem.Disable()
+	} else {
+		m.bindMenuAction(ctx, menuItem, item)
+	}
+	for _, child := range item.Children {
+		m.renderMenuItem(ctx, menuItem, child)
+	}
+}
+
+func addMenuItem(parent *systraylib.MenuItem, item menuItemModel) *systraylib.MenuItem {
+	if parent == nil {
+		if item.Checkbox {
+			return systraylib.AddMenuItemCheckbox(item.Title, item.Tooltip, item.Checked)
+		}
+		return systraylib.AddMenuItem(item.Title, item.Tooltip)
+	}
+	if item.Checkbox {
+		return parent.AddSubMenuItemCheckbox(item.Title, item.Tooltip, item.Checked)
+	}
+	return parent.AddSubMenuItem(item.Title, item.Tooltip)
+}
+
+func (m *Menu) bindMenuAction(ctx context.Context, item *systraylib.MenuItem, model menuItemModel) {
+	switch model.Action {
+	case menuActionToggle:
+		onClick(ctx, item, func(context.Context) { m.handleToggle(model.Toggle) })
+	case menuActionProfile:
+		onClick(ctx, item, func(ctx context.Context) { m.handleProfileSelection(ctx, model.ProfileID) })
+	case menuActionSocks5:
+		onClick(ctx, item, func(context.Context) { m.handleSocks5Toggle(model.Value) })
+	case menuActionAutoReconnect:
+		onClick(ctx, item, func(context.Context) { m.handleAutoReconnectToggle(model.Value) })
+	case menuActionApplyDNS:
+		onClick(ctx, item, func(context.Context) { m.handleApplyDNSToggle(model.Value) })
+	case menuActionCopyDiagnostics:
+		onClick(ctx, item, func(context.Context) { m.copyDiagnostics() })
+	case menuActionQuit:
+		onClick(ctx, item, func(context.Context) { systraylib.Quit() })
+	}
+}
+
+func (m *Menu) rebuildLoop(ctx context.Context) {
 	m.init()
-	go func() {
-		for range m.rebuildCh {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.rebuildCh:
+			m.drainRebuilds()
 			m.rebuild()
 		}
-	}()
+	}
+}
+
+func (m *Menu) drainRebuilds() {
 	for {
-		watcher, err := m.Client.Watch(context.Background())
-		if err != nil {
-			systrayLog.Error(err)
+		select {
+		case <-m.rebuildCh:
+		default:
 			return
+		}
+	}
+}
+
+func (m *Menu) watch(ctx context.Context) {
+	m.init()
+	for {
+		watcher, err := m.Client.Watch(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			systrayLog.Error(err)
+			if !waitForRetry(ctx) {
+				return
+			}
+			continue
 		}
 		for {
 			notify, err := watcher.Next()
 			if err != nil {
 				_ = watcher.Close()
+				if ctx.Err() != nil {
+					return
+				}
 				systrayLog.Error(err)
-				return
+				break
 			}
 			changed := false
 			m.mu.Lock()
@@ -410,10 +394,23 @@ func (m *Menu) watch() {
 			}
 			m.mu.Unlock()
 			if changed {
-				m.refresh(context.Background())
 				m.requestRebuild()
 			}
 		}
+		if !waitForRetry(ctx) {
+			return
+		}
+	}
+}
+
+func waitForRetry(ctx context.Context) bool {
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -437,16 +434,14 @@ func onClick(ctx context.Context, item *systraylib.MenuItem, fn func(context.Con
 			select {
 			case <-ctx.Done():
 				return
-			case <-item.ClickedCh:
+			case _, ok := <-item.ClickedCh:
+				if !ok || ctx.Err() != nil {
+					return
+				}
 				fn(ctx)
 			}
 		}
 	}()
-}
-
-func addDisabled(title string) {
-	item := systraylib.AddMenuItem(title, "")
-	item.Disable()
 }
 
 func setTooltip(text string) {
@@ -457,15 +452,11 @@ func setTooltip(text string) {
 	systraylib.SetTooltip(text)
 }
 
-func setTrayIcon() {
-	// Use PNG on Linux for better tray backend compatibility.
-	// Keep ICO for non-Linux platforms.
+func setTrayIconColor(color trayIconColor) {
+	systraylib.SetIcon(trayIconForColor(color))
 	if runtime.GOOS == "linux" {
-		systraylib.SetIcon(brandicons.Favicon32PNG())
 		time.Sleep(10 * time.Millisecond)
-		return
 	}
-	systraylib.SetIcon(brandicons.TrayICO())
 }
 
 func toggleForStatus(status *types.Status) toggleState {

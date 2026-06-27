@@ -76,6 +76,26 @@ type Point struct {
 	X, Y float64
 }
 
+type colorStops [3]color.NRGBA
+
+var trayStatusGradients = map[string]colorStops{
+	"blue": {
+		{R: 0x00, G: 0xF2, B: 0xFE, A: 0xFF},
+		{R: 0x4F, G: 0xAC, B: 0xFE, A: 0xFF},
+		{R: 0x00, G: 0x60, B: 0xDC, A: 0xFF},
+	},
+	"red": {
+		{R: 0xFF, G: 0x78, B: 0x78, A: 0xFF},
+		{R: 0xF0, G: 0x00, B: 0x00, A: 0xFF},
+		{R: 0xA0, G: 0x00, B: 0x00, A: 0xFF},
+	},
+	"green": {
+		{R: 0x78, G: 0xFF, B: 0x78, A: 0xFF},
+		{R: 0x00, G: 0xF0, B: 0x00, A: 0xFF},
+		{R: 0x00, G: 0xA0, B: 0x00, A: 0xFF},
+	},
+}
+
 func rotate(p Point, deg float64) Point {
 	rad := deg * math.Pi / 180.0
 	cos := math.Cos(rad)
@@ -90,6 +110,76 @@ func distance(p1, p2 Point) float64 {
 	dx := p1.X - p2.X
 	dy := p1.Y - p2.Y
 	return math.Sqrt(dx*dx + dy*dy)
+}
+
+func gradientColor(stops colorStops, u float64) color.NRGBA {
+	if u < 0 {
+		u = 0
+	}
+	if u > 1 {
+		u = 1
+	}
+	if u < 0.5 {
+		return mixColor(stops[0], stops[1], u/0.5)
+	}
+	return mixColor(stops[1], stops[2], (u-0.5)/0.5)
+}
+
+func mixColor(a, b color.NRGBA, t float64) color.NRGBA {
+	return color.NRGBA{
+		R: uint8(float64(a.R) + (float64(b.R)-float64(a.R))*t),
+		G: uint8(float64(a.G) + (float64(b.G)-float64(a.G))*t),
+		B: uint8(float64(a.B) + (float64(b.B)-float64(a.B))*t),
+		A: uint8(float64(a.A) + (float64(b.A)-float64(a.A))*t),
+	}
+}
+
+func gradientIcon(src *image.NRGBA, stops colorStops) *image.NRGBA {
+	dst := image.NewNRGBA(src.Bounds())
+	bounds := src.Bounds()
+	for y := src.Bounds().Min.Y; y < src.Bounds().Max.Y; y++ {
+		for x := src.Bounds().Min.X; x < src.Bounds().Max.X; x++ {
+			a := src.NRGBAAt(x, y).A
+			if a == 0 {
+				continue
+			}
+			u := (float64(x-bounds.Min.X) + 0.5 + float64(y-bounds.Min.Y) + 0.5) / float64(bounds.Dx()+bounds.Dy())
+			c := gradientColor(stops, u)
+			c.A = a
+			dst.SetNRGBA(x, y, c)
+		}
+	}
+	return dst
+}
+
+func writePNG(path string, img image.Image) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return png.Encode(f, img)
+}
+
+func writeICO(path string, images []image.Image) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return ico.EncodeAll(f, images)
+}
+
+func writeTrayStatusAssets(assetsDir, name string, img image.Image) error {
+	img256 := resize.Resize(256, 256, img, resize.Lanczos3)
+	img64 := resize.Resize(64, 64, img, resize.Lanczos3)
+	img48 := resize.Resize(48, 48, img, resize.Lanczos3)
+	img32 := resize.Resize(32, 32, img, resize.Lanczos3)
+	img16 := resize.Resize(16, 16, img, resize.Lanczos3)
+	if err := writePNG(filepath.Join(assetsDir, "tray-"+name+".png"), img32); err != nil {
+		return err
+	}
+	return writeICO(filepath.Join(assetsDir, "tray-"+name+".ico"), []image.Image{img16, img32, img48, img64, img256})
 }
 
 func bezierQ(p0, p1, p2 Point, t float64) Point {
@@ -332,6 +422,12 @@ func main() {
 	}
 	_, _ = fFlexTrayIco.Write(buf.Bytes())
 	fFlexTrayIco.Close()
+
+	for name, stops := range trayStatusGradients {
+		if err := writeTrayStatusAssets(assetsDir, name, gradientIcon(img, stops)); err != nil {
+			panic(err)
+		}
+	}
 
 	fmt.Println("All assets successfully generated!")
 }

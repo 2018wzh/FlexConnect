@@ -5,6 +5,7 @@ This directory contains the current FlexConnect brand assets derived from the us
 - `app.svg`: square application icon used for tray, favicon, and executable icon generation
 - `logo.svg`: horizontal product logo used in the local dashboard header
 - `favicon.ico`, `favicon-32.png`, `tray.ico`: generated runtime assets
+- `tray-blue.*`, `tray-red.*`, `tray-green.*`: generated tray status icons
 
 Regenerate the brand assets, bitmaps, and `.ico` outputs with:
 

@@ -17,6 +17,24 @@ var (
 
 	//go:embed tray.ico
 	trayICO []byte
+
+	//go:embed tray-blue.ico
+	trayBlueICO []byte
+
+	//go:embed tray-blue.png
+	trayBluePNG []byte
+
+	//go:embed tray-red.ico
+	trayRedICO []byte
+
+	//go:embed tray-red.png
+	trayRedPNG []byte
+
+	//go:embed tray-green.ico
+	trayGreenICO []byte
+
+	//go:embed tray-green.png
+	trayGreenPNG []byte
 )
 
 func AppSVG() string {
@@ -37,4 +55,28 @@ func Favicon32PNG() []byte {
 
 func TrayICO() []byte {
 	return trayICO
+}
+
+func TrayBlueICO() []byte {
+	return trayBlueICO
+}
+
+func TrayBluePNG() []byte {
+	return trayBluePNG
+}
+
+func TrayRedICO() []byte {
+	return trayRedICO
+}
+
+func TrayRedPNG() []byte {
+	return trayRedPNG
+}
+
+func TrayGreenICO() []byte {
+	return trayGreenICO
+}
+
+func TrayGreenPNG() []byte {
+	return trayGreenPNG
 }

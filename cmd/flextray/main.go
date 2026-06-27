@@ -15,6 +15,16 @@ import (
 )
 
 func main() {
+	lock, alreadyRunning, err := acquireInstanceLock("FlexConnectFlexTray")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if alreadyRunning {
+		return
+	}
+	defer lock.Close()
+
 	socket := flag.String("socket", ipc.DefaultSocketPath(), "daemon socket or named pipe path")
 	flag.Parse()
 
@@ -37,4 +47,3 @@ func showStartupError(message string, err error) {
 		fmt.Fprintln(os.Stderr, full)
 	}
 }
-
