@@ -64,6 +64,7 @@ func (m *Menu) onReady() {
 	m.refresh(ctx)
 	m.rebuild()
 	go m.rebuildLoop(ctx)
+	go m.openLoop(ctx)
 	go m.watch(ctx)
 }
 
@@ -327,6 +328,17 @@ func (m *Menu) bindMenuAction(ctx context.Context, item *systraylib.MenuItem, mo
 	}
 }
 
+// updateTrayTooltip sets the tray hover tooltip from current state without
+// resetting the menu. Safe to call on every traffic tick.
+func (m *Menu) updateTrayTooltip() {
+	m.mu.Lock()
+	status := copyStatus(m.status)
+	traffic := m.traffic
+	profiles := append([]types.Profile(nil), m.profiles...)
+	m.mu.Unlock()
+	setTooltip(tooltipText(status, traffic, profiles))
+}
+
 func (m *Menu) rebuildLoop(ctx context.Context) {
 	m.init()
 	for {
@@ -346,6 +358,18 @@ func (m *Menu) drainRebuilds() {
 		case <-m.rebuildCh:
 		default:
 			return
+		}
+	}
+}
+
+func (m *Menu) openLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-systraylib.TrayOpenedCh:
+			m.refresh(ctx)
+			m.requestRebuild()
 		}
 	}
 }
@@ -374,28 +398,36 @@ func (m *Menu) watch(ctx context.Context) {
 				systrayLog.Error(err)
 				break
 			}
-			changed := false
-			m.mu.Lock()
-			if notify.Status != nil {
-				m.status = notify.Status
-				changed = true
-			}
-			if notify.Profiles != nil {
-				m.profiles = append([]types.Profile(nil), notify.Profiles...)
-				changed = true
-			}
-			if notify.Traffic != nil {
-				m.traffic = *notify.Traffic
-				changed = true
-			}
-			m.mu.Unlock()
-			if changed {
-				m.requestRebuild()
-			}
+			m.handleNotify(notify, m.updateTrayTooltip)
 		}
 		if !waitForRetry(ctx) {
 			return
 		}
+	}
+}
+
+func (m *Menu) handleNotify(notify types.Notify, updateTooltip func()) {
+	stateChanged := false
+	trafficChanged := false
+	m.mu.Lock()
+	if notify.Status != nil {
+		m.status = notify.Status
+		stateChanged = true
+	}
+	if notify.Profiles != nil {
+		m.profiles = append([]types.Profile(nil), notify.Profiles...)
+		stateChanged = true
+	}
+	if notify.Traffic != nil {
+		m.traffic = *notify.Traffic
+		trafficChanged = true
+	}
+	m.mu.Unlock()
+	if trafficChanged && !stateChanged {
+		updateTooltip()
+	}
+	if stateChanged {
+		m.requestRebuild()
 	}
 }
 
@@ -469,21 +501,100 @@ func toggleForStatus(status *types.Status) toggleState {
 	}
 }
 
+// maxTooltipLen is the Windows NOTIFYICONDATA szTip limit (128 WCHARs,
+// minus one for the null terminator). We count runes, not bytes, because
+// each BMP character (including ↑↓…) occupies one WCHAR.
+const maxTooltipLen = 127
+
 func tooltipText(status *types.Status, traffic types.TrafficSnapshot, profiles []types.Profile) string {
-	return strings.Join(trafficSummaryRows(status, traffic, profiles), "\n")
+	state := stateText(status)
+
+	// Line 1: state – always shown in full (short).
+	line1 := fmt.Sprintf("%s", state)
+
+	// Line 3: traffic & speed – always shown (use "0" when idle, never hide).
+	speed := fmt.Sprintf("\u2191%s/s \u2193%s/s",
+		formatByteSizeCompact(uint64(traffic.BytesSentPerSecond)),
+		formatByteSizeCompact(uint64(traffic.BytesReceivedPerSecond)))
+	line3 := speed
+
+	// Line 2: identity – may be truncated when total exceeds maxTooltipLen.
+	identity := trafficIdentity(status, profiles)
+
+	// Calculate how many characters remain for the identity line using
+	// rune count (matching Windows WCHAR semantics).
+	budget := maxTooltipLen - len([]rune(line1)) - 1 - len([]rune(line3)) - 1
+	if budget < 0 {
+		budget = 0
+	}
+	line2 := truncateTo(identity, budget)
+
+	return line1 + "\n" + line2 + "\n" + line3
+}
+
+// truncateTo returns s if it fits within max, otherwise shortens it with "…".
+func truncateTo(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	if max <= 1 {
+		return "…"
+	}
+	return string(runes[:max-1]) + "…"
+}
+
+// formatByteSizeCompact produces short labels with B/KB/MB/GB suffixes
+// (e.g. "512B", "1.5KB", "2.3MB").
+func formatByteSizeCompact(bytes uint64) string {
+	const (
+		kibi = 1024
+		mebi = 1024 * 1024
+		gibi = 1024 * 1024 * 1024
+	)
+	switch {
+	case bytes >= gibi:
+		return fmt.Sprintf("%.1fGB", float64(bytes)/float64(gibi))
+	case bytes >= mebi:
+		return fmt.Sprintf("%.1fMB", float64(bytes)/float64(mebi))
+	case bytes >= kibi:
+		return fmt.Sprintf("%.1fKB", float64(bytes)/float64(kibi))
+	default:
+		return fmt.Sprintf("%dB", bytes)
+	}
 }
 
 func trafficSummaryRows(status *types.Status, traffic types.TrafficSnapshot, profiles []types.Profile) []string {
-	rows := []string{"FlexConnect: " + stateText(status)}
-	identity := trafficIdentity(status, profiles)
-	if identity != "" {
-		rows = append(rows, identity)
+	rows := []string{"Status: " + stateText(status)}
+
+	// Profile name.
+	profileName := profileNameForStatus(status, profiles)
+	if profileName != "" {
+		rows = append(rows, "Profile: "+profileName)
 	}
+
+	// VPN IP from session.
+	if status != nil && status.Session != nil {
+		if ip := strings.TrimSpace(status.Session.VPNAddress); ip != "" {
+			rows = append(rows, "IP: "+ip)
+		}
+	}
+
 	rows = append(rows,
-		fmt.Sprintf("Traffic ↑%s ↓%s", formatByteSize(traffic.BytesSent), formatByteSize(traffic.BytesReceived)),
-		fmt.Sprintf("Speed ↑%s ↓%s", formatByteRate(traffic.BytesSentPerSecond), formatByteRate(traffic.BytesReceivedPerSecond)),
+		fmt.Sprintf("Traffic: ↑%s ↓%s", formatByteSizeCompact(traffic.BytesSent), formatByteSizeCompact(traffic.BytesReceived)),
 	)
 	return rows
+}
+
+// profileNameForStatus returns the display name of the current profile, or empty.
+func profileNameForStatus(status *types.Status, profiles []types.Profile) string {
+	if status == nil || status.CurrentProfileID == "" {
+		return ""
+	}
+	return profileNameByID(profiles, status.CurrentProfileID)
 }
 
 func trafficIdentity(status *types.Status, profiles []types.Profile) string {

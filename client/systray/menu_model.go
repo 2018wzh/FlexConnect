@@ -1,8 +1,11 @@
 package systray
 
 import (
+	"fmt"
+	"net"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
 	brandicons "flexconnect/assets/icons"
@@ -103,14 +106,113 @@ func informationItem(status *types.Status, traffic types.TrafficSnapshot, profil
 	if status != nil && status.Session != nil && status.Session.VPNAddress != "" {
 		title = "Information: " + status.Session.VPNAddress
 	}
-	rows := trafficSummaryRows(status, traffic, profiles)
 	item := menuItemModel{Title: title}
-	for _, row := range rows {
+
+	// Basic rows (status, identity, traffic).
+	basicRows := trafficSummaryRows(status, traffic, profiles)
+	for _, row := range basicRows {
 		if strings.TrimSpace(row) != "" {
 			item.Children = append(item.Children, disabledItem(row))
 		}
 	}
+
+	if status != nil && status.Session != nil {
+		s := status.Session
+
+		// Separator before session details.
+		item.Children = append(item.Children, separatorItem())
+
+		// Session details.
+		if s.ServerAddress != "" {
+			item.Children = append(item.Children, disabledItem("Server: "+s.ServerAddress))
+		}
+		if s.Hostname != "" {
+			item.Children = append(item.Children, disabledItem("Hostname: "+s.Hostname))
+		}
+		if s.TUNName != "" {
+			item.Children = append(item.Children, disabledItem("TUN: "+s.TUNName))
+		}
+		if s.VPNAddress != "" && s.VPNMask != "" {
+			label := "VPN IP: " + s.VPNAddress + "/" + maskToCIDR(s.VPNMask)
+			item.Children = append(item.Children, disabledItem(label))
+		}
+		if s.MTU > 0 {
+			item.Children = append(item.Children, disabledItem(fmt.Sprintf("MTU: %d", s.MTU)))
+		}
+
+		// DNS servers.
+		if len(s.DNS) > 0 {
+			item.Children = append(item.Children, disabledItem("DNS: "+strings.Join(s.DNS, ", ")))
+		}
+
+		// Cipher info.
+		if s.TLSCipher != "" {
+			item.Children = append(item.Children, disabledItem("TLS: "+s.TLSCipher))
+		}
+		if s.DTLSCipher != "" {
+			item.Children = append(item.Children, disabledItem("DTLS: "+s.DTLSCipher))
+		}
+	}
+
+	// Routes submenu (shown even without an active session).
+	if status != nil {
+		routesItem := routesMenuItem(status)
+		if len(routesItem.Children) > 0 {
+			item.Children = append(item.Children, separatorItem(), routesItem)
+		}
+	}
+
 	return item
+}
+
+func routesMenuItem(status *types.Status) menuItemModel {
+	routes := status.EffectiveRoutes
+	includeCount := 0
+	excludeCount := 0
+	for _, r := range routes {
+		if r.Action == "exclude" {
+			excludeCount++
+		} else {
+			includeCount++
+		}
+	}
+	title := fmt.Sprintf("Routes (%d)", len(routes))
+	item := menuItemModel{Title: title}
+	if len(routes) == 0 {
+		item.Children = append(item.Children, disabledItem("No routes"))
+		return item
+	}
+	// Show summary line.
+	summary := fmt.Sprintf("%d included", includeCount)
+	if excludeCount > 0 {
+		summary += fmt.Sprintf(", %d excluded", excludeCount)
+	}
+	item.Children = append(item.Children, disabledItem(summary), separatorItem())
+
+	// List individual routes.
+	for _, r := range routes {
+		label := r.Destination
+		if r.Action == "exclude" {
+			label += " (excluded)"
+		}
+		source := ""
+		if r.Source != "" {
+			source = " [" + r.Source + "]"
+		}
+		item.Children = append(item.Children, disabledItem(label+source))
+	}
+	return item
+}
+
+// maskToCIDR converts an IPv4 netmask like "255.255.255.0" to a CIDR prefix
+// length like "24". Returns the input unchanged if parsing fails.
+func maskToCIDR(mask string) string {
+	ip := net.ParseIP(mask).To4()
+	if ip == nil {
+		return mask
+	}
+	ones, _ := net.IPv4Mask(ip[0], ip[1], ip[2], ip[3]).Size()
+	return strconv.Itoa(ones)
 }
 
 func profileMenuItem(status *types.Status, profiles []types.Profile) menuItemModel {
