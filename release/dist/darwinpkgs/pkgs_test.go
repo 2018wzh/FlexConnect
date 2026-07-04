@@ -3,6 +3,7 @@ package darwinpkgs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"flexconnect/release/dist"
@@ -38,19 +39,41 @@ func TestStageRoot(t *testing.T) {
 	}
 
 	root := filepath.Join(temp, "root")
-	if err := stageRoot(root, artifacts); err != nil {
+	if err := stageRoot(root, artifacts, "1.2.3"); err != nil {
 		t.Fatalf("stageRoot error: %v", err)
 	}
 
 	want := []string{
 		filepath.Join(root, "usr", "local", "bin", "flexconnect"),
 		filepath.Join(root, "usr", "local", "bin", "flexconnectd"),
-		filepath.Join(root, "usr", "local", "bin", "flextray"),
+		filepath.Join(root, "Applications", "FlexConnect.app", "Contents", "MacOS", "FlexConnect"),
+		filepath.Join(root, "Applications", "FlexConnect.app", "Contents", "Info.plist"),
 		filepath.Join(root, "Library", "LaunchDaemons", "com.flexconnect.flexconnectd.plist"),
 	}
 	for _, path := range want {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected staged file %q: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "usr", "local", "bin", "flextray")); !os.IsNotExist(err) {
+		t.Fatalf("expected bare flextray to be absent, got err=%v", err)
+	}
+	plist, err := os.ReadFile(filepath.Join(root, "Applications", "FlexConnect.app", "Contents", "Info.plist"))
+	if err != nil {
+		t.Fatalf("read Info.plist: %v", err)
+	}
+	for _, fragment := range []string{
+		"<key>CFBundleExecutable</key>",
+		"<string>FlexConnect</string>",
+		"<key>CFBundleIdentifier</key>",
+		"<string>com.flexconnect.app</string>",
+		"<key>CFBundleShortVersionString</key>",
+		"<string>1.2.3</string>",
+		"<key>LSUIElement</key>",
+		"<true/>",
+	} {
+		if !strings.Contains(string(plist), fragment) {
+			t.Fatalf("Info.plist missing %q:\n%s", fragment, plist)
 		}
 	}
 }

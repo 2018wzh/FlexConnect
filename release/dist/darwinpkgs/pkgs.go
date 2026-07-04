@@ -33,7 +33,7 @@ func (t *pkgTarget) Build(b *dist.Build) ([]string, error) {
 	scriptsDir := filepath.Join(workDir, "scripts")
 	componentPkg := filepath.Join(workDir, "FlexConnect.pkg")
 	finalPkg := filepath.Join(b.Out, pkgFilename(b.Version, t.goarch))
-	if err := stageRoot(rootDir, artifacts); err != nil {
+	if err := stageRoot(rootDir, artifacts, b.Version); err != nil {
 		return nil, err
 	}
 	if err := copyScripts(scriptsDir, b); err != nil {
@@ -51,9 +51,10 @@ func (t *pkgTarget) Build(b *dist.Build) ([]string, error) {
 	return []string{finalPkg}, nil
 }
 
-func stageRoot(root string, artifacts dist.CommonArtifacts) error {
+func stageRoot(root string, artifacts dist.CommonArtifacts, version string) error {
 	for _, dir := range []string{
 		filepath.Join(root, "usr", "local", "bin"),
+		filepath.Join(root, "Applications", "FlexConnect.app", "Contents", "MacOS"),
 		filepath.Join(root, "Library", "LaunchDaemons"),
 	} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -66,10 +67,37 @@ func stageRoot(root string, artifacts dist.CommonArtifacts) error {
 	if err := copyFile(artifacts.FlexConnectD, filepath.Join(root, "usr", "local", "bin", "flexconnectd"), 0o755); err != nil {
 		return err
 	}
-	if err := copyFile(artifacts.FlexTray, filepath.Join(root, "usr", "local", "bin", "flextray"), 0o755); err != nil {
+	if err := copyFile(artifacts.FlexTray, filepath.Join(root, "Applications", "FlexConnect.app", "Contents", "MacOS", "FlexConnect"), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(root, "Applications", "FlexConnect.app", "Contents", "Info.plist"), []byte(appInfoPlist(version)), 0o644); err != nil {
 		return err
 	}
 	return copyFile(artifacts.LaunchdPlist, filepath.Join(root, "Library", "LaunchDaemons", "com.flexconnect.flexconnectd.plist"), 0o644)
+}
+
+func appInfoPlist(version string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>FlexConnect</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.flexconnect.app</string>
+  <key>CFBundleName</key>
+  <string>FlexConnect</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>%s</string>
+  <key>CFBundleVersion</key>
+  <string>%s</string>
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>
+`, version, version)
 }
 
 func copyScripts(dst string, b *dist.Build) error {
