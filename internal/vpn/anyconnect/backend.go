@@ -11,6 +11,7 @@ import (
 	acBase "flexconnect/internal/anyconnect/base"
 	acRPC "flexconnect/internal/anyconnect/rpc"
 	acSession "flexconnect/internal/anyconnect/session"
+	acTunnel "flexconnect/internal/anyconnect/tunnel"
 	"flexconnect/internal/types"
 	"flexconnect/internal/vpn"
 )
@@ -131,6 +132,10 @@ func (b *Backend) ReadServerConfig() map[string]any {
 
 func (b *Backend) Events() <-chan vpn.Event {
 	return b.events
+}
+
+func (b *Backend) TunnelDialer(ctx context.Context) (vpn.TunnelDialer, error) {
+	return acTunnel.SessionTunnelDialer(ctx, acSession.Sess.CSess)
 }
 
 func configureProfile(profile types.Profile, password string) {

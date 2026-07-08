@@ -15,7 +15,7 @@ FlexConnect 是一个跨平台可配置的 AnyConnect VPN 客户端，提供守�
 - 管理多个 Profile
 - 发起和断开 VPN 连接
 - 应用服务器路由与本地路由策略
-- 提供本地 SOCKS5 代理
+- 提供本地 SOCKS5 代理；代理连接与域名解析只走已连接的 VPN 隧道
 - 导出诊断信息
 - 通过命令行完成 Profile 管理与路由配置
 
@@ -58,6 +58,8 @@ flexconnect proxy enable 127.0.0.1:1080
 flexconnect proxy disable
 flexconnect logs
 ```
+
+SOCKS5 代理是 VPN-only：启用后只支持 TCP CONNECT 和 IPv4 目标，域名通过 VPN DNS 解析，无法确认走 VPN 时会拒绝连接，不会回退到本机网络。当前不支持 UDP ASSOC、BIND 或 IPv6 代理目标。
 
 ## 构建与安装
 

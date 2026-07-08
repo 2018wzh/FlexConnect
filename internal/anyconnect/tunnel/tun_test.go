@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"encoding/binary"
 	"net/netip"
 	"testing"
 
@@ -52,6 +53,43 @@ func TestBuildOSNetConfig(t *testing.T) {
 	if len(cfg.DNSServers) != 2 || cfg.DNSServers[0].String() != "202.120.80.2" {
 		t.Fatalf("DNSServers = %v", cfg.DNSServers)
 	}
+}
+
+func TestUserFlowRoutesReversePacketsToUserDevice(t *testing.T) {
+	router := newUserFlowRouter()
+	outbound := testIPv4Packet(6, [4]byte{172, 20, 144, 185}, [4]byte{10, 64, 0, 7}, 53124, 443)
+	inbound := testIPv4Packet(6, [4]byte{10, 64, 0, 7}, [4]byte{172, 20, 144, 185}, 443, 53124)
+
+	if !router.recordOutbound(outbound) {
+		t.Fatal("outbound user TCP packet was not recorded")
+	}
+	if !router.matchesInbound(inbound) {
+		t.Fatal("reverse inbound TCP packet was not routed to user tunnel")
+	}
+}
+
+func TestUserFlowDoesNotClaimUnmatchedPackets(t *testing.T) {
+	router := newUserFlowRouter()
+	outbound := testIPv4Packet(17, [4]byte{172, 20, 144, 185}, [4]byte{10, 64, 0, 53}, 53124, 53)
+	unmatched := testIPv4Packet(17, [4]byte{10, 64, 0, 54}, [4]byte{172, 20, 144, 185}, 53, 53124)
+
+	if !router.recordOutbound(outbound) {
+		t.Fatal("outbound user UDP packet was not recorded")
+	}
+	if router.matchesInbound(unmatched) {
+		t.Fatal("unmatched inbound UDP packet was incorrectly routed to user tunnel")
+	}
+}
+
+func testIPv4Packet(proto byte, src, dst [4]byte, srcPort, dstPort uint16) []byte {
+	packet := make([]byte, 40)
+	packet[0] = 0x45
+	packet[9] = proto
+	copy(packet[12:16], src[:])
+	copy(packet[16:20], dst[:])
+	binary.BigEndian.PutUint16(packet[20:22], srcPort)
+	binary.BigEndian.PutUint16(packet[22:24], dstPort)
+	return packet
 }
 
 func TestBuildOSNetConfigAddsDefaultRouteWhenServerIncludesAreEmpty(t *testing.T) {

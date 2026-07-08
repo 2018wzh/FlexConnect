@@ -3,6 +3,7 @@ package appd
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -33,11 +34,13 @@ func (s *memoryStore) Save(data storefile.Data) error {
 }
 
 type fakeBackend struct {
-	mu       sync.Mutex
-	events   chan vpn.Event
-	connects int
-	failures []error
-	traffic  *types.TrafficStats
+	mu        sync.Mutex
+	events    chan vpn.Event
+	connects  int
+	failures  []error
+	traffic   *types.TrafficStats
+	tunnel    vpn.TunnelDialer
+	tunnelErr error
 }
 
 func newFakeBackend(failures ...error) *fakeBackend {
@@ -71,6 +74,17 @@ func (b *fakeBackend) Traffic() *types.TrafficStats {
 }
 func (b *fakeBackend) ReadServerConfig() map[string]any { return nil }
 func (b *fakeBackend) Events() <-chan vpn.Event         { return b.events }
+func (b *fakeBackend) TunnelDialer(context.Context) (vpn.TunnelDialer, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.tunnelErr != nil {
+		return nil, b.tunnelErr
+	}
+	if b.tunnel == nil {
+		return nil, errors.New("no tunnel dialer")
+	}
+	return b.tunnel, nil
+}
 
 func (b *fakeBackend) emit(event vpn.Event) {
 	b.events <- event
@@ -178,6 +192,59 @@ func TestManualDisconnectCancelsScheduledAutoReconnect(t *testing.T) {
 	if got := backend.connectCount(); got != 1 {
 		t.Fatalf("connect count = %d, want 1", got)
 	}
+}
+
+func TestProxyStartsOnlyWithTunnelDialer(t *testing.T) {
+	profile := testProfile("p1", false)
+	profile.SOCKS5Enabled = true
+	profile.SOCKS5Listen = "127.0.0.1:0"
+	backend := newFakeBackend()
+	backend.tunnel = &noopTunnelDialer{}
+	service := newTestService(t, backend, profile)
+
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	status := service.Status()
+	if !status.SOCKS5Enabled {
+		t.Fatal("SOCKS5 should be enabled when tunnel dialer is available")
+	}
+	if status.SOCKS5Listen == "" || status.SOCKS5Listen == "127.0.0.1:0" {
+		t.Fatalf("SOCKS5Listen = %q", status.SOCKS5Listen)
+	}
+	if err := service.Disconnect(context.Background()); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+}
+
+func TestProxyDoesNotFallbackWhenTunnelDialerUnavailable(t *testing.T) {
+	profile := testProfile("p1", false)
+	profile.SOCKS5Enabled = true
+	profile.SOCKS5Listen = "127.0.0.1:0"
+	backend := newFakeBackend()
+	backend.tunnelErr = errors.New("vpn tunnel unavailable")
+	service := newTestService(t, backend, profile)
+
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatalf("connect should not fail the VPN session when proxy cannot start: %v", err)
+	}
+	status := service.Status()
+	if status.SOCKS5Enabled || status.SOCKS5Listen != "" {
+		t.Fatalf("SOCKS5 status = enabled %v listen %q, want disabled", status.SOCKS5Enabled, status.SOCKS5Listen)
+	}
+	if status.LastError == "" {
+		t.Fatal("LastError should explain why the VPN-only proxy was not started")
+	}
+}
+
+type noopTunnelDialer struct{}
+
+func (noopTunnelDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, errors.New("not used")
+}
+
+func (noopTunnelDialer) LookupContextHost(context.Context, string) ([]string, error) {
+	return nil, errors.New("not used")
 }
 
 func newTestService(t *testing.T, backend *fakeBackend, profiles ...types.Profile) *Service {

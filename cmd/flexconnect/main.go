@@ -921,7 +921,7 @@ func rootHelpTopic() helpTopic {
 		Summary: "CLI for the FlexConnect daemon",
 		Usage:   "flexconnect [--socket <path>] [-v|--verbose] <command> [command flags]",
 		Description: "FlexConnect controls the local FlexConnect daemon, manages VPN profiles,\n" +
-			"starts AnyConnect sessions, and exposes local tools like diagnostics and SOCKS5 proxying.",
+			"starts AnyConnect sessions, and exposes local tools like diagnostics and VPN-only SOCKS5 proxying.",
 		Subcommands: []helpTopic{
 			{Name: "status", Summary: "Show current daemon and VPN status"},
 			{Name: "login", Summary: "Create a profile and log in"},
@@ -1037,7 +1037,7 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 			Name:  "profile update",
 			Usage: "flexconnect profile update -p <profile-name> [--name ..] [--server ..] [--user ..] [--group ..] [--password ..] [--dns a,b] [--mtu 1399] [--accept true|false] [--auto-reconnect true|false] [--apply-dns true|false] [--include a,b] [--exclude c,d] [--socks5 true|false] [--socks5-listen 127.0.0.1:1080]",
 			Description: "Update profile fields in place. Runtime-relevant changes reconnect an active profile automatically.\n" +
-				"Use `socks5=true` to enable the built-in SOCKS5 proxy for that profile.",
+				"Use `socks5=true` to enable the built-in VPN-only SOCKS5 proxy for that profile.",
 		},
 		"route": {
 			Name:        "route",
@@ -1061,7 +1061,7 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 		"proxy": {
 			Name:        "proxy",
 			Usage:       "flexconnect proxy <subcommand>",
-			Description: "Control the built-in local SOCKS5 proxy that can follow a profile.",
+			Description: "Control the built-in local SOCKS5 proxy. Proxy TCP connections and DNS resolution go through the connected VPN session only; FlexConnect does not fall back to the local network.",
 			Subcommands: []helpTopic{
 				{Name: "status", Summary: "Show current SOCKS5 status"},
 				{Name: "enable", Summary: "Enable SOCKS5 for current profile"},
@@ -1076,7 +1076,7 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 		"proxy enable": {
 			Name:        "proxy enable",
 			Usage:       "flexconnect proxy enable [listen-address]",
-			Description: "Enable the built-in SOCKS5 proxy on the current profile. The listener starts automatically when that profile connects.",
+			Description: "Enable the built-in VPN-only SOCKS5 proxy on the current profile. The listener starts automatically when that profile connects and fails closed if VPN tunnel dialing is unavailable.",
 		},
 		"proxy disable": {
 			Name:        "proxy disable",

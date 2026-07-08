@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"net"
 
 	"flexconnect/internal/types"
 )
@@ -19,4 +20,10 @@ type Backend interface {
 	Traffic() *types.TrafficStats
 	ReadServerConfig() map[string]any
 	Events() <-chan Event
+	TunnelDialer(context.Context) (TunnelDialer, error)
+}
+
+type TunnelDialer interface {
+	DialContext(context.Context, string, string) (net.Conn, error)
+	LookupContextHost(context.Context, string) ([]string, error)
 }

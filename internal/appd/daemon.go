@@ -1087,7 +1087,10 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 	})
 	s.emitLocked(types.Notify{Event: "traffic", Traffic: ptrTraffic(s.traffic)})
 	s.mu.Unlock()
-	return s.applyProxyProfile(profile)
+	if err := s.applyProxyProfile(profile); err != nil {
+		appdLog.Printf("apply proxy after connect failed profile=%s err=%v", profile.ID, err)
+	}
+	return nil
 }
 
 func (s *Service) connectAllowedFromStateLocked(profileID string, allowReconnectState bool) bool {
@@ -1115,10 +1118,19 @@ func (s *Service) applyProxyProfile(profile types.Profile) error {
 	if !profile.SOCKS5Enabled {
 		return s.stopProxy()
 	}
-	return s.startProxy(profile.SOCKS5Listen)
+	dialer, err := s.backend.TunnelDialer(context.Background())
+	if err != nil {
+		_ = s.stopProxy()
+		s.recordProxyError(fmt.Errorf("SOCKS5 VPN dialer unavailable: %w", err))
+		return err
+	}
+	return s.startProxy(profile.SOCKS5Listen, dialer)
 }
 
-func (s *Service) startProxy(listenAddr string) error {
+func (s *Service) startProxy(listenAddr string, dialer socks5.TunnelDialer) error {
+	if dialer == nil {
+		return errors.New("SOCKS5 requires a VPN tunnel dialer")
+	}
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:1080"
 	}
@@ -1137,7 +1149,7 @@ func (s *Service) startProxy(listenAddr string) error {
 	if oldProxy != nil {
 		_ = oldProxy.Close()
 	}
-	server, err := socks5.Listen(listenAddr)
+	server, err := socks5.Listen(listenAddr, dialer)
 	if err != nil {
 		s.mu.Lock()
 		s.logs.Add("error", fmt.Sprintf("appd: start socks5 proxy failed err=%q", err.Error()))
@@ -1158,6 +1170,18 @@ func (s *Service) startProxy(listenAddr string) error {
 	s.emitLocked(types.Notify{Event: "status", Status: ptrStatus(s.status), Message: "SOCKS5 proxy started"})
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *Service) recordProxyError(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.status.LastError = err.Error()
+	s.status.UpdatedAt = now()
+	s.logs.Add("error", fmt.Sprintf("appd: socks5 proxy unavailable err=%q", err.Error()))
+	s.emitLocked(types.Notify{Event: "status", Status: ptrStatus(s.status), Error: err.Error()})
+	s.mu.Unlock()
 }
 
 func (s *Service) stopProxy() error {

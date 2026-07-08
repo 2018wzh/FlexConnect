@@ -152,6 +152,7 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 	// tun 设备写错误或者cSess.CloseChan
 	defer func() {
 		base.Info("payloadIn to tun exit")
+		closeUserTunnel(cSess)
 		if !cSess.Sess.ActiveClose {
 			if cSess.NetworkManager != nil {
 				_ = cSess.NetworkManager.Close(context.Background())
@@ -174,6 +175,11 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 		case pl = <-cSess.PayloadIn:
 		case <-cSess.CloseChan:
 			return
+		}
+
+		if routeUserInbound(cSess, pl.Data) {
+			putPayloadBuffer(pl)
+			continue
 		}
 
 		// 只有当使用域名分流且返回数据包为 DNS 时才进一步分析，少建几个协程

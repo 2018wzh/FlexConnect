@@ -12,14 +12,22 @@ import (
 	"time"
 )
 
+type TunnelDialer interface {
+	DialContext(context.Context, string, string) (net.Conn, error)
+	LookupContextHost(context.Context, string) ([]string, error)
+}
+
 type Server struct {
 	listener net.Listener
-	dialer   net.Dialer
+	dialer   TunnelDialer
 	addr     string
 	wg       sync.WaitGroup
 }
 
-func Listen(addr string) (*Server, error) {
+func Listen(addr string, dialer TunnelDialer) (*Server, error) {
+	if dialer == nil {
+		return nil, errors.New("SOCKS5 requires a VPN tunnel dialer")
+	}
 	if addr == "" {
 		addr = "127.0.0.1:1080"
 	}
@@ -30,9 +38,7 @@ func Listen(addr string) (*Server, error) {
 	server := &Server{
 		listener: ln,
 		addr:     ln.Addr().String(),
-		dialer: net.Dialer{
-			Timeout: 30 * time.Second,
-		},
+		dialer:   dialer,
 	}
 	server.wg.Add(1)
 	go server.serve()
@@ -110,9 +116,11 @@ func (s *Server) handleConn(conn net.Conn) error {
 		return err
 	}
 
-	upstream, err := s.dialer.DialContext(context.Background(), "tcp", target)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	upstream, err := s.dialTarget(ctx, target)
 	if err != nil {
-		_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = conn.Write([]byte{0x05, replyCodeForDialError(err), 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return err
 	}
 	defer upstream.Close()
@@ -120,24 +128,87 @@ func (s *Server) handleConn(conn net.Conn) error {
 		return err
 	}
 
-	bindAddr := upstream.LocalAddr().(*net.TCPAddr)
+	bindAddr, ok := upstream.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		bindAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
 	if err := writeReply(conn, bindAddr); err != nil {
 		return err
 	}
 	return proxyBidirectional(conn, upstream)
 }
 
-func readTarget(r io.Reader, atyp byte) (string, error) {
+type targetAddr struct {
+	host string
+	port string
+	atyp byte
+}
+
+func readTarget(r io.Reader, atyp byte) (targetAddr, error) {
 	host, err := readHost(r, atyp)
 	if err != nil {
-		return "", err
+		return targetAddr{}, err
 	}
 	var portBuf [2]byte
 	if _, err := io.ReadFull(r, portBuf[:]); err != nil {
-		return "", err
+		return targetAddr{}, err
 	}
 	port := binary.BigEndian.Uint16(portBuf[:])
-	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
+	return targetAddr{host: host, port: strconv.Itoa(int(port)), atyp: atyp}, nil
+}
+
+var (
+	errNoTunnelAddress      = errors.New("no VPN DNS address")
+	errUnsupportedIPv6Proxy = errors.New("SOCKS5 VPN proxy supports IPv4 TCP targets only")
+)
+
+func (s *Server) dialTarget(ctx context.Context, target targetAddr) (net.Conn, error) {
+	if s.dialer == nil {
+		return nil, errors.New("missing VPN tunnel dialer")
+	}
+	if ip := net.ParseIP(target.host); ip != nil {
+		v4 := ip.To4()
+		if v4 == nil {
+			return nil, errUnsupportedIPv6Proxy
+		}
+		return s.dialer.DialContext(ctx, "tcp4", net.JoinHostPort(v4.String(), target.port))
+	}
+	addrs, err := s.dialer.LookupContextHost(ctx, target.host)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errNoTunnelAddress, err)
+	}
+	var firstErr error
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		conn, err := s.dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ip.To4().String(), target.port))
+		if err == nil {
+			return conn, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return nil, errNoTunnelAddress
+}
+
+func replyCodeForDialError(err error) byte {
+	if errors.Is(err, errUnsupportedIPv6Proxy) {
+		return 0x08
+	}
+	if errors.Is(err, errNoTunnelAddress) {
+		return 0x04
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return 0x04
+	}
+	return 0x05
 }
 
 func readHost(r io.Reader, atyp byte) (string, error) {
