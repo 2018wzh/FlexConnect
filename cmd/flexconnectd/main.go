@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,19 +14,19 @@ import (
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
 	"flexconnect/internal/router"
-	"flexconnect/internal/secret"
 	storefile "flexconnect/internal/store/file"
 	vpnac "flexconnect/internal/vpn/anyconnect"
 )
 
 func main() {
-	opts := daemonOptions{}
-	flag.StringVar(&opts.socket, "socket", ipc.DefaultSocketPath(), "daemon socket or named pipe path")
-	flag.StringVar(&opts.state, "state", defaultStatePath(), "path to state file")
-	verbose := flag.Bool("v", false, "enable verbose debug logging")
-	verboseLong := flag.Bool("verbose", false, "same as -v")
-	flag.Parse()
-	opts.verbose = *verbose || *verboseLong
+	opts, err := parseDaemonOptions(os.Args[1:], os.LookupEnv)
+	if errors.Is(err, flagErrHelp) {
+		return
+	}
+	if err != nil {
+		logging.Init(os.Stdout, logging.LevelInfo, true)
+		logging.WithComponent("flexconnectd").Fatalf("%v", err)
+	}
 
 	if isWindowsService() {
 		if err := runWindowsService(opts); err != nil {
@@ -47,9 +46,11 @@ func main() {
 }
 
 type daemonOptions struct {
-	socket  string
-	state   string
-	verbose bool
+	socket      string
+	state       string
+	verbose     bool
+	secretStore string
+	startup     *startupConfig
 }
 
 func runDaemon(ctx context.Context, opts daemonOptions) error {
@@ -87,11 +88,14 @@ func runDaemonReady(ctx context.Context, opts daemonOptions, ready chan<- error)
 	serverLog.Printf("elevation check passed")
 	serverLog.Printf("configuration backend=anyconnect socket=%s state=%s", opts.socket, opts.state)
 
-	service, err := newService(opts.state)
+	service, err := newService(opts.state, opts.secretStore)
 	if err != nil {
 		return err
 	}
 	serverLog.Printf("service initialized")
+	if err := bootstrapStartup(ctx, service, opts.startup); err != nil {
+		return err
+	}
 
 	listener, err := ipc.Listen(opts.socket)
 	if err != nil {
@@ -139,8 +143,11 @@ func condLevel(verbose bool) logging.Level {
 	return logging.LevelInfo
 }
 
-func newService(statePath string) (*appd.Service, error) {
+func newService(statePath, secretStore string) (*appd.Service, error) {
 	store := storefile.New(statePath)
-	secrets := secret.NewKeyringStore("flexconnect")
+	secrets, err := newSecretStore(secretStore)
+	if err != nil {
+		return nil, err
+	}
 	return appd.New(store, secrets, vpnac.New(), router.DefaultPlanner{})
 }

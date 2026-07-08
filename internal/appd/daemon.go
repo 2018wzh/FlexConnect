@@ -303,13 +303,15 @@ func (s *Service) CreateProfile(profile types.Profile, password string) (types.P
 	if profile.SecretRef == "" {
 		profile.SecretRef = "profile/" + profile.ID
 	}
+	if password != "" {
+		if err := s.secrets.Put(profile.SecretRef, password); err != nil {
+			return types.Profile{}, err
+		}
+	}
 	s.profiles = append(s.profiles, profile)
 	if s.currentID == "" {
 		s.currentID = profile.ID
 		s.status.CurrentProfileID = profile.ID
-	}
-	if password != "" {
-		_ = s.secrets.Put(profile.SecretRef, password)
 	}
 	if err := s.persist(); err != nil {
 		return types.Profile{}, err

@@ -3,7 +3,9 @@ package appd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -237,6 +239,29 @@ func TestProxyDoesNotFallbackWhenTunnelDialerUnavailable(t *testing.T) {
 	}
 }
 
+func TestCreateProfileReturnsSecretStoreError(t *testing.T) {
+	store := &memoryStore{}
+	secrets := failingSecretStore{err: errors.New("keyring unavailable")}
+	service, err := New(store, secrets, newFakeBackend(), router.DefaultPlanner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := types.NewProfile("corp")
+	profile.ServerURL = "https://vpn.example.test"
+	profile.Username = "alice"
+
+	_, err = service.CreateProfile(profile, "secret")
+	if err == nil {
+		t.Fatal("CreateProfile succeeded")
+	}
+	if !strings.Contains(err.Error(), "keyring unavailable") {
+		t.Fatalf("error = %q", err)
+	}
+	if got := len(service.ListProfiles()); got != 0 {
+		t.Fatalf("profiles persisted after secret failure = %d", got)
+	}
+}
+
 type noopTunnelDialer struct{}
 
 func (noopTunnelDialer) DialContext(context.Context, string, string) (net.Conn, error) {
@@ -297,4 +322,20 @@ func waitUntil(t *testing.T, timeout time.Duration, fn func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("condition not met before timeout")
+}
+
+type failingSecretStore struct {
+	err error
+}
+
+func (s failingSecretStore) Get(ref string) (string, error) {
+	return "", fmt.Errorf("unexpected get %s", ref)
+}
+
+func (s failingSecretStore) Put(string, string) error {
+	return s.err
+}
+
+func (s failingSecretStore) Delete(string) error {
+	return nil
 }

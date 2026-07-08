@@ -61,6 +61,59 @@ flexconnect logs
 
 SOCKS5 代理是 VPN-only：启用后只支持 TCP CONNECT 和 IPv4 目标，域名通过 VPN DNS 解析，无法确认走 VPN 时会拒绝连接，不会回退到本机网络。当前不支持 UDP ASSOC、BIND 或 IPv6 代理目标。
 
+## Docker 部署
+
+Docker 镜像运行 `flexconnectd`，通过环境变量创建一个固定 ID 的 Profile 并立即连接。容器内需要 Linux TUN 能力，SOCKS5 默认监听 `0.0.0.0:1080` 并通过端口映射暴露给宿主机。
+
+```bash
+docker build -t flexconnect:local .
+docker run --rm \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun \
+  -p 1080:1080 \
+  -e FLEXCONNECT_SERVER=https://vpn.example.com \
+  -e FLEXCONNECT_USERNAME=alice \
+  -e FLEXCONNECT_PASSWORD='<password>' \
+  flexconnect:local
+```
+
+推荐用 Compose 和 Docker secret 注入密码：
+
+```bash
+mkdir -p secrets
+printf '%s\n' '<password>' > secrets/flexconnect_password
+FLEXCONNECT_SERVER=https://vpn.example.com FLEXCONNECT_USERNAME=alice docker compose -f docker-compose.example.yml up --build
+```
+
+容器启动失败会直接非零退出，包括缺少必填环境变量、密码文件不可读、VPN 连接失败、请求启用 SOCKS5 但代理未实际监听。让 Docker/Compose 的重启策略负责重试，不在应用启动流程里吞掉错误。
+
+### 环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `FLEXCONNECT_SOCKET` | daemon 本地 Unix socket，镜像默认 `/run/flexconnect/flexconnect.sock` |
+| `FLEXCONNECT_STATE` | 状态文件路径，镜像默认 `/var/lib/flexconnect/state.json` |
+| `FLEXCONNECT_VERBOSE` | `true` 时启用 debug 日志 |
+| `FLEXCONNECT_SECRET_STORE` | `keyring` 或 `memory`；镜像默认 `memory` |
+| `FLEXCONNECT_CONNECT_ON_START` | `true` 时启动即 upsert Profile 并连接；镜像默认 `true` |
+| `FLEXCONNECT_CONNECT_TIMEOUT` | 启动连接超时，例如 `45s`、`2m` |
+| `FLEXCONNECT_PROFILE_ID` | 启动 Profile 的固定 ID，镜像默认 `docker` |
+| `FLEXCONNECT_PROFILE_NAME` | 启动 Profile 名称，镜像默认 `docker` |
+| `FLEXCONNECT_SERVER` | AnyConnect 服务器 URL，启动连接时必填 |
+| `FLEXCONNECT_USERNAME` | 用户名，启动连接时必填 |
+| `FLEXCONNECT_GROUP` | VPN group，可选 |
+| `FLEXCONNECT_PASSWORD` | 密码；不可与 `FLEXCONNECT_PASSWORD_FILE` 同时设置 |
+| `FLEXCONNECT_PASSWORD_FILE` | 密码文件路径；只去掉末尾换行，适合 Docker secret |
+| `FLEXCONNECT_ACCEPT_SERVER_ROUTES` | 是否接受服务器下发路由 |
+| `FLEXCONNECT_AUTO_RECONNECT` | 是否在异常断开后自动重连；镜像默认 `true` |
+| `FLEXCONNECT_APPLY_DNS` | 是否应用 VPN DNS |
+| `FLEXCONNECT_MTU` | TUN MTU |
+| `FLEXCONNECT_DNS` | 逗号分隔的 DNS override |
+| `FLEXCONNECT_INCLUDE_ROUTES` | 逗号分隔的自定义 include routes |
+| `FLEXCONNECT_EXCLUDE_ROUTES` | 逗号分隔的自定义 exclude routes |
+| `FLEXCONNECT_SOCKS5_ENABLED` | 是否启用 VPN-only SOCKS5；镜像默认 `true` |
+| `FLEXCONNECT_SOCKS5_LISTEN` | SOCKS5 监听地址；镜像默认 `0.0.0.0:1080` |
+
 ## 构建与安装
 
 ### Windows 服务

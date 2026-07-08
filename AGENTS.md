@@ -34,6 +34,9 @@ SOCKS5 proxying, and real AnyConnect password-auth sessions.
   - `systemd/` contains the Linux daemon service unit.
 - `tmp/` is local temporary output and should not be treated as source.
 - `.env` is a local live-test secrets file and is ignored by Git.
+- `Dockerfile` builds the Linux container image for `flexconnectd` and `flexconnect`.
+- `docker-compose.example.yml` documents Linux TUN, SOCKS5 port, state volume, and Docker secret wiring.
+- `.dockerignore` excludes local secrets, build outputs, runtime state, caches, and local worktrees from Docker build context.
 - `.gitignore` defines ignored secrets, build outputs, runtime state, and caches.
 - `go.mod` and `go.sum` define the Go module and locked dependencies.
 - `README.md` is the primary user-facing quick start and validation guide.
@@ -64,6 +67,21 @@ Build all Go packages:
 
 ```powershell
 go build ./...
+```
+
+Build and smoke-check the Linux Docker image:
+
+```bash
+docker build -t flexconnect:local .
+docker run --rm -e FLEXCONNECT_CONNECT_ON_START=false flexconnect:local -h
+```
+
+Run the Docker Compose example with a relative Docker secret file:
+
+```bash
+mkdir -p secrets
+printf '%s\n' '<password>' > secrets/flexconnect_password
+FLEXCONNECT_SERVER=https://vpn.example.com FLEXCONNECT_USERNAME=alice docker compose -f docker-compose.example.yml up --build
 ```
 
 Build distribution artifacts through the unified dist entrypoint:
@@ -200,6 +218,9 @@ password auth, establishes TLS/DTLS and TUN state, then reports session details 
   `scripts/live-connect-test.ps1`.
 - Smoke tests start a real daemon with an isolated socket and state file, then run CLI status,
   profile list, diagnostics, and disconnect commands.
+- Docker verification builds the Linux image and runs `flexconnectd -h` with
+  `FLEXCONNECT_CONNECT_ON_START=false`; live Docker VPN acceptance additionally requires
+  Linux TUN access with `NET_ADMIN` and `/dev/net/tun`.
 - Local default:
 
 ```powershell
@@ -232,9 +253,13 @@ go test ./...
   outputs are ignored by `.gitignore`; do not commit them.
 - Passwords are stored through `internal/secret` using the OS keyring in production and a memory
   store in tests.
+- Docker defaults `FLEXCONNECT_SECRET_STORE=memory`; secrets are injected from
+  `FLEXCONNECT_PASSWORD` or `FLEXCONNECT_PASSWORD_FILE`, and both set together must fail fast.
 - Profile state persists only metadata and `secret_ref` values, not raw passwords.
 - Diagnostics are tested to avoid raw password leakage; keep that invariant for new fields.
 - Local control traffic is served over Unix sockets or Windows named pipes, not a public TCP port.
+- Docker exposes only the SOCKS5 listener by default. Do not expose the local control socket over
+  TCP as part of Docker work.
 - Windows daemon startup may request elevation; service install scripts modify system services.
 - Live tests use real AnyConnect credentials and may alter local VPN, route, DNS, and TUN state.
 - Dependency scanning is not configured in the repository.
@@ -256,6 +281,8 @@ go test ./...
   administrator or root privileges and modify host services.
 - Do not run live AnyConnect tests unless the user explicitly requests them and provides or confirms
   a valid local `.env`.
+- Do not print Docker secret contents, password environment values, generated state files, or
+  credential-bearing Compose overrides.
 - Changes to auth, secret storage, diagnostics, routing, TUN, service scripts, installers, and
   package metadata require human review.
 - Keep new daemon, tray, and CLI operations bounded with contexts or cancellation paths.
@@ -284,6 +311,18 @@ go test ./...
   - `--state` selects the daemon state file.
   - `-v` and `--verbose` enable debug logging for daemon and CLI.
   - `FLEXCONNECTD_NO_ELEVATE=1` disables Windows daemon auto-elevation.
+  - `FLEXCONNECT_SOCKET` selects the daemon Unix socket or named pipe through environment.
+  - `FLEXCONNECT_STATE` selects the daemon state file through environment.
+  - `FLEXCONNECT_VERBOSE=true` enables debug logging through environment.
+  - `FLEXCONNECT_SECRET_STORE=keyring|memory` selects password persistence.
+  - `FLEXCONNECT_CONNECT_ON_START=true` creates or updates the startup profile and connects during daemon startup.
+  - `FLEXCONNECT_CONNECT_TIMEOUT` bounds startup connection attempts, for example `45s`.
+  - `FLEXCONNECT_PROFILE_ID` and `FLEXCONNECT_PROFILE_NAME` identify the env-managed profile.
+  - `FLEXCONNECT_SERVER`, `FLEXCONNECT_USERNAME`, and optional `FLEXCONNECT_GROUP` configure AnyConnect login.
+  - `FLEXCONNECT_PASSWORD` and `FLEXCONNECT_PASSWORD_FILE` are mutually exclusive password inputs.
+  - `FLEXCONNECT_ACCEPT_SERVER_ROUTES`, `FLEXCONNECT_AUTO_RECONNECT`, `FLEXCONNECT_APPLY_DNS`, and `FLEXCONNECT_MTU` configure profile runtime behavior.
+  - `FLEXCONNECT_DNS`, `FLEXCONNECT_INCLUDE_ROUTES`, and `FLEXCONNECT_EXCLUDE_ROUTES` are comma-separated profile lists.
+  - `FLEXCONNECT_SOCKS5_ENABLED` and `FLEXCONNECT_SOCKS5_LISTEN` configure the built-in VPN-only SOCKS5 listener.
   - `FLEXCONNECT_RUN_LIVE=1` enables the live AnyConnect test.
   - `FLEXCONNECT_ENV_FILE` points the live test at an env file.
   - `FLEXCONNECT_LIVE_ELEVATED` is used by the live-test elevation wrapper.
