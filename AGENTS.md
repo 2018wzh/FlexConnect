@@ -84,6 +84,25 @@ printf '%s\n' '<password>' > secrets/flexconnect_password
 FLEXCONNECT_SERVER=https://vpn.example.com FLEXCONNECT_USERNAME=alice docker compose -f docker-compose.example.yml up --build
 ```
 
+Publish Linux container image to GitHub Packages (GHCR):
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+IMAGE=ghcr.io/<OWNER>/flexconnect
+VERSION=<VERSION>
+
+docker build -t "${IMAGE}:${VERSION}" .
+docker push "${IMAGE}:${VERSION}"
+docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest"
+docker push "${IMAGE}:latest"
+```
+
+Manual workflow dispatch (optional):
+
+```bash
+gh workflow run docker-release.yml -f image-tag=1.0.6
+```
+
 Build distribution artifacts through the unified dist entrypoint:
 
 ```powershell
@@ -159,8 +178,10 @@ go run .\cmd\flexconnect -v status
 
 Deploy:
 
-> TODO: Add production deployment documentation. Today, deployment is represented
-> by the packaging and service-install scripts above.
+Container deployment can be done via GitHub Container Registry when pushing `v*` tags:
+
+- Build artifacts are produced by the existing `release` workflow.
+- Linux container images are built and published by `.github/workflows/docker-release.yml` to `ghcr.io`.
 
 ## Code Style & Conventions
 - Use Go 1.26.2 as declared in `go.mod`.

@@ -87,6 +87,29 @@ FLEXCONNECT_SERVER=https://vpn.example.com FLEXCONNECT_USERNAME=alice docker com
 
 容器启动失败会直接非零退出，包括缺少必填环境变量、密码文件不可读、VPN 连接失败、请求启用 SOCKS5 但代理未实际监听。让 Docker/Compose 的重启策略负责重试，不在应用启动流程里吞掉错误。
 
+### 发布到 GitHub Packages
+
+仓库中的 `Docker Release` 工作流会在推送 `v*` tag 时将镜像发布到 `ghcr.io`，并自动打上 `v` 去掉前缀后的版本标签（如 `1.2.3`）以及 `<major>`、`<major>.<minor>`。
+
+从 GHCR 发布镜像（可选）：
+
+```bash
+docker login ghcr.io
+IMAGE=ghcr.io/<OWNER>/flexconnect
+VERSION=<VERSION>
+
+docker build -t "${IMAGE}:${VERSION}" .
+docker push "${IMAGE}:${VERSION}"
+docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest"
+docker push "${IMAGE}:latest"
+```
+
+从 GHCR 拉取镜像：
+
+```bash
+docker pull ghcr.io/<OWNER>/flexconnect:<VERSION>
+```
+
 ### 环境变量
 
 | 变量 | 说明 |
