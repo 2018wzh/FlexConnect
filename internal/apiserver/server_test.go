@@ -1,12 +1,15 @@
 package apiserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/types"
 )
 
@@ -58,6 +61,24 @@ func TestTrafficEndpointReturnsSnapshot(t *testing.T) {
 	}
 }
 
+func TestHealthEndpointReturnsVersionedReadiness(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+	rec := httptest.NewRecorder()
+
+	New(fakeDaemon{}).Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var got types.Health
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "ok" || got.Version != buildinfo.Version || got.APIVersion != buildinfo.LocalAPIVersion {
+		t.Fatalf("health = %+v", got)
+	}
+}
+
 func TestTrafficEndpointRejectsNonGet(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/traffic", nil)
 	rec := httptest.NewRecorder()
@@ -65,6 +86,32 @@ func TestTrafficEndpointRejectsNonGet(t *testing.T) {
 	New(fakeDaemon{}).Handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestRequestBodyIsBounded(t *testing.T) {
+	body := bytes.NewReader(bytes.Repeat([]byte("x"), maxRequestBodyBytes+1))
+	req := httptest.NewRequest(http.MethodPost, "/v1/login", body)
+	rec := httptest.NewRecorder()
+
+	New(fakeDaemon{}).Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if requestID := rec.Header().Get("X-FlexConnect-Request-ID"); requestID == "" {
+		t.Fatal("missing request ID")
+	}
+}
+
+func TestLoginRejectsUnknownJSONFields(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/login", strings.NewReader(`{"server_url":"vpn.example.test","unknown":true}`))
+	rec := httptest.NewRecorder()
+
+	New(fakeDaemon{}).Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d", rec.Code)
 	}
 }

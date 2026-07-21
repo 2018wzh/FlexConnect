@@ -106,6 +106,12 @@ type Status struct {
 	UpdatedAt          string       `json:"updated_at"`
 }
 
+type Health struct {
+	Status     string `json:"status"`
+	Version    string `json:"version"`
+	APIVersion string `json:"api_version"`
+}
+
 type RouteUpdateRequest struct {
 	AcceptServerRoutes *bool    `json:"accept_server_routes,omitempty"`
 	CustomInclude      []string `json:"custom_include_routes,omitempty"`

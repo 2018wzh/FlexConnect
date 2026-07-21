@@ -86,7 +86,7 @@ func runDaemonReady(ctx context.Context, opts daemonOptions, ready chan<- error)
 		return err
 	}
 	serverLog.Printf("elevation check passed")
-	serverLog.Printf("configuration backend=anyconnect socket=%s state=%s", opts.socket, opts.state)
+	serverLog.Printf("configuration backend=anyconnect custom_socket=%v custom_state=%v", opts.socket != ipc.DefaultSocketPath(), opts.state != defaultStatePath())
 
 	service, err := newService(opts.state, opts.secretStore)
 	if err != nil {
@@ -102,11 +102,20 @@ func runDaemonReady(ctx context.Context, opts daemonOptions, ready chan<- error)
 		sendReady(err)
 		return err
 	}
-	defer listener.Close()
-	serverLog.Printf("ipc listener ready at %s", opts.socket)
+	defer func() {
+		if closeErr := listener.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
+	serverLog.Printf("ipc listener ready custom_socket=%v", opts.socket != ipc.DefaultSocketPath())
 	sendReady(nil)
 
-	server := &http.Server{Handler: apiserver.New(service).Handler()}
+	server := &http.Server{
+		Handler:           apiserver.New(service).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    32 * 1024,
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		serverLog.Printf("http server serving")

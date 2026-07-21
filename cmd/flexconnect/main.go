@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"flexconnect/client/local"
+	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
 	"flexconnect/internal/types"
@@ -21,6 +23,13 @@ import (
 )
 
 var verbose bool
+
+const (
+	defaultCommandTimeout = 15 * time.Second
+	connectCommandTimeout = 2 * time.Minute
+	maxSecretInputBytes   = 64 * 1024
+)
+
 var (
 	cliIn  io.Reader = os.Stdin
 	cliOut io.Writer = os.Stdout
@@ -49,33 +58,116 @@ func main() {
 	os.Args = append([]string{os.Args[0]}, filteredArgs...)
 
 	socket := flag.String("socket", ipc.DefaultSocketPath(), "daemon socket or named pipe path")
+	timeout := flag.Duration("timeout", defaultCommandTimeout, "daemon connectivity and ordinary command timeout")
+	connectTimeout := flag.Duration("connect-timeout", connectCommandTimeout, "login and VPN connection timeout")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	verboseShort := flag.Bool("v", false, "enable verbose debug output")
 	verboseLong := flag.Bool("verbose", false, "same as -v")
 	flag.Parse()
+	if *showVersion {
+		_, _ = fmt.Fprintln(cliOut, buildinfo.Version)
+		return
+	}
 	verbose = parsedVerbose || *verboseShort || *verboseLong
 	local.SetDebug(verbose)
 	logging.Init(cliErr, condLevel(verbose), true)
 	args := flag.Args()
-	debugf("socket=%q verbose=%t args=%v", *socket, verbose, args)
+	debugf("custom_socket=%t verbose=%t argument_count=%d", *socket != ipc.DefaultSocketPath(), verbose, len(args))
 	if len(args) == 0 || isHelpArg(args[0]) {
 		_, _ = io.WriteString(cliOut, rootHelp())
 		return
 	}
+	if *timeout <= 0 || *connectTimeout <= 0 {
+		fmt.Fprintln(cliErr, "--timeout and --connect-timeout must be positive")
+		os.Exit(2)
+	}
 	client := &local.Client{Socket: *socket}
-	runCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := run(runCtx, client, args); err != nil {
+	if err := runWithTimeouts(context.Background(), client, args, *timeout, *connectTimeout); err != nil {
 		fmt.Fprintln(cliErr, err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, client *local.Client, args []string) error {
+func run(parent context.Context, client *local.Client, args []string) error {
+	return runWithTimeouts(parent, client, args, defaultCommandTimeout, connectCommandTimeout)
+}
+
+func runWithTimeouts(parent context.Context, client *local.Client, args []string, timeout, connectTimeout time.Duration) error {
 	if len(args) == 0 {
 		_, err := io.WriteString(cliOut, rootHelp())
 		return err
 	}
-	debugf("run command=%q args=%v", args[0], args)
+	if commandNeedsDaemon(args) {
+		if err := checkDaemonConnectivity(parent, client, timeout); err != nil {
+			return err
+		}
+	}
+	if args[0] == "login" && len(args) == 1 {
+		return runInteractiveLogin(parent, client, cliIn, cliOut, connectTimeout)
+	}
+
+	ctx := parent
+	cancel := func() {}
+	if args[0] != "watch" {
+		commandTimeout := timeout
+		if args[0] == "login" || args[0] == "up" {
+			commandTimeout = connectTimeout
+		}
+		ctx, cancel = context.WithTimeout(parent, commandTimeout)
+	}
+	defer cancel()
+	return runCommand(ctx, client, args)
+}
+
+func commandNeedsDaemon(args []string) bool {
+	if len(args) == 0 || args[0] == "help" || isHelpArg(args[0]) {
+		return false
+	}
+	if len(args) > 1 && wantCommandHelp(args[1:]) {
+		return false
+	}
+	for _, arg := range args[1:] {
+		if arg == "--help" || arg == "-h" {
+			return false
+		}
+	}
+	switch args[0] {
+	case "status", "login", "up", "down", "logs", "diag", "traffic", "watch":
+		return true
+	case "profile", "route", "proxy":
+		return len(args) > 1
+	default:
+		return false
+	}
+}
+
+func checkDaemonConnectivity(parent context.Context, client *local.Client, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	debugf("checking daemon connectivity")
+	health, err := client.Health(ctx)
+	if err != nil {
+		return daemonConnectivityError(err)
+	}
+	debugf("daemon connectivity check passed version=%s api_version=%s", health.Version, health.APIVersion)
+	return nil
+}
+
+func daemonConnectivityError(err error) error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("cannot connect to flexconnectd: connectivity check timed out: %w", err)
+	case errors.Is(err, os.ErrPermission):
+		return fmt.Errorf("cannot connect to flexconnectd: permission denied; on Linux, add this user to the flexconnect group and start a new login session: %w", err)
+	case errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("cannot connect to flexconnectd: control socket not found; verify that the daemon service is running: %w", err)
+	default:
+		return fmt.Errorf("cannot connect to flexconnectd: %w", err)
+	}
+}
+
+func runCommand(ctx context.Context, client *local.Client, args []string) error {
+	debugf("run command=%q", args[0])
 	if args[0] == "help" {
 		return printHelpTopic(args[1:])
 	}
@@ -97,7 +189,7 @@ func run(ctx context.Context, client *local.Client, args []string) error {
 		_, err = io.WriteString(cliOut, formatStatusWithProfiles(status, profiles))
 		return err
 	case "login":
-		debugf("handling login args=%v", args)
+		debugf("handling login")
 		if wantCommandHelp(args[1:]) {
 			return printNamedHelp("login")
 		}
@@ -170,13 +262,13 @@ func run(ctx context.Context, client *local.Client, args []string) error {
 		_, err = io.WriteString(cliOut, formatTrafficSnapshot(*traffic))
 		return err
 	case "profile":
-		debugf("handling profile args=%v", args)
+		debugf("handling profile")
 		return runProfile(ctx, client, args[1:])
 	case "route":
-		debugf("handling route args=%v", args)
+		debugf("handling route")
 		return runRoutes(ctx, client, args[1:])
 	case "proxy":
-		debugf("handling proxy args=%v", args)
+		debugf("handling proxy")
 		return runProxy(ctx, client, args[1:])
 	case "watch":
 		debugf("handling watch")
@@ -193,7 +285,7 @@ func run(ctx context.Context, client *local.Client, args []string) error {
 			if err != nil {
 				return err
 			}
-			debugf("watch notify event=%q payload=%+v", notify.Event, notify)
+			debugf("watch notify event=%q", notify.Event)
 			if err := printJSON(notify); err != nil {
 				return err
 			}
@@ -203,43 +295,102 @@ func run(ctx context.Context, client *local.Client, args []string) error {
 	}
 }
 
-func runLogin(ctx context.Context, client *local.Client, args []string) error {
-	if len(args) == 0 {
-		req, err := promptLoginRequest(cliIn, cliOut)
-		if err != nil {
-			return err
-		}
-		if err := client.Login(ctx, req); err != nil {
-			return err
-		}
-		return printCurrentStatus(ctx, client)
+func runInteractiveLogin(parent context.Context, client *local.Client, in io.Reader, out io.Writer, timeout time.Duration) error {
+	req, err := promptLoginRequest(in, out)
+	if err != nil {
+		return err
 	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	if err := client.Login(ctx, req); err != nil {
+		return err
+	}
+	return printCurrentStatus(ctx, client)
+}
+
+func runLogin(ctx context.Context, client *local.Client, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	server := fs.String("server", "", "server URL")
 	user := fs.String("user", "", "username")
-	password := fs.String("password", "", "password")
+	unsafePassword := fs.String("password", "", "unsupported plaintext password")
+	passwordFile := fs.String("password-file", "", "read password from a file")
+	passwordStdin := fs.Bool("password-stdin", false, "read password from standard input")
 	name := fs.String("name", "", "profile name")
 	group := fs.String("group", "", "VPN group")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: flexconnect login [--server <url> --user <username> --password <password> --name <profile-name> --group <group>]")
+		return fmt.Errorf("usage: flexconnect login --server <url> --user <username> (--password-file <path> | --password-stdin) [--name <profile-name> --group <group>]")
+	}
+	if *unsafePassword != "" {
+		return errors.New("--password is not supported because command-line secrets leak through process listings and shell history; use --password-file or --password-stdin")
 	}
 	if *server == "" || *user == "" {
 		return fmt.Errorf("login requires --server and --user")
+	}
+	password, provided, err := readSecretInput(*passwordFile, *passwordStdin, cliIn)
+	if err != nil {
+		return err
+	}
+	if !provided {
+		return errors.New("login requires --password-file or --password-stdin; omit all arguments for interactive login")
 	}
 	if err := client.Login(ctx, types.LoginRequest{
 		Name:      *name,
 		ServerURL: *server,
 		Username:  *user,
 		Group:     *group,
-		Password:  *password,
+		Password:  password,
 	}); err != nil {
 		return err
 	}
 	return printCurrentStatus(ctx, client)
+}
+
+func readSecretInput(path string, fromStdin bool, in io.Reader) (string, bool, error) {
+	if path != "" && fromStdin {
+		return "", false, errors.New("--password-file and --password-stdin are mutually exclusive")
+	}
+	if path == "" && !fromStdin {
+		return "", false, nil
+	}
+
+	var reader io.Reader = in
+	var file *os.File
+	if path != "" {
+		opened, err := os.Open(path)
+		if err != nil {
+			return "", false, fmt.Errorf("open password file: %w", err)
+		}
+		file = opened
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil {
+			return "", false, fmt.Errorf("inspect password file: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return "", false, errors.New("password file must be a regular file")
+		}
+		if err := validateSecretFile(info); err != nil {
+			return "", false, err
+		}
+		reader = file
+	}
+
+	data, err := io.ReadAll(io.LimitReader(reader, maxSecretInputBytes+1))
+	if err != nil {
+		return "", false, fmt.Errorf("read password input: %w", err)
+	}
+	if len(data) > maxSecretInputBytes {
+		return "", false, fmt.Errorf("password input exceeds %d bytes", maxSecretInputBytes)
+	}
+	secret := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+	if secret == "" {
+		return "", false, errors.New("password input is empty")
+	}
+	return secret, true, nil
 }
 
 func promptLoginRequest(in io.Reader, out io.Writer) (types.LoginRequest, error) {
@@ -379,7 +530,7 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 	if len(args) == 0 || isHelpArg(args[0]) {
 		return printNamedHelp("profile")
 	}
-	debugf("runProfile args=%v", args)
+	debugf("runProfile subcommand=%q", args[0])
 	switch args[0] {
 	case "list":
 		debugf("profile list")
@@ -390,23 +541,35 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 		debugf("profile list count=%d", len(profiles))
 		return printJSON(profiles)
 	case "add":
-		debugf("profile add args=%v", args)
+		debugf("profile add")
 		if wantCommandHelp(args[1:]) {
 			return printNamedHelp("profile add")
 		}
-		if len(args) < 3 {
-			return fmt.Errorf("usage: profile add <name> <server_url> [username] [password]")
+		fs := flag.NewFlagSet("profile add", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		unsafePassword := fs.String("password", "", "unsupported plaintext password")
+		passwordFile := fs.String("password-file", "", "read password from a file")
+		passwordStdin := fs.Bool("password-stdin", false, "read password from standard input")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
 		}
-		profile := types.NewProfile(args[1])
-		profile.ServerURL = args[2]
-		if len(args) > 3 {
-			profile.Username = args[3]
+		if *unsafePassword != "" {
+			return errors.New("--password is not supported; use --password-file or --password-stdin")
 		}
-		password := ""
-		if len(args) > 4 {
-			password = args[4]
+		positionals := fs.Args()
+		if len(positionals) < 2 || len(positionals) > 3 {
+			return fmt.Errorf("usage: profile add [--password-file <path> | --password-stdin] <name> <server_url> [username]")
 		}
-		debugf("profile add name=%q server=%q username=%q", profile.Name, profile.ServerURL, profile.Username)
+		profile := types.NewProfile(positionals[0])
+		profile.ServerURL = positionals[1]
+		if len(positionals) > 2 {
+			profile.Username = positionals[2]
+		}
+		password, _, err := readSecretInput(*passwordFile, *passwordStdin, cliIn)
+		if err != nil {
+			return err
+		}
+		debugf("profile add name=%q username=%q", profile.Name, profile.Username)
 		created, err := client.CreateProfile(ctx, profile, password)
 		if err != nil {
 			return err
@@ -426,7 +589,7 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 			return printNamedHelp("profile update")
 		}
 		if len(args) < 1 {
-			return fmt.Errorf("usage: profile update -p <profile-name> [--name ..] [--server ..] [--user ..] [--group ..] [--password ..] [--dns a,b] [--mtu 1399] [--accept true|false] [--auto-reconnect true|false] [--apply-dns true|false] [--include a,b] [--exclude c,d] [--socks5 true|false] [--socks5-listen 127.0.0.1:1080]")
+			return fmt.Errorf("usage: profile update -p <profile-name> [--name ..] [--server ..] [--user ..] [--group ..] [--password-file <path> | --password-stdin] [--dns a,b] [--mtu 1399] [--accept true|false] [--auto-reconnect true|false] [--apply-dns true|false] [--include a,b] [--exclude c,d] [--socks5 true|false] [--socks5-listen 127.0.0.1:1080]")
 		}
 		fs := flag.NewFlagSet("profile update", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
@@ -435,7 +598,9 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 		serverURL := fs.String("server", "", "new server URL")
 		user := fs.String("user", "", "new username")
 		group := fs.String("group", "", "new VPN group")
-		password := fs.String("password", "", "new password")
+		unsafePassword := fs.String("password", "", "unsupported plaintext password")
+		passwordFile := fs.String("password-file", "", "read new password from a file")
+		passwordStdin := fs.Bool("password-stdin", false, "read new password from standard input")
 		dns := fs.String("dns", "", "comma-separated DNS overrides")
 		mtu := fs.String("mtu", "", "MTU override")
 		accept := fs.String("accept", "", "accept server routes (true|false)")
@@ -452,7 +617,10 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 			return err
 		}
 		if len(fs.Args()) != 0 {
-			return fmt.Errorf("usage: profile update -p <profile-name> [--name ..] [--server ..] [--user ..] [--group ..] [--password ..] [--dns a,b] [--mtu 1399] [--accept true|false] [--auto-reconnect true|false] [--apply-dns true|false] [--include a,b] [--exclude c,d] [--socks5 true|false] [--socks5-listen 127.0.0.1:1080]")
+			return fmt.Errorf("usage: profile update -p <profile-name> [--name ..] [--server ..] [--user ..] [--group ..] [--password-file <path> | --password-stdin] [--dns a,b] [--mtu 1399] [--accept true|false] [--auto-reconnect true|false] [--apply-dns true|false] [--include a,b] [--exclude c,d] [--socks5 true|false] [--socks5-listen 127.0.0.1:1080]")
+		}
+		if *unsafePassword != "" {
+			return errors.New("--password is not supported; use --password-file or --password-stdin")
 		}
 		targetID := ""
 		if *profileName != "" {
@@ -481,8 +649,12 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 		if *group != "" {
 			req.Group = group
 		}
-		if *password != "" {
-			req.Password = password
+		password, passwordProvided, err := readSecretInput(*passwordFile, *passwordStdin, cliIn)
+		if err != nil {
+			return err
+		}
+		if passwordProvided {
+			req.Password = &password
 		}
 		if *dns != "" {
 			req.DNSOverrides = splitCSV(*dns)
@@ -563,7 +735,7 @@ func runRoutes(ctx context.Context, client *local.Client, args []string) error {
 	if len(args) == 0 || isHelpArg(args[0]) {
 		return printNamedHelp("route")
 	}
-	debugf("runRoute args=%v", args)
+	debugf("runRoute subcommand=%q", args[0])
 	switch args[0] {
 	case "show":
 		debugf("route show")
@@ -574,7 +746,7 @@ func runRoutes(ctx context.Context, client *local.Client, args []string) error {
 		debugf("route show effective=%d", len(status.EffectiveRoutes))
 		return printJSON(status.EffectiveRoutes)
 	case "set":
-		debugf("route set args=%v", args)
+		debugf("route set")
 		if wantCommandHelp(args[1:]) {
 			return printNamedHelp("route set")
 		}
@@ -648,7 +820,7 @@ func runProxy(ctx context.Context, client *local.Client, args []string) error {
 	if len(args) == 0 || isHelpArg(args[0]) {
 		return printNamedHelp("proxy")
 	}
-	debugf("runProxy args=%v", args)
+	debugf("runProxy subcommand=%q", args[0])
 	switch args[0] {
 	case "status":
 		debugf("proxy status")
@@ -663,7 +835,7 @@ func runProxy(ctx context.Context, client *local.Client, args []string) error {
 		_, err = fmt.Fprintln(cliOut, "SOCKS5: disabled")
 		return err
 	case "enable":
-		debugf("proxy enable args=%v", args)
+		debugf("proxy enable")
 		if wantCommandHelp(args[1:]) {
 			return printNamedHelp("proxy enable")
 		}
@@ -685,7 +857,7 @@ func runProxy(ctx context.Context, client *local.Client, args []string) error {
 		debugf("proxy enable profile=%q", current.ID)
 		return printJSON(profile)
 	case "disable":
-		debugf("proxy disable args=%v", args)
+		debugf("proxy disable")
 		if wantCommandHelp(args[1:]) {
 			return printNamedHelp("proxy disable")
 		}
@@ -907,8 +1079,11 @@ func renderHelpTopic(topic helpTopic) string {
 		}
 	}
 	buf.WriteString("\nGLOBAL FLAGS\n")
-	buf.WriteString("  --socket <path>  path to daemon socket or named pipe\n")
-	buf.WriteString("  -v, --verbose  enable verbose debug output\n")
+	buf.WriteString("  --socket <path>               path to daemon socket or named pipe\n")
+	buf.WriteString("  --timeout <duration>          connectivity and ordinary command timeout (default 15s)\n")
+	buf.WriteString("  --connect-timeout <duration>  login and VPN connection timeout (default 2m)\n")
+	buf.WriteString("  -v, --verbose                 enable verbose debug output\n")
+	buf.WriteString("  --version                     print version and exit\n")
 	if topic.Name == "flexconnect" {
 		buf.WriteString("\nFor command-specific help, run `flexconnect help <command>` or add `--help` after a command.\n")
 	}
@@ -919,7 +1094,7 @@ func rootHelpTopic() helpTopic {
 	return helpTopic{
 		Name:    "flexconnect",
 		Summary: "CLI for the FlexConnect daemon",
-		Usage:   "flexconnect [--socket <path>] [-v|--verbose] <command> [command flags]",
+		Usage:   "flexconnect [--socket <path>] [--timeout <duration>] [--connect-timeout <duration>] [-v|--verbose] <command> [command flags]",
 		Description: "FlexConnect controls the local FlexConnect daemon, manages VPN profiles,\n" +
 			"starts AnyConnect sessions, and exposes local tools like diagnostics and VPN-only SOCKS5 proxying.",
 		Subcommands: []helpTopic{
@@ -938,12 +1113,12 @@ func rootHelpTopic() helpTopic {
 		Examples: []string{
 			"flexconnect status",
 			"flexconnect login",
-			"flexconnect login --server https://vpn.example.com --user alice --password secret --name corp",
+			"flexconnect login --server https://vpn.example.com --user alice --password-file ./secrets/flexconnect_password --name corp",
 			"flexconnect up",
 			"flexconnect up -p corp",
 			"flexconnect down",
 			"flexconnect traffic",
-			"flexconnect profile update -p corp --user alice --server vpn.example.com --password secret --auto-reconnect true --apply-dns true --socks5-listen 127.0.0.1:1080",
+			"flexconnect profile update -p corp --user alice --server vpn.example.com --password-file ./secrets/flexconnect_password --auto-reconnect true --apply-dns true --socks5-listen 127.0.0.1:1080",
 			"flexconnect proxy enable 127.0.0.1:1080",
 		},
 	}
@@ -959,11 +1134,11 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 		},
 		"login": {
 			Name:        "login",
-			Usage:       "flexconnect login [--server <url> --user <username> --password <password> --name <profile-name> --group <group>]",
+			Usage:       "flexconnect login [--server <url> --user <username> (--password-file <path> | --password-stdin) --name <profile-name> --group <group>]",
 			Description: "Create or update a profile, log in, and keep it as the last used profile. With no flags, prompts for the connection details interactively.",
 			Examples: []string{
 				"flexconnect login",
-				"flexconnect login --server https://vpn.example.com --user alice --password secret --name corp",
+				"flexconnect login --server https://vpn.example.com --user alice --password-file ./secrets/flexconnect_password --name corp",
 			},
 		},
 		"up": {
@@ -1014,14 +1189,14 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 			},
 			Examples: []string{
 				"flexconnect profile list",
-				"flexconnect profile add corp https://vpn.example.com alice secret",
+				"flexconnect profile add --password-file ./secrets/flexconnect_password corp https://vpn.example.com alice",
 				"flexconnect profile update -p corp --socks5 true --socks5-listen 127.0.0.1:1080",
 			},
 		},
 		"profile add": {
 			Name:        "profile add",
-			Usage:       "flexconnect profile add <name> <server_url> [username] [password]",
-			Description: "Create a new profile and optionally seed username and password.",
+			Usage:       "flexconnect profile add [--password-file <path> | --password-stdin] <name> <server_url> [username]",
+			Description: "Create a new profile and optionally seed a password from a protected file or standard input.",
 		},
 		"profile switch": {
 			Name:        "profile switch",
@@ -1035,7 +1210,7 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 		},
 		"profile update": {
 			Name:  "profile update",
-			Usage: "flexconnect profile update -p <profile-name> [--name ..] [--server ..] [--user ..] [--group ..] [--password ..] [--dns a,b] [--mtu 1399] [--accept true|false] [--auto-reconnect true|false] [--apply-dns true|false] [--include a,b] [--exclude c,d] [--socks5 true|false] [--socks5-listen 127.0.0.1:1080]",
+			Usage: "flexconnect profile update -p <profile-name> [--name ..] [--server ..] [--user ..] [--group ..] [--password-file <path> | --password-stdin] [--dns a,b] [--mtu 1399] [--accept true|false] [--auto-reconnect true|false] [--apply-dns true|false] [--include a,b] [--exclude c,d] [--socks5 true|false] [--socks5-listen 127.0.0.1:1080]",
 			Description: "Update profile fields in place. Runtime-relevant changes reconnect an active profile automatically.\n" +
 				"Use `socks5=true` to enable the built-in VPN-only SOCKS5 proxy for that profile.",
 		},

@@ -1,20 +1,32 @@
 package apiserver
 
 import (
+	"context"
 	"encoding/json"
-	"flexconnect/internal/logging"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"flexconnect/internal/appd"
+	"flexconnect/internal/buildinfo"
+	"flexconnect/internal/logging"
 	"flexconnect/internal/types"
 )
 
 var apiserverLog = logging.WithComponent("apiserver")
 
+const maxRequestBodyBytes = 1 << 20
+
+type requestIDContextKey struct{}
+
 type Server struct {
 	daemon appd.Daemon
 	mux    *http.ServeMux
+	nextID atomic.Uint64
 }
 
 func New(daemon appd.Daemon) *Server {
@@ -24,10 +36,21 @@ func New(daemon appd.Daemon) *Server {
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := strconv.FormatUint(s.nextID.Add(1), 10)
+		w.Header().Set("X-FlexConnect-Request-ID", requestID)
+		if r.ContentLength > maxRequestBodyBytes {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		ctx := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
+		s.mux.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("/v1/health", s.handleHealth)
 	s.mux.HandleFunc("/v1/status", s.handleStatus)
 	s.mux.HandleFunc("/v1/profiles", s.handleProfiles)
 	s.mux.HandleFunc("/v1/profiles/", s.handleProfilesSub)
@@ -42,6 +65,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/watch", s.handleWatch)
 }
 
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	logfRequest(r)
+	if r.Method != http.MethodGet {
+		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	apiserverLog.Printf("method=%s path=%s status=%d api_version=%s", r.Method, r.URL.Path, http.StatusOK, buildinfo.LocalAPIVersion)
+	writeJSON(w, types.Health{Status: "ok", Version: buildinfo.Version, APIVersion: buildinfo.LocalAPIVersion})
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	logfRequest(r)
 	if r.Method != http.MethodPost {
@@ -50,7 +84,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req types.LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -83,7 +117,7 @@ func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.daemon.ListProfiles())
 	case http.MethodPut:
 		var req types.ProfileUpsertRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSON(r, &req); err != nil {
 			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -130,7 +164,7 @@ func (s *Server) handleProfilesSub(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodPut {
 		var req types.ProfileUpdateRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSON(r, &req); err != nil {
 			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -250,7 +284,7 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/v1/routes/")
 	var req types.RouteUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -293,9 +327,31 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		apiserverLog.Printf("response encode failed err=%v", err)
+	}
+}
+
+func decodeJSON(r *http.Request, out any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return fmt.Errorf("request body exceeds %d bytes: %w", maxRequestBodyBytes, err)
+		}
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return fmt.Errorf("invalid trailing JSON data: %w", err)
+	}
+	return nil
 }
 
 func logfRequest(r *http.Request) {
-	apiserverLog.Printf("request=%s path=%s remote=%s", r.Method, r.URL.Path, r.RemoteAddr)
+	requestID, _ := r.Context().Value(requestIDContextKey{}).(string)
+	apiserverLog.Printf("request_id=%s request=%s path=%s remote=%s", requestID, r.Method, r.URL.Path, r.RemoteAddr)
 }

@@ -1,11 +1,14 @@
 package secret
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/zalando/go-keyring"
 )
+
+var ErrNotFound = errors.New("secret not found")
 
 type Store interface {
 	Get(ref string) (string, error)
@@ -22,7 +25,11 @@ func NewKeyringStore(service string) *KeyringStore {
 }
 
 func (s *KeyringStore) Get(ref string) (string, error) {
-	return keyring.Get(s.service, ref)
+	value, err := keyring.Get(s.service, ref)
+	if errors.Is(err, keyring.ErrNotFound) {
+		return "", fmt.Errorf("%w: %s", ErrNotFound, ref)
+	}
+	return value, err
 }
 
 func (s *KeyringStore) Put(ref, value string) error {
@@ -30,7 +37,11 @@ func (s *KeyringStore) Put(ref, value string) error {
 }
 
 func (s *KeyringStore) Delete(ref string) error {
-	return keyring.Delete(s.service, ref)
+	err := keyring.Delete(s.service, ref)
+	if errors.Is(err, keyring.ErrNotFound) {
+		return nil
+	}
+	return err
 }
 
 type MemoryStore struct {
@@ -47,7 +58,7 @@ func (s *MemoryStore) Get(ref string) (string, error) {
 	defer s.mu.Unlock()
 	v, ok := s.data[ref]
 	if !ok {
-		return "", fmt.Errorf("secret not found: %s", ref)
+		return "", fmt.Errorf("%w: %s", ErrNotFound, ref)
 	}
 	return v, nil
 }

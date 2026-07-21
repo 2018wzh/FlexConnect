@@ -2,12 +2,14 @@
 
 FROM golang:1.26.2-bookworm AS build
 
+ARG VERSION=1.0.6
+
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/flexconnectd ./cmd/flexconnectd
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/flexconnect ./cmd/flexconnect
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X=flexconnect/internal/buildinfo.Version=${VERSION}" -o /out/flexconnectd ./cmd/flexconnectd
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X=flexconnect/internal/buildinfo.Version=${VERSION}" -o /out/flexconnect ./cmd/flexconnect
 
 FROM debian:bookworm-slim
 

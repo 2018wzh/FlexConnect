@@ -48,6 +48,23 @@ jobs:
             type=raw,value=${{ github.event.inputs.image-tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image-tag != '' }}
             type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image-tag == '' }}
 
+      - name: Derive binary version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ github.event.inputs.image-tag }}" ]]; then
+            version="${{ github.event.inputs.image-tag }}"
+          else
+            version="dev-${GITHUB_SHA::12}"
+          fi
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "invalid binary version: $version" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
@@ -57,3 +74,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.value }}

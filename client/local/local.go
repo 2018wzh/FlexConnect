@@ -3,7 +3,6 @@ package local
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
 	"flexconnect/internal/types"
@@ -40,6 +40,27 @@ type Client struct {
 
 	once sync.Once
 	hc   *http.Client
+}
+
+type IncompatibleAPIError struct {
+	ClientVersion string
+	DaemonVersion string
+}
+
+type APIError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("local API returned HTTP %d", e.StatusCode)
+	}
+	return e.Message
+}
+
+func (e *IncompatibleAPIError) Error() string {
+	return fmt.Sprintf("local API version mismatch: client=%s daemon=%s", e.ClientVersion, e.DaemonVersion)
 }
 
 func (c *Client) socket() string {
@@ -94,6 +115,20 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*
 func (c *Client) Status(ctx context.Context) (*types.Status, error) {
 	var out types.Status
 	return &out, c.getJSON(ctx, "/v1/status", &out)
+}
+
+func (c *Client) Health(ctx context.Context) (*types.Health, error) {
+	var out types.Health
+	if err := c.getJSON(ctx, "/v1/health", &out); err != nil {
+		return nil, err
+	}
+	if out.Status != "ok" {
+		return nil, fmt.Errorf("flexconnectd is not ready: status=%q", out.Status)
+	}
+	if out.APIVersion != buildinfo.LocalAPIVersion {
+		return nil, &IncompatibleAPIError{ClientVersion: buildinfo.LocalAPIVersion, DaemonVersion: out.APIVersion}
+	}
+	return &out, nil
 }
 
 func (c *Client) Profiles(ctx context.Context) ([]types.Profile, error) {
@@ -184,9 +219,9 @@ func (c *Client) Watch(ctx context.Context) (*Watcher, error) {
 	}
 	if res.StatusCode != http.StatusOK {
 		defer res.Body.Close()
-		all, _ := io.ReadAll(res.Body)
-		localDebug("/v1/watch unexpected status", res.StatusCode, strings.TrimSpace(string(all)))
-		return nil, errors.New(strings.TrimSpace(string(all)))
+		err := responseError(res)
+		localDebug("/v1/watch unexpected status", res.StatusCode, err)
+		return nil, err
 	}
 	localDebug("/v1/watch started")
 	return &Watcher{ctx: ctx, res: res, dec: json.NewDecoder(res.Body)}, nil
@@ -200,22 +235,23 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		all, _ := io.ReadAll(res.Body)
-		localDebug("GET", path, "unexpected status", res.StatusCode, "body", strings.TrimSpace(string(all)))
-		return errors.New(strings.TrimSpace(string(all)))
+		err := responseError(res)
+		localDebug("GET", path, "unexpected status", res.StatusCode, "err", err)
+		return err
 	}
 	localDebug("GET", path, "ok")
 	return json.NewDecoder(res.Body).Decode(out)
 }
 
 func (c *Client) sendJSON(ctx context.Context, method, path string, in, out any, want int) error {
-	localDebug(method, path, "payload", in)
+	localDebug(method, path)
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
 			return err
 		}
+		localDebug(method, path, "payload_bytes", len(b))
 		body = strings.NewReader(string(b))
 	}
 	res, err := c.do(ctx, method, path, body)
@@ -224,9 +260,9 @@ func (c *Client) sendJSON(ctx context.Context, method, path string, in, out any,
 	}
 	defer res.Body.Close()
 	if res.StatusCode != want {
-		all, _ := io.ReadAll(res.Body)
-		localDebug(method, path, "unexpected status", res.StatusCode, "body", strings.TrimSpace(string(all)))
-		return errors.New(strings.TrimSpace(string(all)))
+		err := responseError(res)
+		localDebug(method, path, "unexpected status", res.StatusCode, "err", err)
+		return err
 	}
 	if out == nil {
 		return nil
@@ -243,12 +279,28 @@ func (c *Client) expectNoContent(ctx context.Context, method, path string, body 
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusNoContent {
-		all, _ := io.ReadAll(res.Body)
-		localDebug(method, path, "unexpected status", res.StatusCode, "body", strings.TrimSpace(string(all)))
-		return errors.New(strings.TrimSpace(string(all)))
+		err := responseError(res)
+		localDebug(method, path, "unexpected status", res.StatusCode, "err", err)
+		return err
 	}
 	localDebug(method, path, "ok")
 	return nil
+}
+
+func responseError(res *http.Response) error {
+	const maxErrorBytes = 64 * 1024
+	all, err := io.ReadAll(io.LimitReader(res.Body, maxErrorBytes+1))
+	if err != nil {
+		return fmt.Errorf("read local API error response: %w", err)
+	}
+	message := strings.TrimSpace(string(all))
+	if len(all) > maxErrorBytes {
+		message = strings.TrimSpace(string(all[:maxErrorBytes])) + "..."
+	}
+	if message == "" {
+		message = http.StatusText(res.StatusCode)
+	}
+	return &APIError{StatusCode: res.StatusCode, Message: message}
 }
 
 func (c *Client) expectNoContentJSON(ctx context.Context, method, path string, in any) error {

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/logbuf"
 	"flexconnect/internal/logging"
 	"flexconnect/internal/profileio"
@@ -18,8 +19,6 @@ import (
 	"flexconnect/internal/types"
 	"flexconnect/internal/vpn"
 )
-
-const version = "1.0.6"
 
 var (
 	autoReconnectMinDelay = 2 * time.Second
@@ -194,7 +193,7 @@ func (s *Service) Diagnostics() types.Diagnostics {
 		}
 	}
 	return types.Diagnostics{
-		Version:        version,
+		Version:        buildinfo.Version,
 		Status:         status,
 		CurrentProfile: current,
 		Profiles:       profiles,
@@ -289,7 +288,7 @@ func (s *Service) CurrentProfile() (types.Profile, error) {
 }
 
 func (s *Service) CreateProfile(profile types.Profile, password string) (types.Profile, error) {
-	appdLog.Printf("create profile name=%q server=%q", profile.Name, profile.ServerURL)
+	appdLog.Printf("create profile name=%q", profile.Name)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if profile.ID == "" {
@@ -338,8 +337,8 @@ func (s *Service) UpdateProfile(id string, req types.ProfileUpdateRequest) (type
 		return types.Profile{}, fmt.Errorf("profile not found: %s", id)
 	}
 	before := s.profiles[index]
-	appdDebugf("update profile before id=%s name=%q server=%q accept=%v include=%d exclude=%d",
-		before.ID, before.Name, before.ServerURL, before.AcceptServerRoutes, len(before.CustomInclude), len(before.CustomExclude))
+	appdDebugf("update profile before id=%s name=%q accept=%v include=%d exclude=%d",
+		before.ID, before.Name, before.AcceptServerRoutes, len(before.CustomInclude), len(before.CustomExclude))
 	profile := before
 	if req.Name != nil {
 		profile.Name = *req.Name
@@ -435,7 +434,10 @@ func (s *Service) DeleteProfile(id string) error {
 		s.stopReconnectLocked()
 	}
 	wasConnected = s.connectedID == id
-	_ = s.secrets.Delete(s.profiles[index].SecretRef)
+	if err := s.secrets.Delete(s.profiles[index].SecretRef); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("delete secret for profile %s: %w", id, err)
+	}
 	s.profiles = append(s.profiles[:index], s.profiles[index+1:]...)
 	if s.currentID == id {
 		s.currentID = ""
@@ -504,7 +506,11 @@ func (s *Service) Connect(ctx context.Context, id string) error {
 		s.mu.Unlock()
 		return err
 	}
-	password, _ := s.secrets.Get(profile.SecretRef)
+	password, err := s.loadProfileSecret(profile)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.mu.Unlock()
 	connectStart := time.Now()
 	if err := s.connectPreparedProfile(ctx, profile, password, false); err != nil {
@@ -624,7 +630,7 @@ func (s *Service) UpdateRoutes(id string, req types.RouteUpdateRequest) (types.P
 }
 
 func (s *Service) Login(ctx context.Context, req types.LoginRequest) error {
-	appdLog.Printf("start login interactive profile=%s server=%q", req.ProfileID, req.ServerURL)
+	appdLog.Printf("start login interactive profile=%s", req.ProfileID)
 	appdDebugf("start login interactive profile=%s", req.ProfileID)
 	s.mu.Lock()
 	profile, password, err := s.prepareLoginProfileLocked(req)
@@ -653,7 +659,7 @@ func (s *Service) Watch(ctx context.Context) <-chan types.Notify {
 	s.nextWatcherID++
 	s.watchers[id] = ch
 	ch <- types.Notify{
-		Version:  version,
+		Version:  buildinfo.Version,
 		Event:    "snapshot",
 		Status:   ptrStatus(s.status),
 		Traffic:  ptrTraffic(s.traffic),
@@ -821,8 +827,10 @@ func (s *Service) runScheduledReconnect(profileID string, manualSeq uint64, atte
 		s.mu.Unlock()
 		return
 	}
-	password, _ := s.secrets.Get(profile.SecretRef)
-	err := s.connectPreparedProfile(context.Background(), profile, password, true)
+	password, err := s.loadProfileSecret(profile)
+	if err == nil {
+		err = s.connectPreparedProfile(context.Background(), profile, password, true)
+	}
 
 	s.mu.Lock()
 	if err != nil {
@@ -874,7 +882,7 @@ func (s *Service) findProfileLocked(id string) (types.Profile, error) {
 }
 
 func (s *Service) emitLocked(notify types.Notify) {
-	notify.Version = version
+	notify.Version = buildinfo.Version
 	notify.Time = now()
 	appdDebugf("emit notify event=%s watchers=%d", notify.Event, len(s.watchers))
 	for _, ch := range s.watchers {
@@ -974,7 +982,11 @@ func (s *Service) prepareLoginProfileLocked(req types.LoginRequest) (types.Profi
 			return types.Profile{}, "", err
 		}
 	} else {
-		password, _ = s.secrets.Get(profile.SecretRef)
+		var err error
+		password, err = s.loadProfileSecret(profile)
+		if err != nil {
+			return types.Profile{}, "", err
+		}
 	}
 
 	if index >= 0 {
@@ -992,7 +1004,11 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 		return err
 	}
 	if profile.SecretRef != "" && password == "" {
-		password, _ = s.secrets.Get(profile.SecretRef)
+		var err error
+		password, err = s.loadProfileSecret(profile)
+		if err != nil {
+			return err
+		}
 	}
 
 	s.mu.Lock()
@@ -1048,7 +1064,7 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 	s.status.LastError = ""
 	s.clearTrafficLocked()
 	s.status.UpdatedAt = now()
-	s.logs.Add("info", fmt.Sprintf("appd: connecting id=%s server=%q", profile.ID, profile.ServerURL))
+	s.logs.Add("info", fmt.Sprintf("appd: connecting id=%s", profile.ID))
 	s.emitLocked(types.Notify{
 		Event:   "status",
 		Status:  ptrStatus(s.status),
@@ -1093,6 +1109,20 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 		appdLog.Printf("apply proxy after connect failed profile=%s err=%v", profile.ID, err)
 	}
 	return nil
+}
+
+func (s *Service) loadProfileSecret(profile types.Profile) (string, error) {
+	if profile.SecretRef == "" {
+		return "", fmt.Errorf("profile %s has no secret reference", profile.ID)
+	}
+	password, err := s.secrets.Get(profile.SecretRef)
+	if err != nil {
+		return "", fmt.Errorf("load secret for profile %s: %w", profile.ID, err)
+	}
+	if password == "" {
+		return "", fmt.Errorf("secret for profile %s is empty", profile.ID)
+	}
+	return password, nil
 }
 
 func (s *Service) connectAllowedFromStateLocked(profileID string, allowReconnectState bool) bool {

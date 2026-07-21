@@ -230,6 +230,14 @@ effective routes, manages the optional SOCKS5 listener, serves the local browser
 watch notifications. The AnyConnect adapter configures the embedded protocol stack, performs
 password auth, establishes TLS/DTLS and TUN state, then reports session details back to the daemon.
 
+On Linux the packaged daemon runs as `root:flexconnect`; systemd owns `/run/flexconnect` and
+`/var/lib/flexconnect`, and the control socket is `0660`. Only users explicitly added to the
+`flexconnect` group may use the CLI or tray control plane.
+
+Daemon-backed CLI commands perform a bounded `/v1/health` readiness and API-version handshake
+before their command request. Interactive input is collected outside request deadlines; ordinary
+commands and VPN connection commands use separate configurable timeouts.
+
 ## Testing Strategy
 - Unit tests cover routing, logging, file storage, CLI behavior, tray helpers, and the AnyConnect
   backend adapter.
@@ -278,7 +286,7 @@ go test ./...
   `FLEXCONNECT_PASSWORD` or `FLEXCONNECT_PASSWORD_FILE`, and both set together must fail fast.
 - Profile state persists only metadata and `secret_ref` values, not raw passwords.
 - Diagnostics are tested to avoid raw password leakage; keep that invariant for new fields.
-- Local control traffic is served over Unix sockets or Windows named pipes, not a public TCP port.
+- Local control traffic is served over a `0660 root:flexconnect` Unix socket on Linux or a protected Windows named pipe, not a public TCP port.
 - Docker exposes only the SOCKS5 listener by default. Do not expose the local control socket over
   TCP as part of Docker work.
 - Windows daemon startup may request elevation; service install scripts modify system services.

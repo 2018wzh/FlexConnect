@@ -3,7 +3,6 @@ package appd
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -262,6 +261,41 @@ func TestCreateProfileReturnsSecretStoreError(t *testing.T) {
 	}
 }
 
+func TestConnectReturnsSecretStoreError(t *testing.T) {
+	profile := testProfile("p1", false)
+	backend := newFakeBackend()
+	store := &memoryStore{data: storefile.Data{Profiles: []types.Profile{profile}, CurrentProfileID: profile.ID}}
+	service, err := New(store, failingSecretStore{err: errors.New("keyring unavailable")}, backend, router.DefaultPlanner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = service.Connect(context.Background(), profile.ID)
+	if err == nil || !strings.Contains(err.Error(), "load secret for profile p1: keyring unavailable") {
+		t.Fatalf("Connect error = %v", err)
+	}
+	if backend.connectCount() != 0 {
+		t.Fatalf("backend connect count = %d", backend.connectCount())
+	}
+}
+
+func TestDeleteProfileReturnsSecretStoreErrorWithoutMutatingProfiles(t *testing.T) {
+	profile := testProfile("p1", false)
+	store := &memoryStore{data: storefile.Data{Profiles: []types.Profile{profile}, CurrentProfileID: profile.ID}}
+	service, err := New(store, failingSecretStore{err: errors.New("keyring unavailable")}, newFakeBackend(), router.DefaultPlanner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = service.DeleteProfile(profile.ID)
+	if err == nil || !strings.Contains(err.Error(), "delete secret for profile p1: keyring unavailable") {
+		t.Fatalf("DeleteProfile error = %v", err)
+	}
+	if got := service.ListProfiles(); len(got) != 1 || got[0].ID != profile.ID {
+		t.Fatalf("profiles after failed delete = %+v", got)
+	}
+}
+
 type noopTunnelDialer struct{}
 
 func (noopTunnelDialer) DialContext(context.Context, string, string) (net.Conn, error) {
@@ -328,8 +362,8 @@ type failingSecretStore struct {
 	err error
 }
 
-func (s failingSecretStore) Get(ref string) (string, error) {
-	return "", fmt.Errorf("unexpected get %s", ref)
+func (s failingSecretStore) Get(string) (string, error) {
+	return "", s.err
 }
 
 func (s failingSecretStore) Put(string, string) error {
@@ -337,5 +371,5 @@ func (s failingSecretStore) Put(string, string) error {
 }
 
 func (s failingSecretStore) Delete(string) error {
-	return nil
+	return s.err
 }

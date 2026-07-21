@@ -5,6 +5,7 @@
 # Local secrets and env
 .env
 .env.*
+secrets/
 
 # Build outputs
 bin/

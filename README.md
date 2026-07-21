@@ -40,7 +40,7 @@ flexconnect profile list
 ### 首次使用
 
 1. 启动 `flexconnectd`
-2. 运行 `flexconnect login --server <server> --user <user> --password <password> --name <profile-name>`
+2. 运行 `flexconnect login` 并在终端中安全输入连接信息
 3. 创建或选择一个 Profile
 4. 输入服务器、用户名和密码并连接
 
@@ -49,7 +49,7 @@ flexconnect profile list
 ## 命令示例
 
 ```bash
-flexconnect login --server https://vpn.example.com --user alice --password <password> --name corp
+flexconnect login --server https://vpn.example.com --user alice --password-file ./secrets/flexconnect_password --name corp
 flexconnect up -p corp
 flexconnect down
 flexconnect diag diag.json
@@ -58,6 +58,9 @@ flexconnect proxy enable 127.0.0.1:1080
 flexconnect proxy disable
 flexconnect logs
 ```
+
+非交互场景只接受 `--password-file` 或 `--password-stdin`。FlexConnect 不接受命令行
+明文密码，因为进程参数和 shell 历史可能泄露凭据。
 
 SOCKS5 代理是 VPN-only：启用后只支持 TCP CONNECT 和 IPv4 目标，域名通过 VPN DNS 解析，无法确认走 VPN 时会拒绝连接，不会回退到本机网络。当前不支持 UDP ASSOC、BIND 或 IPv6 代理目标。
 
@@ -153,6 +156,14 @@ docker pull ghcr.io/<OWNER>/flexconnect:<VERSION>
 ./scripts/install-macos.sh
 ```
 
+Linux daemon 的本地控制接口位于 `/run/flexconnect/flexconnect.sock`，仅允许
+`root` 和 `flexconnect` 组访问。安装后将需要使用 CLI 或托盘的账户加入该组，
+并重新登录以刷新组成员关系：
+
+```bash
+sudo usermod -aG flexconnect "$USER"
+```
+
 ### 统一打包
 
 ```bash
@@ -171,11 +182,14 @@ go run ./cmd/dist build --version 1.0.6 darwin/arm64/pkg
 ## 运行与配置
 
 - `--socket` 用于指定本地 IPC 端点
+- `--timeout` 设置 daemon 健康检查和普通 CLI 操作超时，默认 `15s`
+- `--connect-timeout` 设置登录和 VPN 建链超时，默认 `2m`
 - `--state` 用于指定状态文件
 - `-v` 或 `--verbose` 启用更详细日志
 - Windows 上直接启动 `flexconnectd` 时会自动请求管理员权限
 - 密码通过系统密钥库保存，状态文件只保存非敏感元数据
-- 本地控制接口通过 Unix socket 或 Windows named pipe 提供，不暴露公网 TCP 端口
+- CLI 在执行 daemon 命令前通过 `/v1/health` 校验 readiness 和本地 API 版本
+- Linux 本地控制接口通过 `0660 root:flexconnect` Unix socket 提供；Windows 使用受保护的 named pipe，不暴露公网 TCP 端口
 
 ## 项目结构
 

@@ -176,17 +176,18 @@ func (b *Build) BuildCommonArtifacts(goos, goarch string) (CommonArtifacts, erro
 		"GOOS":   goos,
 		"GOARCH": goarch,
 	}
-	flexconnect, err := b.BuildGoBinary("./cmd/flexconnect", GoBinaryOptions{Name: "flexconnect", Env: env})
+	versionLdflag := "-X=flexconnect/internal/buildinfo.Version=" + b.Version
+	flexconnect, err := b.BuildGoBinary("./cmd/flexconnect", GoBinaryOptions{Name: "flexconnect", Env: env, Ldflags: []string{versionLdflag}})
 	if err != nil {
 		return CommonArtifacts{}, err
 	}
-	flexconnectd, err := b.BuildGoBinary("./cmd/flexconnectd", GoBinaryOptions{Name: "flexconnectd", Env: env})
+	flexconnectd, err := b.BuildGoBinary("./cmd/flexconnectd", GoBinaryOptions{Name: "flexconnectd", Env: env, Ldflags: []string{versionLdflag}})
 	if err != nil {
 		return CommonArtifacts{}, err
 	}
-	trayOpts := GoBinaryOptions{Name: "flextray", Env: env}
+	trayOpts := GoBinaryOptions{Name: "flextray", Env: env, Ldflags: []string{versionLdflag}}
 	if goos == "windows" {
-		trayOpts.Ldflags = []string{"-H=windowsgui"}
+		trayOpts.Ldflags = append(trayOpts.Ldflags, "-H=windowsgui")
 	}
 	flextray, err := b.BuildGoBinary("./cmd/flextray", trayOpts)
 	if err != nil {

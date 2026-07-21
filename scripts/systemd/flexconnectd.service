@@ -5,7 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/flexconnectd --socket /var/run/flexconnect.sock --state /var/lib/flexconnect/state.json
+User=root
+Group=flexconnect
+UMask=0007
+RuntimeDirectory=flexconnect
+RuntimeDirectoryMode=0750
+StateDirectory=flexconnect
+StateDirectoryMode=0700
+ExecStart=/usr/sbin/flexconnectd --socket /run/flexconnect/flexconnect.sock --state /var/lib/flexconnect/state.json
 Restart=on-failure
 RestartSec=5
 
