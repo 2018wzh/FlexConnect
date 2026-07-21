@@ -19,12 +19,14 @@ jobs:
   publish:
     name: Build and push container image
     runs-on: ubuntu-latest
-    env:
-      IMAGE_NAME: ghcr.io/${{ toLower(github.repository_owner) }}/${{ toLower(github.event.repository.name) }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve image name
+        shell: bash
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
