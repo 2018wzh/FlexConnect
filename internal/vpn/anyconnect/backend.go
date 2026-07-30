@@ -2,6 +2,7 @@ package anyconnect
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strings"
 	"sync"
@@ -17,8 +18,9 @@ import (
 )
 
 type Backend struct {
-	mu     sync.Mutex
-	events chan vpn.Event
+	mu            sync.Mutex
+	events        chan vpn.Event
+	connectionSeq uint64
 }
 
 func New() *Backend {
@@ -59,29 +61,46 @@ func (b *Backend) Connect(ctx context.Context, profile types.Profile, password s
 			acBase.Warn("vpn connect failed", "error", err.Error())
 			return nil, err
 		}
-		session := b.SessionInfo()
+		cSess := acSession.Sess.CSess
+		if cSess == nil {
+			return nil, fmt.Errorf("vpn connect completed without a connection session")
+		}
+		b.connectionSeq++
+		cSess.ConnectionID = fmt.Sprintf("vpn-%d", b.connectionSeq)
+		session := b.sessionInfo(cSess)
 		acBase.Info("vpn connect success", "server", session.ServerAddress, "tun", session.TUNName)
-		b.events <- vpn.Event{Type: "connected", Session: session}
-		go b.monitorClose()
+		b.events <- vpn.Event{Type: "connected", ConnectionID: cSess.ConnectionID, Session: session}
+		go b.monitorClose(cSess, cSess.ConnectionID)
 		return session, nil
 	}
 }
 
-func (b *Backend) monitorClose() {
-	if acSession.Sess.CloseChan == nil {
+func (b *Backend) monitorClose(cSess *acSession.ConnSession, connectionID string) {
+	if cSess == nil || cSess.CloseChan == nil {
 		acBase.Warn("monitor close skipped: close channel missing")
 		return
 	}
 	acBase.Info("vpn monitor close started")
-	<-acSession.Sess.CloseChan
+	<-cSess.CloseChan
 	acBase.Info("vpn monitor close done")
-	b.events <- vpn.Event{Type: "disconnected"}
+	info := cSess.CloseInfo()
+	faults := make([]vpn.TransportFault, 0, len(info.TransportFaults))
+	for _, fault := range info.TransportFaults {
+		faults = append(faults, vpn.TransportFault{Code: fault.Code, Transport: fault.Transport, Error: fault.Error, Time: fault.Time})
+	}
+	b.events <- vpn.Event{
+		Type: "disconnected", ConnectionID: connectionID,
+		Close: &vpn.DisconnectInfo{Code: info.Code, Transport: info.Transport, Error: info.Error, Time: info.Time, TransportFaults: faults},
+	}
 }
 
 func (b *Backend) Disconnect(_ context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	acBase.Info("vpn disconnect called")
+	if acSession.Sess.CSess != nil {
+		acSession.Sess.CSess.RecordClose("local_requested", "local", nil)
+	}
 	acRPC.DisConnect()
 	return nil
 }
@@ -91,7 +110,15 @@ func (b *Backend) SessionInfo() *types.SessionInfo {
 	if c == nil {
 		return nil
 	}
+	return b.sessionInfo(c)
+}
+
+func (b *Backend) sessionInfo(c *acSession.ConnSession) *types.SessionInfo {
+	if c == nil {
+		return nil
+	}
 	return &types.SessionInfo{
+		ConnectionID:  c.ConnectionID,
 		ServerAddress: c.ServerAddress,
 		Hostname:      c.Hostname,
 		TUNName:       c.TunName,

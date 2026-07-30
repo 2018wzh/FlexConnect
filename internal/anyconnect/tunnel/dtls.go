@@ -107,6 +107,11 @@ func dtlsChannel(cSess *session.ConnSession) {
 		pl := getPayloadBuffer()                // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
 		bytesReceived, err = conn.Read(pl.Data) // 服务器没有数据返回时，会阻塞
 		if err != nil {
+			code := "dtls_read_error"
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				code = "dtls_read_timeout"
+			}
+			cSess.RecordTransportFault(code, "dtls", err)
 			base.Error("dtls server to payloadIn error:", err)
 			return
 		}
@@ -121,7 +126,7 @@ func dtlsChannel(cSess *session.ConnSession) {
 		case 0x07: // KEEPALIVE
 			// base.Debug("dtls receive KEEPALIVE")
 		case 0x05: // DISCONNECT
-			// base.Debug("dtls receive DISCONNECT")
+			cSess.RecordTransportFault("server_disconnect", "dtls", nil)
 			return
 		case 0x03: // DPD-REQ
 			// base.Debug("dtls receive DPD-REQ")
@@ -183,6 +188,11 @@ func payloadOutDTLSToServer(conn *dtls.Conn, dSess *session.DtlsSession, cSess *
 
 		bytesSent, err = conn.Write(pl.Data)
 		if err != nil {
+			code := "dtls_write_error"
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				code = "dtls_write_timeout"
+			}
+			cSess.RecordTransportFault(code, "dtls", err)
 			base.Error("dtls payloadOut to server error:", err)
 			return
 		}

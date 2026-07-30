@@ -111,6 +111,7 @@ func tunToPayloadOut(dev wgtun.Device, cSess *session.ConnSession) {
 		_, err = dev.Read(bufs, sizes, offset) // 如果 tun 没有 up，会在这等待
 		n = sizes[0]
 		if err != nil {
+			cSess.RecordClose("tun_read_error", "tun", err)
 			base.Error("tun to payloadOut error:", err)
 			return
 		}
@@ -210,6 +211,7 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 		}
 		received++
 		if err != nil {
+			cSess.RecordClose("tun_write_error", "tun", err)
 			base.Error("payloadIn to tun error:", err)
 			return
 		}

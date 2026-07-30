@@ -8,9 +8,26 @@ import (
 )
 
 type Event struct {
-	Type    string
-	Session *types.SessionInfo
-	Err     error
+	Type         string
+	ConnectionID string
+	Session      *types.SessionInfo
+	Err          error
+	Close        *DisconnectInfo
+}
+
+type DisconnectInfo struct {
+	Code            string
+	Transport       string
+	Error           string
+	Time            string
+	TransportFaults []TransportFault
+}
+
+type TransportFault struct {
+	Code      string
+	Transport string
+	Error     string
+	Time      string
 }
 
 type Backend interface {

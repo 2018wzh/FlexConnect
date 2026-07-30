@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/binary"
+	"net"
 	"net/http"
 	"time"
 
@@ -42,6 +43,11 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 		pl := getPayloadBuffer()                // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
 		bytesReceived, err = bufR.Read(pl.Data) // 服务器没有数据返回时，会阻塞
 		if err != nil {
+			code := "tls_read_error"
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				code = "tls_read_timeout"
+			}
+			cSess.RecordClose(code, "tls", err)
 			base.Error("tls server to payloadIn error:", err)
 			return
 		}
@@ -75,6 +81,9 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 			case <-cSess.CloseChan:
 				return
 			}
+		case 0x05: // DISCONNECT
+			cSess.RecordClose("server_disconnect", "tls", nil)
+			return
 		}
 		cSess.Stat.BytesReceived.Add(uint64(bytesReceived))
 	}
@@ -121,6 +130,11 @@ func payloadOutTLSToServer(conn *tls.Conn, cSess *session.ConnSession) {
 		}
 		bytesSent, err = conn.Write(pl.Data)
 		if err != nil {
+			code := "tls_write_error"
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				code = "tls_write_timeout"
+			}
+			cSess.RecordClose(code, "tls", err)
 			base.Error("tls payloadOut to server error:", err)
 			return
 		}

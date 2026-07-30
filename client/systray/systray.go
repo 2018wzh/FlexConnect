@@ -2,6 +2,7 @@ package systray
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	systraylib "fyne.io/systray"
+	"github.com/gen2brain/beeep"
 
 	"flexconnect/client/local"
 	"flexconnect/internal/logging"
@@ -17,6 +19,21 @@ import (
 )
 
 var systrayLog = logging.WithComponent("flexconnect-systray")
+
+type notificationSender interface {
+	Send(title, body string) error
+	Alert(title, body string) error
+}
+
+type beeepNotificationSender struct{}
+
+func (beeepNotificationSender) Send(title, body string) error {
+	return beeep.Notify(title, body, "")
+}
+
+func (beeepNotificationSender) Alert(title, body string) error {
+	return beeep.Alert(title, body, "")
+}
 
 type toggleAction int
 
@@ -43,6 +60,9 @@ type Menu struct {
 	rebuildCh  chan struct{}
 	runCancel  context.CancelFunc
 	menuCancel context.CancelFunc
+	notifier   notificationSender
+	notified   map[string]struct{}
+	errorSeen  map[string]time.Time
 }
 
 func (m *Menu) Run() {
@@ -85,6 +105,56 @@ func (m *Menu) init() {
 	if m.rebuildCh == nil {
 		m.rebuildCh = make(chan struct{}, 1)
 	}
+	if m.notifier == nil {
+		m.notifier = beeepNotificationSender{}
+	}
+	if m.notified == nil {
+		m.notified = map[string]struct{}{}
+	}
+	if m.errorSeen == nil {
+		m.errorSeen = map[string]time.Time{}
+	}
+}
+
+// reportError records every tray error and presents a bounded, deduplicated
+// alert. Reconnect/watch loops can encounter the same IPC error repeatedly;
+// suppressing only identical errors for a short interval keeps the desktop
+// usable while retaining the full error in the component log.
+func (m *Menu) reportError(operation string, err error) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	m.init()
+	message := strings.Join(strings.Fields(err.Error()), " ")
+	if len(message) > 320 {
+		message = message[:320] + "..."
+	}
+	key := operation + ":" + message
+	now := time.Now()
+	m.mu.Lock()
+	last, seen := m.errorSeen[key]
+	if seen && now.Sub(last) < 30*time.Second {
+		m.mu.Unlock()
+		return
+	}
+	m.errorSeen[key] = now
+	if len(m.errorSeen) > 64 {
+		for k, at := range m.errorSeen {
+			if now.Sub(at) >= 30*time.Second {
+				delete(m.errorSeen, k)
+			}
+		}
+	}
+	notifier := m.notifier
+	m.mu.Unlock()
+
+	wrapped := fmt.Errorf("%s: %w", operation, err)
+	systrayLog.Error(wrapped)
+	if notifier != nil {
+		if notifyErr := notifier.Alert("FlexConnect tray error", operation+"\n\n"+message); notifyErr != nil {
+			systrayLog.Error(fmt.Errorf("desktop error alert failed operation=%s: %w", operation, notifyErr))
+		}
+	}
 }
 
 func (m *Menu) requestRebuild() {
@@ -98,15 +168,15 @@ func (m *Menu) requestRebuild() {
 func (m *Menu) refresh(ctx context.Context) {
 	status, err := m.Client.Status(ctx)
 	if err != nil {
-		systrayLog.Error(err)
+		m.reportError("daemon unavailable", err)
 	}
 	profiles, err := m.Client.Profiles(ctx)
 	if err != nil {
-		systrayLog.Error(err)
+		m.reportError("daemon unavailable", err)
 	}
 	traffic, err := m.Client.Traffic(ctx)
 	if err != nil {
-		systrayLog.Error(err)
+		m.reportError("daemon unavailable", err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -149,18 +219,18 @@ func (m *Menu) handleProfileSelection(ctx context.Context, profileID string) {
 
 	if status != nil && status.State == types.StateConnected {
 		if err := m.Client.Disconnect(ctx); err != nil {
-			systrayLog.Error(err)
+			m.reportError("disconnect failed", err)
 			return
 		}
 	}
 
 	if err := m.Client.SwitchProfile(ctx, profileID); err != nil {
-		systrayLog.Error(err)
+		m.reportError("switch profile failed", err)
 		return
 	}
 	if status != nil && status.State == types.StateConnected {
 		if err := m.Client.Connect(ctx, profileID); err != nil {
-			systrayLog.Error(err)
+			m.reportError("reconnect after profile switch failed", err)
 			return
 		}
 	}
@@ -191,11 +261,11 @@ func (m *Menu) handleSocks5Toggle(enabled bool) {
 	m.mu.Unlock()
 	req := types.ProfileUpdateRequest{SOCKS5Enabled: &enabled}
 	if status == nil || status.CurrentProfileID == "" {
-		systrayLog.Error(fmt.Errorf("no profile selected"))
+		m.reportError("update SOCKS5 setting failed", fmt.Errorf("no profile selected"))
 		return
 	}
 	if _, err := m.Client.UpdateProfile(context.Background(), status.CurrentProfileID, req); err != nil {
-		systrayLog.Error(err)
+		m.reportError("update SOCKS5 setting failed", err)
 		return
 	}
 	m.refresh(context.Background())
@@ -207,12 +277,12 @@ func (m *Menu) handleAutoReconnectToggle(enabled bool) {
 	status := copyStatus(m.status)
 	m.mu.Unlock()
 	if status == nil || status.CurrentProfileID == "" {
-		systrayLog.Error(fmt.Errorf("no profile selected"))
+		m.reportError("update auto-reconnect setting failed", fmt.Errorf("no profile selected"))
 		return
 	}
 	req := types.ProfileUpdateRequest{AutoReconnect: &enabled}
 	if _, err := m.Client.UpdateProfile(context.Background(), status.CurrentProfileID, req); err != nil {
-		systrayLog.Error(err)
+		m.reportError("update auto-reconnect setting failed", err)
 		return
 	}
 	m.refresh(context.Background())
@@ -224,12 +294,12 @@ func (m *Menu) handleApplyDNSToggle(enabled bool) {
 	status := copyStatus(m.status)
 	m.mu.Unlock()
 	if status == nil || status.CurrentProfileID == "" {
-		systrayLog.Error(fmt.Errorf("no profile selected"))
+		m.reportError("update DNS setting failed", fmt.Errorf("no profile selected"))
 		return
 	}
 	req := types.ProfileUpdateRequest{ApplyDNS: &enabled}
 	if _, err := m.Client.UpdateProfile(context.Background(), status.CurrentProfileID, req); err != nil {
-		systrayLog.Error(err)
+		m.reportError("update DNS setting failed", err)
 		return
 	}
 	m.refresh(context.Background())
@@ -241,11 +311,11 @@ func (m *Menu) handleToggle(action toggleAction) {
 	switch action {
 	case toggleConnect:
 		if err := m.Client.ConnectCurrent(ctx); err != nil {
-			systrayLog.Error(err)
+			m.reportError("connect failed", err)
 		}
 	case toggleDisconnect:
 		if err := m.Client.Disconnect(ctx); err != nil {
-			systrayLog.Error(err)
+			m.reportError("disconnect failed", err)
 		}
 	}
 	m.refresh(ctx)
@@ -255,11 +325,11 @@ func (m *Menu) handleToggle(action toggleAction) {
 func (m *Menu) copyDiagnostics() {
 	text, err := m.Client.DiagnosticsText(context.Background())
 	if err != nil {
-		systrayLog.Error(err)
+		m.reportError("read diagnostics failed", err)
 		return
 	}
 	if err := writeClipboard(text); err != nil {
-		systrayLog.Error(err)
+		m.reportError("copy diagnostics failed", err)
 	}
 }
 
@@ -382,7 +452,7 @@ func (m *Menu) watch(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			systrayLog.Error(err)
+			m.reportError("watch connection failed", err)
 			if !waitForRetry(ctx) {
 				return
 			}
@@ -395,7 +465,7 @@ func (m *Menu) watch(ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				systrayLog.Error(err)
+				m.reportError("watch stream failed", err)
 				break
 			}
 			m.handleNotify(notify, m.updateTrayTooltip)
@@ -423,11 +493,59 @@ func (m *Menu) handleNotify(notify types.Notify, updateTooltip func()) {
 		trafficChanged = true
 	}
 	m.mu.Unlock()
+	if notify.Connection != nil {
+		m.notifyConnection(*notify.Connection)
+	}
 	if trafficChanged && !stateChanged {
 		updateTooltip()
 	}
 	if stateChanged {
 		m.requestRebuild()
+	}
+}
+
+func (m *Menu) notifyConnection(event types.ConnectionEvent) {
+	if event.Kind != "connection_lost" && event.Kind != "reconnect_scheduled" && event.Kind != "reconnected" && event.Kind != "reconnect_failed" {
+		return
+	}
+	m.init()
+	key := event.ID
+	if event.ConnectionID != "" {
+		key = event.ConnectionID + ":" + event.Kind
+	}
+	m.mu.Lock()
+	if _, ok := m.notified[key]; ok {
+		m.mu.Unlock()
+		return
+	}
+	m.notified[key] = struct{}{}
+	notifier := m.notifier
+	m.mu.Unlock()
+
+	title := "FlexConnect"
+	body := event.Kind
+	switch event.Kind {
+	case "connection_lost":
+		title = "VPN connection lost"
+		body = event.ReasonCode
+		if event.Error != "" {
+			body += ": " + event.Error
+		}
+	case "reconnect_scheduled":
+		title = "VPN reconnecting"
+		body = fmt.Sprintf("Attempt %d scheduled", event.Attempt)
+	case "reconnected":
+		title = "VPN reconnected"
+		body = "The VPN session was restored."
+	case "reconnect_failed":
+		title = "VPN reconnect failed"
+		body = fmt.Sprintf("Attempt %d", event.Attempt)
+		if event.Error != "" {
+			body += ": " + event.Error
+		}
+	}
+	if err := notifier.Send(title, body); err != nil {
+		systrayLog.Error(fmt.Errorf("desktop notification failed event=%s: %w", event.Kind, err))
 	}
 }
 

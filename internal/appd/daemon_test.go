@@ -170,6 +170,48 @@ func TestAutoReconnectRetriesWithBackoff(t *testing.T) {
 	})
 }
 
+func TestUnexpectedDisconnectIsRecordedInDiagnostics(t *testing.T) {
+	profile := testProfile("p1", false)
+	backend := newFakeBackend()
+	service := newTestService(t, backend, profile)
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatalf("initial connect: %v", err)
+	}
+	backend.emit(vpn.Event{Type: "disconnected", Err: errors.New("tls peer closed")})
+	waitUntil(t, 500*time.Millisecond, func() bool {
+		history := service.Diagnostics().ConnectionHistory
+		return len(history) >= 2 && history[len(history)-1].Kind == "connection_lost"
+	})
+	diagnostics := service.Diagnostics()
+	last := diagnostics.ConnectionHistory[len(diagnostics.ConnectionHistory)-1]
+	if last.Kind != "connection_lost" || last.ReasonCode != "backend_error" {
+		t.Fatalf("last connection event = %+v", last)
+	}
+	if last.Error != "tls peer closed" {
+		t.Fatalf("last connection error = %q", last.Error)
+	}
+}
+
+func TestManualDisconnectIsNotUnexpectedConnectionLoss(t *testing.T) {
+	profile := testProfile("p1", false)
+	backend := newFakeBackend()
+	service := newTestService(t, backend, profile)
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatalf("initial connect: %v", err)
+	}
+	if err := service.Disconnect(context.Background()); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	backend.emit(vpn.Event{Type: "disconnected"})
+	waitUntil(t, 500*time.Millisecond, func() bool {
+		return len(service.Diagnostics().ConnectionHistory) >= 1
+	})
+	last := service.Diagnostics().ConnectionHistory[len(service.Diagnostics().ConnectionHistory)-1]
+	if last.Kind == "connection_lost" {
+		t.Fatalf("manual disconnect recorded as unexpected: %+v", last)
+	}
+}
+
 func TestManualDisconnectCancelsScheduledAutoReconnect(t *testing.T) {
 	restoreReconnectDelays(t, 50*time.Millisecond, 50*time.Millisecond)
 	profile := testProfile("p1", true)

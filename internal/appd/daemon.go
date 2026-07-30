@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,30 +68,36 @@ type Daemon interface {
 }
 
 type Service struct {
-	mu                  sync.Mutex
-	store               Store
-	secrets             secret.Store
-	backend             vpn.Backend
-	planner             router.Planner
-	profiles            []types.Profile
-	currentID           string
-	connectedID         string
-	status              types.Status
-	logs                *logbuf.Buffer
-	watchers            map[int]chan types.Notify
-	nextWatcherID       int
-	proxyServer         *socks5.Server
-	disconnectSeq       uint64
-	manualDisconnectSeq uint64
-	manualProfileID     string
-	reconnectTimer      *time.Timer
-	reconnectProfileID  string
-	reconnectAttempt    int
-	reconnectSeq        uint64
-	reconnectID         uint64
-	traffic             types.TrafficSnapshot
-	lastTraffic         *types.TrafficStats
-	lastTrafficAt       time.Time
+	mu                      sync.Mutex
+	store                   Store
+	secrets                 secret.Store
+	backend                 vpn.Backend
+	planner                 router.Planner
+	profiles                []types.Profile
+	currentID               string
+	connectedID             string
+	status                  types.Status
+	logs                    *logbuf.Buffer
+	watchers                map[int]chan types.Notify
+	nextWatcherID           int
+	proxyServer             *socks5.Server
+	disconnectSeq           uint64
+	manualDisconnectSeq     uint64
+	manualProfileID         string
+	reconnectTimer          *time.Timer
+	reconnectProfileID      string
+	reconnectAttempt        int
+	reconnectSeq            uint64
+	reconnectID             uint64
+	reconnectNextAt         time.Time
+	traffic                 types.TrafficSnapshot
+	lastTraffic             *types.TrafficStats
+	lastTrafficAt           time.Time
+	connectionSeq           uint64
+	activeConnectionID      string
+	activeConnectionStarted time.Time
+	connectionHistory       []types.ConnectionEvent
+	reconnectLifecycleID    string
 }
 
 func New(store Store, secrets secret.Store, backend vpn.Backend, planner router.Planner) (*Service, error) {
@@ -193,15 +200,51 @@ func (s *Service) Diagnostics() types.Diagnostics {
 		}
 	}
 	return types.Diagnostics{
-		Version:        buildinfo.Version,
-		Status:         status,
-		CurrentProfile: current,
-		Profiles:       profiles,
-		ServerConfig:   s.backend.ReadServerConfig(),
-		Traffic:        ptrTraffic(s.traffic),
-		Logs:           s.logs.Snapshot(),
-		GeneratedAt:    now(),
+		Version:           buildinfo.Version,
+		Status:            status,
+		CurrentProfile:    current,
+		Profiles:          profiles,
+		ServerConfig:      s.backend.ReadServerConfig(),
+		Traffic:           ptrTraffic(s.traffic),
+		Logs:              s.logs.Snapshot(),
+		GeneratedAt:       now(),
+		ConnectionHistory: append([]types.ConnectionEvent(nil), s.connectionHistory...),
+		Reconnect:         s.reconnectSnapshotLocked(),
 	}
+}
+
+func (s *Service) reconnectSnapshotLocked() types.ReconnectSnapshot {
+	if s.reconnectTimer == nil {
+		return types.ReconnectSnapshot{}
+	}
+	next := s.reconnectNextAt
+	return types.ReconnectSnapshot{
+		Active: true, ProfileID: s.reconnectProfileID, Attempt: s.reconnectAttempt,
+		NextRetryAt: next.UTC().Format(time.RFC3339Nano), LifecycleID: s.reconnectLifecycleID,
+	}
+}
+
+func (s *Service) recordConnectionLocked(event types.ConnectionEvent) {
+	s.connectionSeq++
+	event.ID = fmt.Sprintf("connection-event-%d", s.connectionSeq)
+	if event.Time == "" {
+		event.Time = now()
+	}
+	event.Error = sanitizeDiagnostic(event.Error)
+	if len(s.connectionHistory) >= 64 {
+		s.connectionHistory = append([]types.ConnectionEvent(nil), s.connectionHistory[len(s.connectionHistory)-63:]...)
+	}
+	s.connectionHistory = append(s.connectionHistory, event)
+	s.logs.Add("info", fmt.Sprintf("appd: connection event kind=%s profile=%s reason=%s attempt=%d", event.Kind, event.ProfileID, event.ReasonCode, event.Attempt))
+	s.emitLocked(types.Notify{Event: "connection", Connection: &event, Message: event.Kind})
+}
+
+func sanitizeDiagnostic(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(value, "\r", " "), "\n", " "))
+	if len(value) > 512 {
+		value = value[:512]
+	}
+	return value
 }
 
 func (s *Service) refreshConnectedStatusLocked() {
@@ -686,6 +729,7 @@ func (s *Service) consumeBackendEvents() {
 		var disconnectedProfileID string
 		var scheduleAutoReconnect bool
 		var manualSeq uint64
+		var manualDisconnectEvent bool
 		switch event.Type {
 		case "connected":
 			if s.currentID != "" {
@@ -694,12 +738,33 @@ func (s *Service) consumeBackendEvents() {
 			}
 			s.status.State = types.StateConnected
 			s.status.Session = event.Session
+			if s.activeConnectionID == "" {
+				s.activeConnectionID = event.ConnectionID
+			}
+			if s.activeConnectionID == "" && event.Session != nil {
+				s.activeConnectionID = event.Session.ConnectionID
+			}
+			if s.activeConnectionID == "" {
+				s.activeConnectionID = fmt.Sprintf("connection-%d", s.connectionSeq+1)
+			}
+			if s.activeConnectionStarted.IsZero() {
+				s.activeConnectionStarted = time.Now().UTC()
+			}
 			s.sampleTrafficLocked(time.Now().UTC())
 			s.logs.Add("info", "appd: backend event=connected")
 		case "disconnected":
+			if event.ConnectionID != "" && s.activeConnectionID != "" && event.ConnectionID != s.activeConnectionID {
+				appdLog.Printf("ignoring stale backend disconnect connection=%s active=%s", event.ConnectionID, s.activeConnectionID)
+				s.mu.Unlock()
+				continue
+			}
 			disconnectedProfileID = s.connectedID
+			if disconnectedProfileID == "" && s.manualProfileID != "" {
+				disconnectedProfileID = s.manualProfileID
+			}
 			autoProfile, autoProfileFound := s.profileAutoReconnect(disconnectedProfileID)
 			manual := disconnectedProfileID != "" && disconnectedProfileID == s.manualProfileID && s.manualDisconnectSeq == s.disconnectSeq
+			manualDisconnectEvent = manual
 			if manual {
 				s.manualProfileID = ""
 				s.manualDisconnectSeq = 0
@@ -710,6 +775,7 @@ func (s *Service) consumeBackendEvents() {
 				manualSeq = s.disconnectSeq
 				scheduleAutoReconnect = true
 			}
+			connectionID := s.activeConnectionID
 			s.connectedID = ""
 			s.status.State = types.StateDisconnected
 			s.status.ConnectedProfileID = ""
@@ -719,6 +785,33 @@ func (s *Service) consumeBackendEvents() {
 			s.status.SOCKS5Listen = ""
 			s.clearTrafficLocked()
 			s.logs.Add("info", "appd: backend event=disconnected")
+			reasonCode, transport, closeError := "unknown_close", "", ""
+			var transportFaults []types.ConnectionFault
+			if event.Close != nil {
+				reasonCode, transport, closeError = event.Close.Code, event.Close.Transport, event.Close.Error
+				for _, fault := range event.Close.TransportFaults {
+					transportFaults = append(transportFaults, types.ConnectionFault{Code: fault.Code, Transport: fault.Transport, Error: fault.Error, Time: fault.Time})
+				}
+			}
+			if event.Err != nil && closeError == "" {
+				reasonCode = "backend_error"
+				closeError = event.Err.Error()
+			}
+			if manual {
+				reasonCode, transport, closeError = "local_requested", "local", ""
+			}
+			ended := time.Now().UTC()
+			eventRecord := types.ConnectionEvent{ConnectionID: connectionID, ProfileID: disconnectedProfileID, Kind: "connection_lost", ReasonCode: reasonCode, Transport: transport, Error: closeError, SessionEnded: ended.Format(time.RFC3339Nano), TransportFaults: transportFaults}
+			if !s.activeConnectionStarted.IsZero() {
+				eventRecord.SessionStarted = s.activeConnectionStarted.Format(time.RFC3339Nano)
+				eventRecord.DurationMS = ended.Sub(s.activeConnectionStarted).Milliseconds()
+			}
+			if manual {
+				eventRecord.Kind = "disconnected"
+			}
+			s.recordConnectionLocked(eventRecord)
+			s.activeConnectionID = ""
+			s.activeConnectionStarted = time.Time{}
 		}
 		message := ""
 		switch event.Type {
@@ -733,6 +826,14 @@ func (s *Service) consumeBackendEvents() {
 			s.status.LastError = event.Err.Error()
 			s.logs.Add("error", fmt.Sprintf("appd: backend error err=%q", event.Err.Error()))
 			message = "Backend error: " + event.Err.Error()
+		}
+		if event.Type == "disconnected" && event.Err == nil && event.Close != nil && event.Close.Error != "" && !manualDisconnectEvent {
+			s.status.State = types.StateError
+			s.status.LastError = sanitizeDiagnostic(event.Close.Error)
+			message = "VPN connection lost: " + s.status.LastError
+		}
+		if event.Type == "disconnected" && event.Close != nil && event.Close.Code != "" && !manualDisconnectEvent && event.Close.Error == "" {
+			message = "VPN connection lost (" + event.Close.Code + ")."
 		}
 		s.status.UpdatedAt = now()
 		s.emitLocked(types.Notify{
@@ -789,6 +890,14 @@ func (s *Service) startReconnectLocked(profileID string, manualSeq uint64, attem
 	s.reconnectProfileID = profileID
 	s.reconnectAttempt = attempt
 	s.reconnectSeq = manualSeq
+	s.reconnectNextAt = time.Now().UTC().Add(delay)
+	if s.reconnectLifecycleID == "" {
+		s.reconnectLifecycleID = fmt.Sprintf("reconnect-%d", s.connectionSeq+1)
+	}
+	s.recordConnectionLocked(types.ConnectionEvent{
+		ConnectionID: s.reconnectLifecycleID, ProfileID: profileID, Kind: "reconnect_scheduled",
+		Attempt: attempt, NextRetryAt: s.reconnectNextAt.Format(time.RFC3339Nano),
+	})
 	s.logs.Add("info", fmt.Sprintf("appd: auto reconnect scheduled id=%q attempt=%d delay=%s", profileID, attempt, delay))
 	appdLog.Printf("auto reconnect scheduled id=%q attempt=%d delay=%s", profileID, attempt, delay)
 }
@@ -800,6 +909,7 @@ func (s *Service) runScheduledReconnect(profileID string, manualSeq uint64, atte
 		return
 	}
 	s.reconnectTimer = nil
+	s.reconnectNextAt = time.Time{}
 	profile, ok := s.profileAutoReconnect(profileID)
 	if !ok || s.currentID != profileID || s.connectedID != "" || s.disconnectSeq != manualSeq ||
 		!types.BoolValue(profile.AutoReconnect, false) {
@@ -816,12 +926,16 @@ func (s *Service) runScheduledReconnect(profileID string, manualSeq uint64, atte
 		Status:  ptrStatus(s.status),
 		Message: "Reconnecting profile " + profileID,
 	})
+	s.recordConnectionLocked(types.ConnectionEvent{
+		ConnectionID: s.reconnectLifecycleID, ProfileID: profileID, Kind: "reconnect_attempt", Attempt: attempt,
+	})
 	s.mu.Unlock()
 
 	s.logs.Add("info", fmt.Sprintf("appd: reconnect reason=%q", fmt.Sprintf("auto reconnect attempt %d for profile %s", attempt, profileID)))
 	if err := s.disconnect(context.Background(), false); err != nil {
 		s.mu.Lock()
 		s.logs.Add("error", fmt.Sprintf("appd: auto reconnect failed id=%q err=%q", profileID, err.Error()))
+		s.recordConnectionLocked(types.ConnectionEvent{ConnectionID: s.reconnectLifecycleID, ProfileID: profileID, Kind: "reconnect_failed", ReasonCode: "disconnect_failed", Error: err.Error(), Attempt: attempt})
 		appdLog.Printf("auto reconnect failed id=%q attempt=%d err=%v", profileID, attempt, err)
 		s.startReconnectLocked(profileID, manualSeq, attempt+1)
 		s.mu.Unlock()
@@ -835,6 +949,7 @@ func (s *Service) runScheduledReconnect(profileID string, manualSeq uint64, atte
 	s.mu.Lock()
 	if err != nil {
 		s.logs.Add("error", fmt.Sprintf("appd: auto reconnect failed id=%q err=%q", profileID, err.Error()))
+		s.recordConnectionLocked(types.ConnectionEvent{ConnectionID: s.reconnectLifecycleID, ProfileID: profileID, Kind: "reconnect_failed", ReasonCode: "connect_failed", Error: err.Error(), Attempt: attempt})
 		appdLog.Printf("auto reconnect failed id=%q attempt=%d err=%v", profileID, attempt, err)
 		s.startReconnectLocked(profileID, manualSeq, attempt+1)
 		s.mu.Unlock()
@@ -852,6 +967,8 @@ func (s *Service) stopReconnectLocked() {
 	s.reconnectProfileID = ""
 	s.reconnectAttempt = 0
 	s.reconnectSeq = 0
+	s.reconnectNextAt = time.Time{}
+	s.reconnectLifecycleID = ""
 	s.reconnectID++
 }
 
@@ -1079,6 +1196,7 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 		s.status.LastError = err.Error()
 		s.status.UpdatedAt = now()
 		s.logs.Add("error", fmt.Sprintf("appd: connect failed id=%s err=%q", profile.ID, err.Error()))
+		s.recordConnectionLocked(types.ConnectionEvent{ProfileID: profile.ID, Kind: "connect_failed", ReasonCode: "connect_error", Error: err.Error()})
 		s.emitLocked(types.Notify{
 			Event:   "status",
 			Status:  ptrStatus(s.status),
@@ -1094,10 +1212,20 @@ func (s *Service) connectPreparedProfile(ctx context.Context, profile types.Prof
 	s.status.State = types.StateConnected
 	s.status.ConnectedProfileID = profile.ID
 	s.status.Session = session
+	s.activeConnectionID = session.ConnectionID
+	if s.activeConnectionID == "" {
+		s.activeConnectionID = fmt.Sprintf("connection-%d", s.connectionSeq+1)
+	}
+	s.activeConnectionStarted = time.Now().UTC()
 	s.status.EffectiveRoutes = s.planner.Plan(session.SplitInclude, session.SplitExclude, profile)
 	s.status.UpdatedAt = now()
 	s.sampleTrafficLocked(time.Now().UTC())
 	s.logs.Add("info", fmt.Sprintf("appd: connected profile=%s", profile.ID))
+	connectionKind := "connected"
+	if allowReconnectState {
+		connectionKind = "reconnected"
+	}
+	s.recordConnectionLocked(types.ConnectionEvent{ConnectionID: s.activeConnectionID, ProfileID: profile.ID, Kind: connectionKind, Attempt: s.reconnectAttempt})
 	s.emitLocked(types.Notify{
 		Event:   "status",
 		Status:  ptrStatus(s.status),

@@ -59,8 +59,21 @@ flexconnect proxy disable
 flexconnect logs
 ```
 
+## 连接诊断
+
+守护进程只在运行期间保留有界的近期连接历史。`flexconnect watch` 以
+NDJSON 输出 `connection_lost`、`reconnect_scheduled`、`reconnect_attempt`、
+`reconnected` 和 `reconnect_failed` 等生命周期事件；`flexconnect diag`
+会同时包含这些事件、最后一次传输/关闭原因以及当前重连快照。
+
+主动断开会被记录为人为操作，不会触发异常断线重连通知。非主动断开及重连进度会由托盘
+通过系统通知提示；平台通知服务不可用时，错误会进入托盘日志，不会改变 VPN 状态。
+
 非交互场景只接受 `--password-file` 或 `--password-stdin`。FlexConnect 不接受命令行
 明文密码，因为进程参数和 shell 历史可能泄露凭据。
+
+托盘菜单操作、诊断复制和 watch 通道错误会弹出可去重的桌面错误提示，并同时写入托盘日志。
+如果 `flextray` 启动时无法连接守护进程，会先弹出错误提示，然后退出。
 
 SOCKS5 代理是 VPN-only：启用后只支持 TCP CONNECT 和 IPv4 目标，域名通过 VPN DNS 解析，无法确认走 VPN 时会拒绝连接，不会回退到本机网络。当前不支持 UDP ASSOC、BIND 或 IPv6 代理目标。
 

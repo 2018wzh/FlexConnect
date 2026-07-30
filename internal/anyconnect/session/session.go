@@ -36,7 +36,8 @@ type stat struct {
 
 // ConnSession used for both TLS and DTLS
 type ConnSession struct {
-	Sess *Session `json:"-"`
+	Sess         *Session `json:"-"`
+	ConnectionID string
 
 	ServerAddress            string
 	LocalAddress             string
@@ -80,6 +81,26 @@ type ConnSession struct {
 
 	ResetTLSReadDead  *atomic.Bool `json:"-"`
 	ResetDTLSReadDead *atomic.Bool `json:"-"`
+
+	closeInfoMu     sync.Mutex
+	closeInfo       CloseInfo
+	closeInfoSet    bool
+	transportFaults []TransportFault
+}
+
+type TransportFault struct {
+	Code      string
+	Transport string
+	Error     string
+	Time      string
+}
+
+type CloseInfo struct {
+	Code            string
+	Transport       string
+	Error           string
+	Time            string
+	TransportFaults []TransportFault
 }
 
 type DtlsSession struct {
@@ -235,8 +256,76 @@ func (cSess *ConnSession) ReadDeadTimer() {
 	}()
 }
 
+// RecordTransportFault preserves the first few low-level failures for
+// diagnostics without making a DTLS degradation look like a full session loss.
+func (cSess *ConnSession) RecordTransportFault(code, transport string, err error) {
+	if cSess == nil {
+		return
+	}
+	cSess.closeInfoMu.Lock()
+	defer cSess.closeInfoMu.Unlock()
+	if len(cSess.transportFaults) >= 8 {
+		return
+	}
+	cSess.transportFaults = append(cSess.transportFaults, TransportFault{
+		Code: code, Transport: transport, Error: diagnosticError(err),
+		Time: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+func (cSess *ConnSession) RecordClose(code, transport string, err error) {
+	if cSess == nil {
+		return
+	}
+	cSess.closeInfoMu.Lock()
+	defer cSess.closeInfoMu.Unlock()
+	if cSess.closeInfoSet {
+		return
+	}
+	if cSess.Sess != nil && cSess.Sess.ActiveClose {
+		code = "local_requested"
+		transport = "local"
+		err = nil
+	}
+	if code == "" {
+		code = "unknown_close"
+	}
+	cSess.closeInfo = CloseInfo{
+		Code: code, Transport: transport, Error: diagnosticError(err),
+		Time:            time.Now().UTC().Format(time.RFC3339Nano),
+		TransportFaults: append([]TransportFault(nil), cSess.transportFaults...),
+	}
+	cSess.closeInfoSet = true
+}
+
+func (cSess *ConnSession) CloseInfo() CloseInfo {
+	if cSess == nil {
+		return CloseInfo{Code: "unknown_close", Error: "session unavailable"}
+	}
+	cSess.closeInfoMu.Lock()
+	defer cSess.closeInfoMu.Unlock()
+	if !cSess.closeInfoSet {
+		return CloseInfo{Code: "unknown_close", Time: time.Now().UTC().Format(time.RFC3339Nano)}
+	}
+	info := cSess.closeInfo
+	info.TransportFaults = append([]TransportFault(nil), cSess.transportFaults...)
+	return info
+}
+
+func diagnosticError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	return message
+}
+
 func (cSess *ConnSession) Close() {
 	cSess.closeOnce.Do(func() {
+		cSess.RecordClose("", "", nil)
 		base.Info("conn session close")
 		if cSess.DtlsConnected.Load() {
 			cSess.DSess.Close()

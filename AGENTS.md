@@ -230,6 +230,13 @@ effective routes, manages the optional SOCKS5 listener, serves the local browser
 watch notifications. The AnyConnect adapter configures the embedded protocol stack, performs
 password auth, establishes TLS/DTLS and TUN state, then reports session details back to the daemon.
 
+Connection lifecycle observability is owned by the daemon: AnyConnect records
+the first terminal close reason on each session and emits it with the stable
+connection ID. The daemon publishes bounded in-memory lifecycle history through
+`/v1/watch` and `/v1/diagnostics`; the tray consumes these events for
+cross-platform desktop notifications. Manual disconnects are explicitly
+classified and do not enter the unexpected-disconnect notification path.
+
 On Linux the packaged daemon runs as `root:flexconnect`; systemd owns `/run/flexconnect` and
 `/var/lib/flexconnect`, and the control socket is `0660`. Only users explicitly added to the
 `flexconnect` group may use the CLI or tray control plane.

@@ -67,6 +67,7 @@ type ProfileUpdateRequest struct {
 }
 
 type SessionInfo struct {
+	ConnectionID  string   `json:"connection_id,omitempty"`
 	ServerAddress string   `json:"server_address"`
 	Hostname      string   `json:"hostname"`
 	TUNName       string   `json:"tun_name"`
@@ -78,6 +79,41 @@ type SessionInfo struct {
 	SplitExclude  []string `json:"split_exclude"`
 	TLSCipher     string   `json:"tls_cipher"`
 	DTLSCipher    string   `json:"dtls_cipher"`
+}
+
+// ConnectionEvent is a bounded, sanitized lifecycle record for one VPN
+// connection attempt or session. It is intentionally descriptive rather than
+// exposing backend error values or credential-bearing data.
+type ConnectionEvent struct {
+	ID              string            `json:"id"`
+	ConnectionID    string            `json:"connection_id,omitempty"`
+	ProfileID       string            `json:"profile_id"`
+	Kind            string            `json:"kind"`
+	ReasonCode      string            `json:"reason_code,omitempty"`
+	Transport       string            `json:"transport,omitempty"`
+	Error           string            `json:"error,omitempty"`
+	Attempt         int               `json:"attempt,omitempty"`
+	NextRetryAt     string            `json:"next_retry_at,omitempty"`
+	SessionStarted  string            `json:"session_started,omitempty"`
+	SessionEnded    string            `json:"session_ended,omitempty"`
+	DurationMS      int64             `json:"duration_ms,omitempty"`
+	Time            string            `json:"time"`
+	TransportFaults []ConnectionFault `json:"transport_faults,omitempty"`
+}
+
+type ConnectionFault struct {
+	Code      string `json:"code"`
+	Transport string `json:"transport"`
+	Error     string `json:"error,omitempty"`
+	Time      string `json:"time"`
+}
+
+type ReconnectSnapshot struct {
+	Active      bool   `json:"active"`
+	ProfileID   string `json:"profile_id,omitempty"`
+	Attempt     int    `json:"attempt,omitempty"`
+	NextRetryAt string `json:"next_retry_at,omitempty"`
+	LifecycleID string `json:"lifecycle_id,omitempty"`
 }
 
 type TrafficStats struct {
@@ -134,27 +170,30 @@ type LogEntry struct {
 }
 
 type Notify struct {
-	Version  string           `json:"version"`
-	Event    string           `json:"event"`
-	Status   *Status          `json:"status,omitempty"`
-	Traffic  *TrafficSnapshot `json:"traffic,omitempty"`
-	Profile  *Profile         `json:"profile,omitempty"`
-	Profiles []Profile        `json:"profiles,omitempty"`
-	Logs     []LogEntry       `json:"logs,omitempty"`
-	Message  string           `json:"message,omitempty"`
-	Error    string           `json:"error,omitempty"`
-	Time     string           `json:"time"`
+	Version    string           `json:"version"`
+	Event      string           `json:"event"`
+	Status     *Status          `json:"status,omitempty"`
+	Traffic    *TrafficSnapshot `json:"traffic,omitempty"`
+	Profile    *Profile         `json:"profile,omitempty"`
+	Profiles   []Profile        `json:"profiles,omitempty"`
+	Logs       []LogEntry       `json:"logs,omitempty"`
+	Message    string           `json:"message,omitempty"`
+	Error      string           `json:"error,omitempty"`
+	Connection *ConnectionEvent `json:"connection,omitempty"`
+	Time       string           `json:"time"`
 }
 
 type Diagnostics struct {
-	Version        string           `json:"version"`
-	Status         Status           `json:"status"`
-	CurrentProfile *Profile         `json:"current_profile,omitempty"`
-	Profiles       []Profile        `json:"profiles"`
-	ServerConfig   map[string]any   `json:"server_config,omitempty"`
-	Traffic        *TrafficSnapshot `json:"traffic,omitempty"`
-	Logs           []LogEntry       `json:"logs"`
-	GeneratedAt    string           `json:"generated_at"`
+	Version           string            `json:"version"`
+	Status            Status            `json:"status"`
+	CurrentProfile    *Profile          `json:"current_profile,omitempty"`
+	Profiles          []Profile         `json:"profiles"`
+	ServerConfig      map[string]any    `json:"server_config,omitempty"`
+	Traffic           *TrafficSnapshot  `json:"traffic,omitempty"`
+	Logs              []LogEntry        `json:"logs"`
+	GeneratedAt       string            `json:"generated_at"`
+	ConnectionHistory []ConnectionEvent `json:"connection_history"`
+	Reconnect         ReconnectSnapshot `json:"reconnect"`
 }
 
 func BoolPtr(v bool) *bool {
