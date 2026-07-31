@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/router"
 	"flexconnect/internal/secret"
 	storefile "flexconnect/internal/store/file"
 	"flexconnect/internal/types"
+	"flexconnect/internal/updater"
 	"flexconnect/internal/vpn"
 )
 
@@ -414,4 +416,68 @@ func (s failingSecretStore) Put(string, string) error {
 
 func (s failingSecretStore) Delete(string) error {
 	return s.err
+}
+
+type fakeUpdateChecker struct {
+	mu    sync.Mutex
+	calls int
+	info  updater.Info
+}
+
+func (f *fakeUpdateChecker) Check(context.Context) updater.Info {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return f.info
+}
+
+func (f *fakeUpdateChecker) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func TestUpdateCheckDisabledWithoutRepo(t *testing.T) {
+	service := newTestService(t, newFakeBackend(), testProfile("p1", false))
+	// No updater configured: the check reports Disabled without error.
+	info, err := service.UpdateCheck(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Disabled {
+		t.Fatalf("expected Disabled=true, got %+v", info)
+	}
+	if info.CurrentVersion != buildinfo.Version {
+		t.Errorf("CurrentVersion = %q, want %q", info.CurrentVersion, buildinfo.Version)
+	}
+}
+
+func TestUpdateCheckCachesWithinInterval(t *testing.T) {
+	service := newTestService(t, newFakeBackend(), testProfile("p1", false))
+	fake := &fakeUpdateChecker{info: updater.Info{
+		CurrentVersion:  "1.0.6",
+		LatestVersion:   "1.0.7",
+		UpdateAvailable: true,
+		CheckedAt:       "2026-01-01T00:00:00Z",
+	}}
+	service.SetUpdater(fake, time.Hour)
+
+	first, err := service.UpdateCheck(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.UpdateAvailable {
+		t.Fatalf("expected UpdateAvailable=true, got %+v", first)
+	}
+
+	second, err := service.UpdateCheck(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.UpdateAvailable {
+		t.Fatalf("expected cached UpdateAvailable=true, got %+v", second)
+	}
+	if got := fake.callCount(); got != 1 {
+		t.Fatalf("expected 1 checker call (second served from cache), got %d", got)
+	}
 }

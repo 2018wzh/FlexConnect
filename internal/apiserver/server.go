@@ -63,6 +63,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/traffic", s.handleTraffic)
 	s.mux.HandleFunc("/v1/diagnostics", s.handleDiagnostics)
 	s.mux.HandleFunc("/v1/watch", s.handleWatch)
+	s.mux.HandleFunc("/v1/update/check", s.handleUpdateCheck)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -323,6 +324,23 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 	apiserverLog.Printf("method=%s path=%s status=%d stream=end", r.Method, r.URL.Path, http.StatusOK)
+}
+
+func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	logfRequest(r)
+	if r.Method != http.MethodGet {
+		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	info, err := s.daemon.UpdateCheck(r.Context())
+	if err != nil {
+		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusInternalServerError, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	apiserverLog.Printf("method=%s path=%s status=%d update_available=%v", r.Method, r.URL.Path, http.StatusOK, info.UpdateAvailable)
+	writeJSON(w, info)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

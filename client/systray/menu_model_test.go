@@ -8,7 +8,7 @@ import (
 )
 
 func TestMenuModelUnavailableHasCoreItems(t *testing.T) {
-	model := buildMenuModel(nil, types.TrafficSnapshot{}, nil)
+	model := buildMenuModel(nil, types.TrafficSnapshot{}, nil, nil)
 
 	assertHasItem(t, model.Items, "Status: Unavailable")
 	connect := assertHasItem(t, model.Items, "Connect")
@@ -24,7 +24,7 @@ func TestMenuModelUnavailableHasCoreItems(t *testing.T) {
 func TestMenuModelConnectingDisablesMainAction(t *testing.T) {
 	model := buildMenuModel(&types.Status{State: types.StateConnecting, CurrentProfileID: "p1"}, types.TrafficSnapshot{}, []types.Profile{
 		{ID: "p1", Name: "Work"},
-	})
+	}, nil)
 
 	item := assertHasItem(t, model.Items, "Connecting")
 	if !item.Disabled || item.Action != menuActionNone {
@@ -49,7 +49,7 @@ func TestMenuModelConnectedShowsDisconnectAndVPNIP(t *testing.T) {
 		BytesSentPerSecond:     512,
 		BytesReceivedPerSecond: 1536,
 	}
-	model := buildMenuModel(status, traffic, []types.Profile{{ID: "p1", Name: "Work"}})
+	model := buildMenuModel(status, traffic, []types.Profile{{ID: "p1", Name: "Work"}}, nil)
 
 	disconnect := assertHasItem(t, model.Items, "Disconnect")
 	if disconnect.Disabled || disconnect.Action != menuActionToggle || disconnect.Toggle != toggleDisconnect {
@@ -75,7 +75,7 @@ func TestMenuModelConnectedShowsDisconnectAndVPNIP(t *testing.T) {
 }
 
 func TestMenuModelErrorShowsLastError(t *testing.T) {
-	model := buildMenuModel(&types.Status{State: types.StateError, LastError: "bad password"}, types.TrafficSnapshot{}, nil)
+	model := buildMenuModel(&types.Status{State: types.StateError, LastError: "bad password"}, types.TrafficSnapshot{}, nil, nil)
 
 	assertHasItem(t, model.Items, "Last Error: bad password")
 	if trayIconColorForStatus(&types.Status{State: types.StateError}) != trayIconRed {
@@ -163,7 +163,7 @@ func TestMenuModelInformationRichSession(t *testing.T) {
 		BytesSent:     1024,
 		BytesReceived: 2048,
 	}
-	model := buildMenuModel(status, traffic, []types.Profile{{ID: "p1", Name: "Work"}})
+	model := buildMenuModel(status, traffic, []types.Profile{{ID: "p1", Name: "Work"}}, nil)
 
 	info := assertHasItem(t, model.Items, "Information: 10.0.0.8")
 	assertHasItem(t, info.Children, "Server: vpn.example.com")
@@ -188,12 +188,40 @@ func TestMenuModelInformationNoSession(t *testing.T) {
 		CurrentProfileID: "p1",
 		EffectiveRoutes:  []types.RouteSpec{},
 	}
-	model := buildMenuModel(status, types.TrafficSnapshot{}, []types.Profile{{ID: "p1", Name: "Work"}})
+	model := buildMenuModel(status, types.TrafficSnapshot{}, []types.Profile{{ID: "p1", Name: "Work"}}, nil)
 
 	info := assertHasItem(t, model.Items, "Information")
 	// No session → no session detail items, only basic rows.
 	routes := assertHasItem(t, info.Children, "Routes (0)")
 	assertHasItem(t, routes.Children, "No routes")
+}
+
+func TestMenuModelUpdateAvailableItem(t *testing.T) {
+	update := &types.UpdateInfo{
+		LatestVersion:   "9.9.9",
+		UpdateAvailable: true,
+		ReleaseURL:      "https://github.com/owner/repo/releases/tag/v9.9.9",
+	}
+	model := buildMenuModel(&types.Status{State: types.StateDisconnected}, types.TrafficSnapshot{}, nil, update)
+
+	item := assertHasItem(t, model.Items, "Update available: v9.9.9")
+	if !item.Disabled {
+		t.Fatal("update item should be disabled (check-only)")
+	}
+	if item.Tooltip != update.ReleaseURL {
+		t.Fatalf("tooltip = %q, want release URL", item.Tooltip)
+	}
+}
+
+func TestMenuModelNoUpdateItemWhenUpToDate(t *testing.T) {
+	update := &types.UpdateInfo{LatestVersion: "1.0.6", UpdateAvailable: false}
+	model := buildMenuModel(&types.Status{State: types.StateDisconnected}, types.TrafficSnapshot{}, nil, update)
+
+	for _, item := range model.Items {
+		if strings.HasPrefix(item.Title, "Update available") {
+			t.Fatalf("unexpected update item: %+v", item)
+		}
+	}
 }
 
 func TestTruncateTo(t *testing.T) {

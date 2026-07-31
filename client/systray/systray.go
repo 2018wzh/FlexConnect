@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -19,6 +21,43 @@ import (
 )
 
 var systrayLog = logging.WithComponent("flexconnect-systray")
+
+// timeNow is overridable in tests for deterministic time-based behavior.
+var timeNow = time.Now
+
+// jitterFraction returns a float in [0,1); overridable in tests to make
+// retryDelay deterministic.
+var jitterFraction = func() float64 { return rand.Float64() }
+
+const (
+	// Backoff tuning for watch reconnects.
+	backoffBase = 1 * time.Second
+	backoffMax  = 30 * time.Second
+	// notified dedup table: keep recent lifecycle notifications and reclaim memory.
+	notifiedTTL = 5 * time.Minute
+	notifiedMax = 64
+	// opTimeout bounds individual tray-initiated daemon operations.
+	opTimeout = 15 * time.Second
+	// rebuildDebounce coalesces bursts of state changes into one menu rebuild.
+	rebuildDebounce = 60 * time.Millisecond
+)
+
+// daemonClient is the subset of *local.Client methods used by the tray. It is
+// an interface so tests can inject a fake client without depending on a live
+// daemon socket.
+type daemonClient interface {
+	Status(context.Context) (*types.Status, error)
+	Profiles(context.Context) ([]types.Profile, error)
+	Traffic(context.Context) (*types.TrafficSnapshot, error)
+	UpdateCheck(context.Context) (*types.UpdateInfo, error)
+	Disconnect(context.Context) error
+	SwitchProfile(context.Context, string) error
+	Connect(context.Context, string) error
+	ConnectCurrent(context.Context) error
+	UpdateProfile(context.Context, string, types.ProfileUpdateRequest) (*types.Profile, error)
+	DiagnosticsText(context.Context) (string, error)
+	Watch(context.Context) (*local.Watcher, error)
+}
 
 type notificationSender interface {
 	Send(title, body string) error
@@ -50,19 +89,23 @@ type toggleState struct {
 }
 
 type Menu struct {
-	Client *local.Client
+	Client daemonClient
 
-	rebuildMu  sync.Mutex
-	mu         sync.Mutex
-	status     *types.Status
-	traffic    types.TrafficSnapshot
-	profiles   []types.Profile
-	rebuildCh  chan struct{}
-	runCancel  context.CancelFunc
-	menuCancel context.CancelFunc
-	notifier   notificationSender
-	notified   map[string]struct{}
-	errorSeen  map[string]time.Time
+	rebuildMu      sync.Mutex
+	mu             sync.Mutex
+	status         *types.Status
+	traffic        types.TrafficSnapshot
+	profiles       []types.Profile
+	updateInfo     *types.UpdateInfo
+	updateNotified bool
+	rebuildCh      chan struct{}
+	runCtx         context.Context
+	runCancel      context.CancelFunc
+	menuCancel     context.CancelFunc
+	notifier       notificationSender
+	notified       map[string]time.Time
+	errorSeen      map[string]time.Time
+	render         func(context.Context, menuModel)
 }
 
 func (m *Menu) Run() {
@@ -79,6 +122,7 @@ func (m *Menu) onReady() {
 	m.init()
 	ctx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()
+	m.runCtx = ctx
 	m.runCancel = cancel
 	m.mu.Unlock()
 	m.refresh(ctx)
@@ -86,6 +130,7 @@ func (m *Menu) onReady() {
 	go m.rebuildLoop(ctx)
 	go m.openLoop(ctx)
 	go m.watch(ctx)
+	go m.updateCheckLoop(ctx)
 }
 
 func (m *Menu) onExit() {
@@ -109,10 +154,13 @@ func (m *Menu) init() {
 		m.notifier = beeepNotificationSender{}
 	}
 	if m.notified == nil {
-		m.notified = map[string]struct{}{}
+		m.notified = map[string]time.Time{}
 	}
 	if m.errorSeen == nil {
 		m.errorSeen = map[string]time.Time{}
+	}
+	if m.render == nil {
+		m.render = m.renderMenu
 	}
 }
 
@@ -130,19 +178,20 @@ func (m *Menu) reportError(operation string, err error) {
 		message = message[:320] + "..."
 	}
 	key := operation + ":" + message
-	now := time.Now()
+	now := timeNow()
+	const errTTL = 30 * time.Second
 	m.mu.Lock()
 	last, seen := m.errorSeen[key]
-	if seen && now.Sub(last) < 30*time.Second {
+	if seen && now.Sub(last) < errTTL {
 		m.mu.Unlock()
 		return
 	}
 	m.errorSeen[key] = now
-	if len(m.errorSeen) > 64 {
-		for k, at := range m.errorSeen {
-			if now.Sub(at) >= 30*time.Second {
-				delete(m.errorSeen, k)
-			}
+	// Proactively sweep expired entries on every report so the table drains
+	// shortly after the daemon recovers, not only once it exceeds 64 entries.
+	for k, at := range m.errorSeen {
+		if now.Sub(at) >= errTTL {
+			delete(m.errorSeen, k)
 		}
 	}
 	notifier := m.notifier
@@ -166,20 +215,24 @@ func (m *Menu) requestRebuild() {
 }
 
 func (m *Menu) refresh(ctx context.Context) {
-	status, err := m.Client.Status(ctx)
-	if err != nil {
-		m.reportError("daemon unavailable", err)
-	}
-	profiles, err := m.Client.Profiles(ctx)
-	if err != nil {
-		m.reportError("daemon unavailable", err)
-	}
-	traffic, err := m.Client.Traffic(ctx)
-	if err != nil {
-		m.reportError("daemon unavailable", err)
-	}
+	var (
+		status           *types.Status
+		profiles         []types.Profile
+		traffic          *types.TrafficSnapshot
+		update           *types.UpdateInfo
+		sErr, pErr, tErr error
+	)
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() { defer wg.Done(); status, sErr = m.Client.Status(ctx) }()
+	go func() { defer wg.Done(); profiles, pErr = m.Client.Profiles(ctx) }()
+	go func() { defer wg.Done(); traffic, tErr = m.Client.Traffic(ctx) }()
+	// Update info is best-effort: the daemon caches the result, and a failure
+	// here should not surface as a "daemon unavailable" alert.
+	go func() { defer wg.Done(); update, _ = m.Client.UpdateCheck(ctx) }()
+	wg.Wait()
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if status != nil {
 		m.status = status
 	}
@@ -188,6 +241,23 @@ func (m *Menu) refresh(ctx context.Context) {
 	}
 	if traffic != nil {
 		m.traffic = *traffic
+	}
+	if update != nil {
+		m.updateInfo = update
+	}
+	m.mu.Unlock()
+
+	// Report at most one consolidated error per refresh cycle instead of one
+	// per failed call, so a daemon outage produces a single desktop alert.
+	if sErr != nil || pErr != nil || tErr != nil {
+		first := sErr
+		if first == nil {
+			first = pErr
+		}
+		if first == nil {
+			first = tErr
+		}
+		m.reportError("daemon unavailable", first)
 	}
 }
 
@@ -199,6 +269,7 @@ func (m *Menu) rebuild() {
 	status := copyStatus(m.status)
 	traffic := m.traffic
 	profiles := append([]types.Profile(nil), m.profiles...)
+	update := m.updateInfo
 	if m.menuCancel != nil {
 		m.menuCancel()
 	}
@@ -206,7 +277,7 @@ func (m *Menu) rebuild() {
 	m.menuCancel = cancel
 	m.mu.Unlock()
 
-	m.renderMenu(ctx, buildMenuModel(status, traffic, profiles))
+	m.render(ctx, buildMenuModel(status, traffic, profiles, update))
 }
 
 func (m *Menu) handleProfileSelection(ctx context.Context, profileID string) {
@@ -264,11 +335,13 @@ func (m *Menu) handleSocks5Toggle(enabled bool) {
 		m.reportError("update SOCKS5 setting failed", fmt.Errorf("no profile selected"))
 		return
 	}
-	if _, err := m.Client.UpdateProfile(context.Background(), status.CurrentProfileID, req); err != nil {
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	if _, err := m.Client.UpdateProfile(ctx, status.CurrentProfileID, req); err != nil {
 		m.reportError("update SOCKS5 setting failed", err)
 		return
 	}
-	m.refresh(context.Background())
+	m.refresh(ctx)
 	m.requestRebuild()
 }
 
@@ -281,11 +354,13 @@ func (m *Menu) handleAutoReconnectToggle(enabled bool) {
 		return
 	}
 	req := types.ProfileUpdateRequest{AutoReconnect: &enabled}
-	if _, err := m.Client.UpdateProfile(context.Background(), status.CurrentProfileID, req); err != nil {
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	if _, err := m.Client.UpdateProfile(ctx, status.CurrentProfileID, req); err != nil {
 		m.reportError("update auto-reconnect setting failed", err)
 		return
 	}
-	m.refresh(context.Background())
+	m.refresh(ctx)
 	m.requestRebuild()
 }
 
@@ -298,16 +373,31 @@ func (m *Menu) handleApplyDNSToggle(enabled bool) {
 		return
 	}
 	req := types.ProfileUpdateRequest{ApplyDNS: &enabled}
-	if _, err := m.Client.UpdateProfile(context.Background(), status.CurrentProfileID, req); err != nil {
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	if _, err := m.Client.UpdateProfile(ctx, status.CurrentProfileID, req); err != nil {
 		m.reportError("update DNS setting failed", err)
 		return
 	}
-	m.refresh(context.Background())
+	m.refresh(ctx)
 	m.requestRebuild()
 }
 
+// opCtx returns a context derived from the tray lifecycle so in-flight
+// operations are cancelled on exit instead of outliving the process.
+func (m *Menu) opCtx() (context.Context, context.CancelFunc) {
+	m.mu.Lock()
+	parent := m.runCtx
+	m.mu.Unlock()
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, opTimeout)
+}
+
 func (m *Menu) handleToggle(action toggleAction) {
-	ctx := context.Background()
+	ctx, cancel := m.opCtx()
+	defer cancel()
 	switch action {
 	case toggleConnect:
 		if err := m.Client.ConnectCurrent(ctx); err != nil {
@@ -323,7 +413,9 @@ func (m *Menu) handleToggle(action toggleAction) {
 }
 
 func (m *Menu) copyDiagnostics() {
-	text, err := m.Client.DiagnosticsText(context.Background())
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	text, err := m.Client.DiagnosticsText(ctx)
 	if err != nil {
 		m.reportError("read diagnostics failed", err)
 		return
@@ -409,6 +501,105 @@ func (m *Menu) updateTrayTooltip() {
 	setTooltip(tooltipText(status, traffic, profiles))
 }
 
+// defaultUpdateCheckInterval is the fallback cadence for polling the daemon's
+// update-check endpoint when FLEXCONNECT_UPDATE_INTERVAL is unset.
+const defaultUpdateCheckInterval = 6 * time.Hour
+
+// updateCheckInterval resolves the tray's update polling cadence from
+// FLEXCONNECT_UPDATE_INTERVAL (a Go duration string). A zero or "disabled"
+// value turns the periodic check off.
+func updateCheckInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("FLEXCONNECT_UPDATE_INTERVAL"))
+	if raw == "" {
+		return defaultUpdateCheckInterval
+	}
+	if strings.EqualFold(raw, "disabled") {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
+// updateCheckLoop periodically asks the daemon for the latest release info and
+// surfaces a one-time desktop notification plus a menu row when a newer
+// version is available. The daemon performs (and caches) the actual GitHub
+// query; the tray only polls the local API.
+func (m *Menu) updateCheckLoop(ctx context.Context) {
+	interval := updateCheckInterval()
+	if interval <= 0 {
+		return
+	}
+	m.init()
+	// Check once shortly after startup so a fresh session sees pending
+	// updates, then settle into the configured cadence.
+	m.fetchUpdateInfo(ctx)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			m.fetchUpdateInfo(ctx)
+			timer.Reset(interval)
+		}
+	}
+}
+
+// fetchUpdateInfo pulls the daemon's cached update-check result, stores it for
+// the next menu rebuild, and emits a single desktop notification per newly
+// detected release.
+func (m *Menu) fetchUpdateInfo(ctx context.Context) {
+	update, err := m.Client.UpdateCheck(ctx)
+	if err != nil || update == nil {
+		return
+	}
+	m.mu.Lock()
+	changed := !updateInfoEqual(m.updateInfo, update)
+	// Reset the notified flag when a different release is detected so each new
+	// version produces one notification.
+	if m.updateInfo != nil && m.updateInfo.LatestVersion != update.LatestVersion {
+		m.updateNotified = false
+	}
+	m.updateInfo = update
+	shouldNotify := update.UpdateAvailable && !m.updateNotified
+	if shouldNotify {
+		m.updateNotified = true
+	}
+	notifier := m.notifier
+	m.mu.Unlock()
+
+	if changed {
+		m.requestRebuild()
+	}
+	if shouldNotify && notifier != nil {
+		title := "FlexConnect update available"
+		body := "Version " + update.LatestVersion + " is available."
+		if update.ReleaseURL != "" {
+			body += "\n" + update.ReleaseURL
+		}
+		if err := notifier.Send(title, body); err != nil {
+			systrayLog.Error(fmt.Errorf("update notification failed: %w", err))
+		}
+	}
+}
+
+// updateInfoEqual reports whether two update-check results are equivalent for
+// the purposes of deciding whether the menu needs a rebuild.
+func updateInfoEqual(a, b *types.UpdateInfo) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.UpdateAvailable == b.UpdateAvailable &&
+		a.LatestVersion == b.LatestVersion &&
+		a.ReleaseURL == b.ReleaseURL &&
+		a.Disabled == b.Disabled &&
+		a.Error == b.Error
+}
+
 func (m *Menu) rebuildLoop(ctx context.Context) {
 	m.init()
 	for {
@@ -416,6 +607,17 @@ func (m *Menu) rebuildLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-m.rebuildCh:
+			// Drain any burst queued by rapid state changes, then wait a short
+			// debounce window so a flurry of notifications collapses into a
+			// single ResetMenu instead of flickering the menu.
+			m.drainRebuilds()
+			timer := time.NewTimer(rebuildDebounce)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 			m.drainRebuilds()
 			m.rebuild()
 		}
@@ -446,6 +648,7 @@ func (m *Menu) openLoop(ctx context.Context) {
 
 func (m *Menu) watch(ctx context.Context) {
 	m.init()
+	attempt := 0
 	for {
 		watcher, err := m.Client.Watch(ctx)
 		if err != nil {
@@ -453,11 +656,15 @@ func (m *Menu) watch(ctx context.Context) {
 				return
 			}
 			m.reportError("watch connection failed", err)
-			if !waitForRetry(ctx) {
+			if !m.waitForBackoff(ctx, attempt) {
 				return
 			}
+			attempt++
 			continue
 		}
+		// Connection re-established: reset backoff so the next failure starts
+		// from the base delay instead of a previously escalated value.
+		attempt = 0
 		for {
 			notify, err := watcher.Next()
 			if err != nil {
@@ -470,9 +677,23 @@ func (m *Menu) watch(ctx context.Context) {
 			}
 			m.handleNotify(notify, m.updateTrayTooltip)
 		}
-		if !waitForRetry(ctx) {
+		if !m.waitForBackoff(ctx, attempt) {
 			return
 		}
+		attempt++
+	}
+}
+
+// waitForBackoff sleeps for the backoff delay computed for attempt before
+// returning true. It returns false if ctx is cancelled while waiting.
+func (m *Menu) waitForBackoff(ctx context.Context, attempt int) bool {
+	timer := time.NewTimer(retryDelay(attempt))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -513,12 +734,31 @@ func (m *Menu) notifyConnection(event types.ConnectionEvent) {
 	if event.ConnectionID != "" {
 		key = event.ConnectionID + ":" + event.Kind
 	}
+	now := timeNow()
 	m.mu.Lock()
-	if _, ok := m.notified[key]; ok {
+	if last, ok := m.notified[key]; ok && now.Sub(last) < notifiedTTL {
 		m.mu.Unlock()
 		return
 	}
-	m.notified[key] = struct{}{}
+	m.notified[key] = now
+	// Bound memory: sweep TTL-expired entries, and if a burst of distinct
+	// fresh keys pushes past the cap, evict the oldest until back under cap.
+	for k, at := range m.notified {
+		if now.Sub(at) >= notifiedTTL {
+			delete(m.notified, k)
+		}
+	}
+	for len(m.notified) > notifiedMax {
+		var oldestKey string
+		var oldestAt time.Time
+		first := true
+		for k, at := range m.notified {
+			if first || at.Before(oldestAt) {
+				oldestKey, oldestAt, first = k, at, false
+			}
+		}
+		delete(m.notified, oldestKey)
+	}
 	notifier := m.notifier
 	m.mu.Unlock()
 
@@ -549,15 +789,31 @@ func (m *Menu) notifyConnection(event types.ConnectionEvent) {
 	}
 }
 
-func waitForRetry(ctx context.Context) bool {
-	timer := time.NewTimer(time.Second)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
+// retryDelay returns an exponentially growing delay with a ±20% jitter,
+// capped at backoffMax. attempt 0 starts at backoffBase (~1s); each
+// subsequent failure doubles the base until the cap is reached.
+func retryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
 	}
+	d := backoffBase
+	for i := 0; i < attempt && d < backoffMax; i++ {
+		d *= 2
+	}
+	if d > backoffMax {
+		d = backoffMax
+	}
+	// ±20% jitter to avoid synchronized reconnect storms.
+	spread := float64(d) * 0.2
+	delta := time.Duration(jitterFraction()*2*spread - spread)
+	d += delta
+	if d < backoffBase {
+		d = backoffBase
+	}
+	if d > backoffMax {
+		d = backoffMax
+	}
+	return d
 }
 
 func writeClipboard(text string) error {

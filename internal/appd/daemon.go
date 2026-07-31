@@ -18,6 +18,7 @@ import (
 	"flexconnect/internal/socks5"
 	storefile "flexconnect/internal/store/file"
 	"flexconnect/internal/types"
+	"flexconnect/internal/updater"
 	"flexconnect/internal/vpn"
 )
 
@@ -65,6 +66,7 @@ type Daemon interface {
 	Diagnostics() types.Diagnostics
 	Logs() []types.LogEntry
 	Watch(context.Context) <-chan types.Notify
+	UpdateCheck(context.Context) (types.UpdateInfo, error)
 }
 
 type Service struct {
@@ -98,6 +100,17 @@ type Service struct {
 	activeConnectionStarted time.Time
 	connectionHistory       []types.ConnectionEvent
 	reconnectLifecycleID    string
+	updater                 updateChecker
+	updateCache             types.UpdateInfo
+	updateCacheAt           time.Time
+	updateInterval          time.Duration
+	updateNotified          bool
+}
+
+// updateChecker abstracts the online update probe so tests can inject a fake.
+// It is satisfied by *updater.Checker.
+type updateChecker interface {
+	Check(ctx context.Context) updater.Info
 }
 
 func New(store Store, secrets secret.Store, backend vpn.Backend, planner router.Planner) (*Service, error) {
@@ -718,6 +731,48 @@ func (s *Service) Watch(ctx context.Context) <-chan types.Notify {
 		s.mu.Unlock()
 	}()
 	return ch
+}
+
+// SetUpdater injects the online update probe and its cache interval. It is
+// called once during daemon construction; a nil checker (or a zero interval)
+// leaves update checks disabled.
+func (s *Service) SetUpdater(c updateChecker, interval time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updater = c
+	s.updateInterval = interval
+}
+
+// UpdateCheck returns the latest online update status. Results are cached for
+// the configured interval so frequent tray refreshes do not hit the network.
+// When no updater is configured the check reports Disabled.
+func (s *Service) UpdateCheck(ctx context.Context) (types.UpdateInfo, error) {
+	s.mu.Lock()
+	checker := s.updater
+	interval := s.updateInterval
+	cache := s.updateCache
+	cacheAt := s.updateCacheAt
+	s.mu.Unlock()
+
+	if checker == nil {
+		return types.UpdateInfo{CurrentVersion: buildinfo.Version, Disabled: true}, nil
+	}
+	if interval > 0 && !cacheAt.IsZero() && cache.CheckedAt != "" && time.Since(cacheAt) < interval {
+		return cache, nil
+	}
+
+	info := checker.Check(ctx)
+	result := info.ToTypes()
+	// Only cache successful results so a transient network error does not
+	// poison the cache for the whole interval.
+	if result.Error == "" {
+		s.mu.Lock()
+		s.updateCache = result
+		s.updateCacheAt = time.Now()
+		s.updateNotified = false
+		s.mu.Unlock()
+	}
+	return result, nil
 }
 
 func (s *Service) consumeBackendEvents() {

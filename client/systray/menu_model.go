@@ -53,7 +53,7 @@ type menuItemModel struct {
 	Children  []menuItemModel
 }
 
-func buildMenuModel(status *types.Status, traffic types.TrafficSnapshot, profiles []types.Profile) menuModel {
+func buildMenuModel(status *types.Status, traffic types.TrafficSnapshot, profiles []types.Profile, update *types.UpdateInfo) menuModel {
 	profiles = append([]types.Profile(nil), profiles...)
 	sort.Slice(profiles, func(i, j int) bool {
 		return strings.ToLower(profileTitle(profiles[i])) < strings.ToLower(profileTitle(profiles[j]))
@@ -61,6 +61,9 @@ func buildMenuModel(status *types.Status, traffic types.TrafficSnapshot, profile
 
 	model := menuModel{Icon: trayIconColorForStatus(status), Tooltip: tooltipText(status, traffic, profiles)}
 	model.Items = append(model.Items, statusItems(status, profiles)...)
+	if item := updateMenuItem(update); item != nil {
+		model.Items = append(model.Items, *item)
+	}
 	model.Items = append(model.Items, separatorItem())
 	model.Items = append(model.Items, toggleItemForStatus(status))
 	if info := informationItem(status, traffic, profiles); len(info.Children) > 0 {
@@ -259,6 +262,20 @@ func settingsMenuItem(status *types.Status, profiles []types.Profile) menuItemMo
 
 func disabledItem(title string) menuItemModel {
 	return menuItemModel{Title: title, Disabled: true}
+}
+
+// updateMenuItem renders a disabled "Update available" row when a newer
+// release exists. It is informational only (check-only): clicking it does
+// nothing, and the tooltip points at the release page.
+func updateMenuItem(update *types.UpdateInfo) *menuItemModel {
+	if update == nil || !update.UpdateAvailable || update.LatestVersion == "" {
+		return nil
+	}
+	return &menuItemModel{
+		Title:    "Update available: v" + update.LatestVersion,
+		Tooltip:  update.ReleaseURL,
+		Disabled: true,
+	}
 }
 
 func separatorItem() menuItemModel {

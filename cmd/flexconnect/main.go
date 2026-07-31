@@ -132,7 +132,7 @@ func commandNeedsDaemon(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "status", "login", "up", "down", "logs", "diag", "traffic", "watch":
+	case "status", "login", "up", "down", "logs", "diag", "traffic", "watch", "update":
 		return true
 	case "profile", "route", "proxy":
 		return len(args) > 1
@@ -290,6 +290,20 @@ func runCommand(ctx context.Context, client *local.Client, args []string) error 
 				return err
 			}
 		}
+	case "update":
+		debugf("handling update")
+		if wantCommandHelp(args[1:]) {
+			return printNamedHelp("update")
+		}
+		info, err := client.UpdateCheck(ctx)
+		if err != nil {
+			return err
+		}
+		if hasJSONFlag(args[1:]) {
+			return printJSON(info)
+		}
+		_, err = io.WriteString(cliOut, formatUpdateInfo(info))
+		return err
 	default:
 		return fmt.Errorf("unknown command: %s", args[0])
 	}
@@ -1005,6 +1019,34 @@ func formatTrafficSnapshot(traffic types.TrafficSnapshot) string {
 	return buf.String()
 }
 
+func formatUpdateInfo(info *types.UpdateInfo) string {
+	if info == nil {
+		return "No update information available.\n"
+	}
+	var buf bytes.Buffer
+	if info.Disabled {
+		fmt.Fprintf(&buf, "Current: %s\n", info.CurrentVersion)
+		buf.WriteString("Update checks are disabled (no update repository configured).\n")
+		return buf.String()
+	}
+	if info.Error != "" {
+		fmt.Fprintf(&buf, "Current: %s\n", info.CurrentVersion)
+		fmt.Fprintf(&buf, "Update check failed: %s\n", info.Error)
+		return buf.String()
+	}
+	fmt.Fprintf(&buf, "Current: %s\n", info.CurrentVersion)
+	fmt.Fprintf(&buf, "Latest: %s\n", info.LatestVersion)
+	if info.UpdateAvailable {
+		buf.WriteString("Update available: yes\n")
+	} else {
+		buf.WriteString("Update available: no\n")
+	}
+	if info.ReleaseURL != "" {
+		fmt.Fprintf(&buf, "Release: %s\n", info.ReleaseURL)
+	}
+	return buf.String()
+}
+
 func usage() {
 	_, _ = io.WriteString(cliOut, rootHelp())
 }
@@ -1109,6 +1151,7 @@ func rootHelpTopic() helpTopic {
 			{Name: "diag", Summary: "Export diagnostics as JSON"},
 			{Name: "traffic", Summary: "Show traffic totals and speeds"},
 			{Name: "watch", Summary: "Stream daemon events as NDJSON"},
+			{Name: "update", Summary: "Check for a new FlexConnect release"},
 		},
 		Examples: []string{
 			"flexconnect status",
@@ -1174,6 +1217,12 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 			Name:        "watch",
 			Usage:       "flexconnect watch",
 			Description: "Stream daemon notifications as newline-delimited JSON.",
+		},
+		"update": {
+			Name:        "update",
+			Usage:       "flexconnect update [--json]",
+			Description: "Check GitHub Releases for a newer FlexConnect version and report whether an update is available. This only checks and reports; it never downloads or installs anything.",
+			Examples:    []string{"flexconnect update", "flexconnect update --json"},
 		},
 		"profile": {
 			Name:        "profile",

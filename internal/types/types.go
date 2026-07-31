@@ -183,6 +183,27 @@ type Notify struct {
 	Time       string           `json:"time"`
 }
 
+// UpdateAsset describes one downloadable artifact attached to a release.
+type UpdateAsset struct {
+	Name        string `json:"name"`
+	DownloadURL string `json:"download_url"`
+	Size        int64  `json:"size"`
+}
+
+// UpdateInfo is the result of an online update check against GitHub Releases.
+// It is check-only: FlexConnect does not download or replace binaries.
+type UpdateInfo struct {
+	CurrentVersion  string        `json:"current_version"`
+	LatestVersion   string        `json:"latest_version"`
+	UpdateAvailable bool          `json:"update_available"`
+	ReleaseURL      string        `json:"release_url,omitempty"`
+	PublishedAt     string        `json:"published_at,omitempty"`
+	Assets          []UpdateAsset `json:"assets,omitempty"`
+	CheckedAt       string        `json:"checked_at,omitempty"`
+	Disabled        bool          `json:"disabled,omitempty"`
+	Error           string        `json:"error,omitempty"`
+}
+
 type Diagnostics struct {
 	Version           string            `json:"version"`
 	Status            Status            `json:"status"`

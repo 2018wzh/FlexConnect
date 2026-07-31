@@ -199,6 +199,11 @@ func (c *Client) Traffic(ctx context.Context) (*types.TrafficSnapshot, error) {
 	return &out, c.getJSON(ctx, "/v1/traffic", &out)
 }
 
+func (c *Client) UpdateCheck(ctx context.Context) (*types.UpdateInfo, error) {
+	var out types.UpdateInfo
+	return &out, c.getJSON(ctx, "/v1/update/check", &out)
+}
+
 func (c *Client) DiagnosticsText(ctx context.Context) (string, error) {
 	diag, err := c.Diagnostics(ctx)
 	if err != nil {

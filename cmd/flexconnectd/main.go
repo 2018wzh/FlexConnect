@@ -6,15 +6,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"flexconnect/internal/apiserver"
 	"flexconnect/internal/appd"
+	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
 	"flexconnect/internal/router"
 	storefile "flexconnect/internal/store/file"
+	"flexconnect/internal/updater"
 	vpnac "flexconnect/internal/vpn/anyconnect"
 )
 
@@ -158,5 +161,40 @@ func newService(statePath, secretStore string) (*appd.Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return appd.New(store, secrets, vpnac.New(), router.DefaultPlanner{})
+	service, err := appd.New(store, secrets, vpnac.New(), router.DefaultPlanner{})
+	if err != nil {
+		return nil, err
+	}
+	configureUpdater(service)
+	return service, nil
+}
+
+// defaultUpdateInterval is the cadence for online update checks when
+// FLEXCONNECT_UPDATE_INTERVAL is not set.
+const defaultUpdateInterval = 6 * time.Hour
+
+// configureUpdater wires the GitHub Releases update checker into the service.
+// The repository comes from buildinfo.UpdateRepo (overridable at runtime via
+// FLEXCONNECT_UPDATE_REPO); the cadence comes from FLEXCONNECT_UPDATE_INTERVAL
+// (default 6h, "0" or "disabled" turns checks off). When no repository is
+// configured the checker is left unset and the API reports Disabled.
+func configureUpdater(service *appd.Service) {
+	repo := strings.TrimSpace(buildinfo.UpdateRepo)
+	if env := strings.TrimSpace(os.Getenv("FLEXCONNECT_UPDATE_REPO")); env != "" {
+		repo = env
+	}
+	interval := defaultUpdateInterval
+	if env := strings.TrimSpace(os.Getenv("FLEXCONNECT_UPDATE_INTERVAL")); env != "" {
+		if env == "disabled" || env == "0" {
+			interval = 0
+		} else if d, err := time.ParseDuration(env); err == nil {
+			interval = d
+		}
+	}
+	if repo == "" || interval <= 0 {
+		logging.WithComponent("flexconnectd").Printf("update checks disabled repo_configured=%v interval=%s", repo != "", interval)
+		return
+	}
+	service.SetUpdater(updater.New(repo), interval)
+	logging.WithComponent("flexconnectd").Printf("update checks enabled repo=%s interval=%s", repo, interval)
 }
