@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -12,10 +13,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	acAuth "flexconnect/internal/anyconnect/auth"
@@ -25,6 +28,8 @@ import (
 	"flexconnect/internal/anyconnect/utils"
 	"flexconnect/internal/osnet"
 	"github.com/pion/dtls/v3"
+	"github.com/tailscale/wireguard-go/tun"
+	"github.com/tailscale/wireguard-go/tun/netstack"
 )
 
 const (
@@ -32,6 +37,8 @@ const (
 	defaultObserveFor = 35 * time.Second
 	maxEnvFileBytes   = 64 * 1024
 	maxFrameBytes     = 64 * 1024
+	defaultSpeedBytes = 4 * 1024 * 1024
+	defaultSpeedLimit = 30 * time.Second
 )
 
 type credentials struct {
@@ -42,8 +49,44 @@ type credentials struct {
 }
 
 type cstpFrame struct {
-	Type byte
-	Size int
+	Type    byte
+	Size    int
+	Payload []byte
+}
+
+type speedtestConfig struct {
+	URL      string
+	MaxBytes int64
+	Timeout  time.Duration
+}
+
+type speedtestResult struct {
+	Bytes    int64
+	Duration time.Duration
+}
+
+type speedtestOutcome struct {
+	Result speedtestResult
+	Err    error
+}
+
+type probeWriter struct {
+	mu       sync.Mutex
+	tlsConn  net.Conn
+	dtlsConn *dtls.Conn
+}
+
+type trafficBridge struct {
+	dev    tun.Device
+	net    *netstack.Net
+	writer *probeWriter
+
+	mu              sync.Mutex
+	sentBytes       int64
+	receivedBytes   int64
+	sentPackets     int64
+	receivedPackets int64
+	closeOnce       sync.Once
 }
 
 func main() {
@@ -52,21 +95,33 @@ func main() {
 	dpdInterval := flag.Duration("dpd-interval", 0, "TLS DPD interval; zero derives it from X-CSTP-DPD")
 	noDTLS := flag.Bool("no-dtls", false, "do not open the secondary DTLS channel")
 	debug := flag.Bool("debug", false, "enable protocol debug logging")
+	localIP := flag.String("local-ip", "", "optional local IPv4 source address for the control connection")
+	speedtestURL := flag.String("speedtest-url", "", "download URL to probe through the VPN user-space stack; empty disables traffic probing")
+	speedtestBytes := flag.Int64("speedtest-bytes", defaultSpeedBytes, "maximum bytes to download during the traffic probe")
+	speedtestTimeout := flag.Duration("speedtest-timeout", defaultSpeedLimit, "maximum duration of the traffic probe")
 	flag.Parse()
 
 	if *observeFor <= 0 {
 		fatal("observe must be positive")
 	}
+	var speedtest *speedtestConfig
+	if strings.TrimSpace(*speedtestURL) != "" {
+		var err error
+		speedtest, err = newSpeedtestConfig(*speedtestURL, *speedtestBytes, *speedtestTimeout)
+		if err != nil {
+			fatal("invalid speedtest configuration: %v", err)
+		}
+	}
 	creds, err := loadCredentials(*envFile)
 	if err != nil {
 		fatal("load credentials: %v", err)
 	}
-	if err := run(context.Background(), creds, *observeFor, *dpdInterval, !*noDTLS, *debug); err != nil {
+	if err := run(context.Background(), creds, *observeFor, *dpdInterval, !*noDTLS, *debug, *localIP, speedtest); err != nil {
 		fatal("probe failed: %v", err)
 	}
 }
 
-func run(ctx context.Context, creds credentials, observeFor, dpdInterval time.Duration, withDTLS, debug bool) error {
+func run(ctx context.Context, creds credentials, observeFor, dpdInterval time.Duration, withDTLS, debug bool, localIP string, speedtest *speedtestConfig) error {
 	acBase.Setup()
 	if debug {
 		acBase.SetLogLevel("Debug")
@@ -95,9 +150,20 @@ func run(ctx context.Context, creds credentials, observeFor, dpdInterval time.Du
 	acAuth.Prof.Group = creds.Group
 	acAuth.Prof.SecretKey = ""
 
-	fmt.Printf("probe mode=tls-only no_tun=true endpoint=%s local_ip=%s\n", endpointForOutput(creds.Endpoint), info.IP4)
-	if err := acAuth.InitAuth(); err != nil {
-		return err
+	if localIP != "" {
+		if net.ParseIP(localIP).To4() == nil {
+			return fmt.Errorf("invalid local IPv4 address %q", localIP)
+		}
+	}
+	fmt.Printf("probe mode=cstp no_os_tun=true user_space_stack=%t endpoint=%s local_ip=%s auth_local_ip=%s\n", speedtest != nil, endpointForOutput(creds.Endpoint), info.IP4, safeHeader(localIP))
+	var initAuthErr error
+	if localIP == "" {
+		initAuthErr = acAuth.InitAuth()
+	} else {
+		initAuthErr = acAuth.InitAuthWithLocalIP(localIP)
+	}
+	if initAuthErr != nil {
+		return initAuthErr
 	}
 	defer closeAuthConnection()
 	if err := acAuth.PasswordAuth(); err != nil {
@@ -123,7 +189,7 @@ func run(ctx context.Context, creds credentials, observeFor, dpdInterval time.Du
 		safeHeader(resp.Header.Get("X-CSTP-DPD")), safeHeader(resp.Header.Get("X-CSTP-Keepalive")),
 		dtlsConn != nil, resp.Header.Get("X-DTLS-Port") != "", interval.Round(time.Millisecond))
 
-	return observeCSTP(ctx, observeFor, interval, dtlsConn)
+	return observeCSTP(ctx, observeFor, interval, dtlsConn, speedtest, resp.Header)
 }
 
 func negotiateCSTP() (*http.Response, error) {
@@ -160,7 +226,7 @@ func negotiateCSTP() (*http.Response, error) {
 	return resp, nil
 }
 
-func observeCSTP(ctx context.Context, observeFor, dpdInterval time.Duration, dtlsConn *dtls.Conn) error {
+func observeCSTP(ctx context.Context, observeFor, dpdInterval time.Duration, dtlsConn *dtls.Conn, speedtest *speedtestConfig, headers http.Header) error {
 	frames := make(chan cstpFrame, 16)
 	errs := make(chan error, 1)
 	go readFrames(acAuth.BufR, frames, errs)
@@ -171,21 +237,58 @@ func observeCSTP(ctx context.Context, observeFor, dpdInterval time.Duration, dtl
 		dtlsErrs = make(chan error, 1)
 		go readDTLSFrames(dtlsConn, dtlsFrames, dtlsErrs)
 	}
+	writer := &probeWriter{tlsConn: acAuth.Conn, dtlsConn: dtlsConn}
+	var bridge *trafficBridge
+	var bridgeErrs chan error
+	var speedtestDone <-chan speedtestOutcome
+	if speedtest != nil {
+		var err error
+		bridge, err = newTrafficBridge(headers, writer)
+		if err != nil {
+			return err
+		}
+		defer bridge.Close()
+		bridgeErrs = make(chan error, 1)
+		go bridge.readOutbound(bridgeErrs)
+		results := make(chan speedtestOutcome, 1)
+		speedtestDone = results
+		go func() {
+			result, err := runSpeedtest(ctx, bridge.net, *speedtest)
+			results <- speedtestOutcome{Result: result, Err: err}
+		}()
+		fmt.Printf("speedtest start=target:%s max_bytes=%d timeout=%s transport=%s\n",
+			speedtestHost(speedtest.URL), speedtest.MaxBytes, speedtest.Timeout, transportName(dtlsConn))
+	}
 
 	ticker := time.NewTicker(dpdInterval)
 	defer ticker.Stop()
 	deadline := time.NewTimer(observeFor)
 	defer deadline.Stop()
 	started := time.Now()
+	speedtestFinished := speedtest == nil
 	for {
 		select {
 		case frame := <-frames:
-			fmt.Printf("frame elapsed=%s type=0x%02x payload=%d\n", time.Since(started).Round(time.Millisecond), frame.Type, frame.Size)
+			if bridge != nil {
+				if err := bridge.handleInbound(frame); err != nil {
+					return fmt.Errorf("inject CSTP frame into user-space stack: %w", err)
+				}
+			}
+			if frame.Type != 0x00 || bridge == nil {
+				fmt.Printf("frame elapsed=%s type=0x%02x payload=%d\n", time.Since(started).Round(time.Millisecond), frame.Type, frame.Size)
+			}
 			if frame.Type == 0x05 || frame.Type == 0x09 {
 				return fmt.Errorf("server sent CSTP termination frame type=0x%02x", frame.Type)
 			}
 		case frame := <-dtlsFrames:
-			fmt.Printf("dtls_frame elapsed=%s type=0x%02x payload=%d\n", time.Since(started).Round(time.Millisecond), frame.Type, frame.Size)
+			if bridge != nil {
+				if err := bridge.handleInbound(frame); err != nil {
+					return fmt.Errorf("inject DTLS frame into user-space stack: %w", err)
+				}
+			}
+			if frame.Type != 0x00 || bridge == nil {
+				fmt.Printf("dtls_frame elapsed=%s type=0x%02x payload=%d\n", time.Since(started).Round(time.Millisecond), frame.Type, frame.Size)
+			}
 			if frame.Type == 0x05 || frame.Type == 0x09 {
 				return fmt.Errorf("server sent DTLS termination frame type=0x%02x", frame.Type)
 			}
@@ -193,17 +296,27 @@ func observeCSTP(ctx context.Context, observeFor, dpdInterval time.Duration, dtl
 			return fmt.Errorf("CSTP read failed after %s: %w", time.Since(started).Round(time.Millisecond), err)
 		case err := <-dtlsErrs:
 			return fmt.Errorf("DTLS read failed after %s: %w", time.Since(started).Round(time.Millisecond), err)
-		case <-ticker.C:
-			if err := sendCSTPFrame(0x03); err != nil {
-				return fmt.Errorf("send TLS DPD after %s: %w", time.Since(started).Round(time.Millisecond), err)
+		case err := <-bridgeErrs:
+			return fmt.Errorf("user-space outbound traffic failed after %s: %w", time.Since(started).Round(time.Millisecond), err)
+		case outcome := <-speedtestDone:
+			if outcome.Err != nil {
+				return fmt.Errorf("speedtest failed after %s: %w", time.Since(started).Round(time.Millisecond), outcome.Err)
 			}
-			if dtlsConn != nil {
-				if _, err := dtlsConn.Write([]byte{0x03}); err != nil {
-					return fmt.Errorf("send DTLS DPD after %s: %w", time.Since(started).Round(time.Millisecond), err)
-				}
+			speedtestFinished = true
+			stats := bridge.stats()
+			bitsPerSecond := float64(outcome.Result.Bytes*8) / outcome.Result.Duration.Seconds()
+			fmt.Printf("speedtest result=ok bytes=%d duration=%s mibps=%.2f transport=%s outbound_frame_bytes=%d inbound_frame_bytes=%d outbound_packets=%d inbound_packets=%d\n",
+				outcome.Result.Bytes, outcome.Result.Duration.Round(time.Millisecond), bitsPerSecond/(1024*1024), transportName(dtlsConn),
+				stats.sentBytes, stats.receivedBytes, stats.sentPackets, stats.receivedPackets)
+		case <-ticker.C:
+			if err := writer.sendControl(0x03); err != nil {
+				return fmt.Errorf("send TLS DPD after %s: %w", time.Since(started).Round(time.Millisecond), err)
 			}
 			fmt.Printf("dpd elapsed=%s dtls=%t\n", time.Since(started).Round(time.Millisecond), dtlsConn != nil)
 		case <-deadline.C:
+			if !speedtestFinished {
+				return fmt.Errorf("speedtest did not finish within observation window")
+			}
 			fmt.Printf("probe result=stable_tls_observation duration=%s dtls=%t\n", time.Since(started).Round(time.Millisecond), dtlsConn != nil)
 			return nil
 		case <-ctx.Done():
@@ -281,6 +394,233 @@ func (s *probeDTLSSessionStore) Get([]byte) (dtls.Session, error) {
 }
 func (s *probeDTLSSessionStore) Del([]byte) error { return nil }
 
+func (w *probeWriter) sendControl(frameType byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.tlsConn != nil {
+		frame := append([]byte(nil), proto.Header...)
+		frame[6] = frameType
+		if _, err := w.tlsConn.Write(frame); err != nil {
+			return fmt.Errorf("TLS control frame: %w", err)
+		}
+	}
+	if w.dtlsConn != nil {
+		if _, err := w.dtlsConn.Write([]byte{frameType}); err != nil {
+			return fmt.Errorf("DTLS control frame: %w", err)
+		}
+	}
+	return nil
+}
+
+func (w *probeWriter) sendData(packet []byte) error {
+	if len(packet) == 0 {
+		return errors.New("empty IPv4 packet")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.dtlsConn != nil {
+		frame := make([]byte, len(packet)+1)
+		copy(frame[1:], packet)
+		if _, err := w.dtlsConn.Write(frame); err != nil {
+			return fmt.Errorf("DTLS data frame: %w", err)
+		}
+		return nil
+	}
+	frame := make([]byte, len(packet)+len(proto.Header))
+	copy(frame, proto.Header)
+	frame[4] = byte(len(packet) >> 8)
+	frame[5] = byte(len(packet))
+	copy(frame[len(proto.Header):], packet)
+	if _, err := w.tlsConn.Write(frame); err != nil {
+		return fmt.Errorf("TLS data frame: %w", err)
+	}
+	return nil
+}
+
+func newTrafficBridge(headers http.Header, writer *probeWriter) (*trafficBridge, error) {
+	local, err := netip.ParseAddr(strings.TrimSpace(headers.Get("X-CSTP-Address")))
+	if err != nil || !local.Is4() {
+		return nil, fmt.Errorf("invalid VPN IPv4 address %q", headers.Get("X-CSTP-Address"))
+	}
+	dns, err := parseProbeDNS(headers.Values("X-CSTP-DNS"))
+	if err != nil {
+		return nil, err
+	}
+	mtu, err := strconv.Atoi(strings.TrimSpace(headers.Get("X-CSTP-MTU")))
+	if err != nil || mtu < 576 || mtu > 65535 {
+		return nil, fmt.Errorf("invalid VPN MTU %q", headers.Get("X-CSTP-MTU"))
+	}
+	dev, tnet, err := netstack.CreateNetTUN([]netip.Addr{local}, dns, mtu)
+	if err != nil {
+		return nil, fmt.Errorf("create user-space network stack: %w", err)
+	}
+	return &trafficBridge{dev: dev, net: tnet, writer: writer}, nil
+}
+
+func parseProbeDNS(values []string) ([]netip.Addr, error) {
+	var out []netip.Addr
+	for _, value := range values {
+		for _, item := range strings.Split(value, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			addr, err := netip.ParseAddr(item)
+			if err != nil || !addr.Is4() {
+				return nil, fmt.Errorf("invalid VPN DNS address %q", item)
+			}
+			out = append(out, addr)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("CSTP response did not provide an IPv4 DNS server")
+	}
+	return out, nil
+}
+
+func (b *trafficBridge) readOutbound(errs chan<- error) {
+	mtu, err := b.dev.MTU()
+	if err != nil {
+		errs <- err
+		return
+	}
+	buffer := make([]byte, mtu)
+	for {
+		sizes := []int{0}
+		if _, err := b.dev.Read([][]byte{buffer}, sizes, 0); err != nil {
+			errs <- err
+			return
+		}
+		if sizes[0] <= 0 || sizes[0] > len(buffer) {
+			errs <- fmt.Errorf("user-space stack returned invalid packet size %d", sizes[0])
+			return
+		}
+		packet := append([]byte(nil), buffer[:sizes[0]]...)
+		if err := b.writer.sendData(packet); err != nil {
+			errs <- err
+			return
+		}
+		b.mu.Lock()
+		b.sentBytes += int64(len(packet))
+		b.sentPackets++
+		b.mu.Unlock()
+	}
+}
+
+func (b *trafficBridge) handleInbound(frame cstpFrame) error {
+	if frame.Type != 0x00 || len(frame.Payload) == 0 {
+		return nil
+	}
+	if _, err := b.dev.Write([][]byte{frame.Payload}, 0); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.receivedBytes += int64(len(frame.Payload))
+	b.receivedPackets++
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *trafficBridge) stats() trafficStats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return trafficStats{
+		sentBytes:       b.sentBytes,
+		receivedBytes:   b.receivedBytes,
+		sentPackets:     b.sentPackets,
+		receivedPackets: b.receivedPackets,
+	}
+}
+
+type trafficStats struct {
+	sentBytes       int64
+	receivedBytes   int64
+	sentPackets     int64
+	receivedPackets int64
+}
+
+func (b *trafficBridge) Close() {
+	if b == nil {
+		return
+	}
+	b.closeOnce.Do(func() {
+		_ = b.dev.Close()
+	})
+}
+
+func runSpeedtest(parent context.Context, tnet *netstack.Net, config speedtestConfig) (speedtestResult, error) {
+	ctx, cancel := context.WithTimeout(parent, config.Timeout)
+	defer cancel()
+	transport := &http.Transport{
+		Proxy:             nil,
+		ForceAttemptHTTP2: false,
+		DisableKeepAlives: true,
+		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return tnet.DialContext(ctx, network, address)
+		},
+	}
+	client := &http.Client{Transport: transport}
+	defer transport.CloseIdleConnections()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, config.URL, nil)
+	if err != nil {
+		return speedtestResult{}, err
+	}
+	started := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return speedtestResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return speedtestResult{}, fmt.Errorf("speedtest returned %s", resp.Status)
+	}
+	bytesRead, err := io.CopyBuffer(io.Discard, io.LimitReader(resp.Body, config.MaxBytes), make([]byte, 32*1024))
+	if err != nil {
+		return speedtestResult{}, err
+	}
+	duration := time.Since(started)
+	if bytesRead == 0 {
+		return speedtestResult{}, errors.New("speedtest returned no payload")
+	}
+	return speedtestResult{Bytes: bytesRead, Duration: duration}, nil
+}
+
+func newSpeedtestConfig(rawURL string, maxBytes int64, timeout time.Duration) (*speedtestConfig, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, fmt.Errorf("speedtest URL must be an absolute http(s) URL")
+	}
+	if parsed.User != nil {
+		return nil, errors.New("speedtest URL must not contain user info")
+	}
+	if maxBytes <= 0 {
+		return nil, errors.New("speedtest-bytes must be positive")
+	}
+	if timeout <= 0 {
+		return nil, errors.New("speedtest-timeout must be positive")
+	}
+	return &speedtestConfig{URL: parsed.String(), MaxBytes: maxBytes, Timeout: timeout}, nil
+}
+
+func speedtestHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err == nil && parsed.Host != "" {
+		return parsed.Host
+	}
+	return "invalid"
+}
+
+func transportName(dtlsConn *dtls.Conn) string {
+	if dtlsConn != nil {
+		return "dtls"
+	}
+	return "tls"
+}
+
 func readDTLSFrames(conn *dtls.Conn, frames chan<- cstpFrame, errs chan<- error) {
 	buffer := make([]byte, maxFrameBytes)
 	for {
@@ -292,7 +632,8 @@ func readDTLSFrames(conn *dtls.Conn, frames chan<- cstpFrame, errs chan<- error)
 		if size == 0 {
 			continue
 		}
-		frames <- cstpFrame{Type: buffer[0], Size: size - 1}
+		payload := append([]byte(nil), buffer[1:size]...)
+		frames <- cstpFrame{Type: buffer[0], Size: len(payload), Payload: payload}
 	}
 }
 
@@ -317,17 +658,8 @@ func readFrames(reader io.Reader, frames chan<- cstpFrame, errs chan<- error) {
 			errs <- err
 			return
 		}
-		frames <- cstpFrame{Type: header[6], Size: payloadSize}
+		frames <- cstpFrame{Type: header[6], Size: payloadSize, Payload: payload}
 	}
-}
-
-func sendCSTPFrame(frameType byte) error {
-	frame := append([]byte(nil), proto.Header...)
-	frame[6] = frameType
-	frame[4] = 0
-	frame[5] = 0
-	_, err := acAuth.Conn.Write(frame)
-	return err
 }
 
 func closeAuthConnection() {

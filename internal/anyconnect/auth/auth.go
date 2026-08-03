@@ -95,6 +95,21 @@ func init() {
 
 // InitAuth 确定用户组和服务端认证地址 AuthPath
 func InitAuth() error {
+	return initAuth(nil)
+}
+
+// InitAuthWithLocalIP is used by diagnostics that need to pin the initial
+// control connection to a known local IPv4 address without changing system
+// routes or tunnel state.
+func InitAuthWithLocalIP(localIP string) error {
+	ip := net.ParseIP(strings.TrimSpace(localIP)).To4()
+	if ip == nil {
+		return fmt.Errorf("invalid local IPv4 address %q", localIP)
+	}
+	return initAuth(&net.TCPAddr{IP: ip})
+}
+
+func initAuth(localAddr net.Addr) error {
 	base.Info("init auth with server", Prof.HostWithPort)
 	WebVpnCookie = ""
 	// https://github.com/mwitkow/go-http-dialer
@@ -105,7 +120,8 @@ func InitAuth() error {
 		MaxVersion:         tls.VersionTLS12,
 	}
 	var err error
-	Conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 6 * time.Second}, "tcp4", Prof.HostWithPort, &config)
+	dialer := &net.Dialer{Timeout: 6 * time.Second, LocalAddr: localAddr}
+	Conn, err = tls.DialWithDialer(dialer, "tcp4", Prof.HostWithPort, &config)
 	if err != nil {
 		base.Error("auth tcp connect failed:", err)
 		return err
