@@ -39,7 +39,7 @@ type Profile struct {
 	SecretKey string `json:"secret"`
 
 	AcceptServerRoutes bool     `json:"accept_server_routes"`
-	ApplyDNS          bool     `json:"apply_dns"`
+	ApplyDNS           bool     `json:"apply_dns"`
 	CustomInclude      []string `json:"custom_include_routes"`
 	CustomExclude      []string `json:"custom_exclude_routes"`
 	DNSOverrides       []string `json:"dns_overrides"`
@@ -181,7 +181,7 @@ func PasswordAuth() error {
 		base.Info("using webvpn session token from cookie")
 	}
 	base.Info("password auth completed")
-	base.Debug("SessionToken:" + session.Sess.SessionToken)
+	base.Debug("session token received", "length", len(session.Sess.SessionToken))
 	return nil
 }
 
@@ -240,7 +240,7 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
 	}
 	base.Info("auth response received", "status", resp.StatusCode, "bodyLen", len(body))
 	if base.Cfg.LogLevel == "Debug" {
-		base.Debug(string(body))
+		base.Debug(redactAuthBody(string(body)))
 	}
 
 	if resp.StatusCode == http.StatusOK {
@@ -272,6 +272,12 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
 	Conn.Close()
 	base.Warn("auth failed with status", resp.Status)
 	return fmt.Errorf("auth error %s", resp.Status)
+}
+
+func redactAuthBody(body string) string {
+	body = utils.RemoveBetween(body, "<session-token>", "</session-token>")
+	body = utils.RemoveBetween(body, "<password>", "</password>")
+	return body
 }
 
 func formatAuthError(err proto.AuthError) string {

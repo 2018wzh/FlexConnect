@@ -87,6 +87,15 @@ func InitLog() {
 	baseLogger = log.New(baseStdLoggerWriter{}, "", 0)
 }
 
+// SetLogLevel updates both the package-level filter and the shared logger.
+// It is used by diagnostics that need protocol-level traces after backend
+// initialization has already created the default logger.
+func SetLogLevel(level string) {
+	Cfg.LogLevel = level
+	baseLevel = logLevel2Int(level)
+	logging.SetLevel(logging.ParseLevel(level))
+}
+
 func GetBaseLogger() *log.Logger {
 	return baseLogger
 }

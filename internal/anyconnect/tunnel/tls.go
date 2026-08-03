@@ -2,8 +2,12 @@ package vpn
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -22,12 +26,7 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 		cSess.Close()
 	}()
 	base.Info("start tls channel", "peer", conn.RemoteAddr().String())
-	var (
-		err           error
-		bytesReceived int
-		dataLen       uint16
-		dead          = time.Duration(cSess.TLSDpdTime+5) * time.Second
-	)
+	dead := time.Duration(cSess.TLSDpdTime+5) * time.Second
 
 	go payloadOutTLSToServer(conn, cSess)
 
@@ -36,13 +35,18 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 	for {
 		// 重置超时限制
 		if cSess.ResetTLSReadDead.Load() {
-			_ = conn.SetReadDeadline(time.Now().Add(dead))
+			if err := conn.SetReadDeadline(time.Now().Add(dead)); err != nil {
+				cSess.RecordClose("tls_deadline_error", "tls", err)
+				base.Error("set tls read deadline failed:", err)
+				return
+			}
 			cSess.ResetTLSReadDead.Store(false)
 		}
 
-		pl := getPayloadBuffer()                // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
-		bytesReceived, err = bufR.Read(pl.Data) // 服务器没有数据返回时，会阻塞
+		pl := getPayloadBuffer() // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
+		frameType, wireBytes, err := readCSTPFrame(bufR, pl)
 		if err != nil {
+			putPayloadBuffer(pl)
 			code := "tls_read_error"
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				code = "tls_read_timeout"
@@ -52,41 +56,74 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 			return
 		}
 
-		// base.Debug("tls server to payloadIn", "Type", pl.Data[6])
 		// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-03#section-2.2
-		if bytesReceived > 0 {
-			base.Debug("tls receive frame", "type", pl.Data[6], "len", bytesReceived)
-		}
-		switch pl.Data[6] {
+		base.Debug("tls receive frame", "type", frameType, "len", wireBytes)
+		pl.Type = frameType
+		switch frameType {
 		case 0x00: // DATA
-			// base.Debug("tls receive DATA")
-			// 获取数据长度
-			dataLen = binary.BigEndian.Uint16(pl.Data[4:6])
-			// 去除数据头
-			copy(pl.Data, pl.Data[8:8+dataLen])
-			// 更新切片长度
-			pl.Data = pl.Data[:dataLen]
-
 			select {
 			case cSess.PayloadIn <- pl:
 			case <-cSess.CloseChan:
+				putPayloadBuffer(pl)
 				return
 			}
-		case 0x04:
+		case 0x04, 0x07: // DPD-RESP / KEEPALIVE
 			base.Debug("tls receive DPD-RESP")
+			putPayloadBuffer(pl)
 		case 0x03: // DPD-REQ
 			pl.Type = 0x04
+			pl.Data = pl.Data[:0]
 			select {
 			case cSess.PayloadOutTLS <- pl:
 			case <-cSess.CloseChan:
+				putPayloadBuffer(pl)
 				return
 			}
 		case 0x05: // DISCONNECT
+			putPayloadBuffer(pl)
 			cSess.RecordClose("server_disconnect", "tls", nil)
 			return
+		case 0x09: // TERMINATE
+			putPayloadBuffer(pl)
+			cSess.RecordClose("server_terminate", "tls", nil)
+			return
+		default:
+			putPayloadBuffer(pl)
+			err = fmt.Errorf("unsupported CSTP frame type 0x%02x", frameType)
+			cSess.RecordClose("tls_protocol_error", "tls", err)
+			base.Error("tls server sent unsupported frame:", err)
+			return
 		}
-		cSess.Stat.BytesReceived.Add(uint64(bytesReceived))
+		cSess.Stat.BytesReceived.Add(uint64(wireBytes))
 	}
+}
+
+const maxCSTPPayloadSize = 64*1024 - 1
+
+func readCSTPFrame(reader io.Reader, pl *proto.Payload) (frameType byte, wireBytes int, err error) {
+	if pl == nil {
+		return 0, 0, errors.New("nil CSTP payload")
+	}
+	var header [8]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return 0, 0, err
+	}
+	if !bytes.Equal(header[:4], proto.Header[:4]) || header[7] != proto.Header[7] {
+		return 0, 0, fmt.Errorf("invalid CSTP header %x", header)
+	}
+	payloadSize := int(binary.BigEndian.Uint16(header[4:6]))
+	if payloadSize > maxCSTPPayloadSize {
+		return 0, 0, fmt.Errorf("CSTP payload exceeds %d bytes: %d", maxCSTPPayloadSize, payloadSize)
+	}
+	if payloadSize > cap(pl.Data) {
+		pl.Data = make([]byte, payloadSize)
+	} else {
+		pl.Data = pl.Data[:payloadSize]
+	}
+	if _, err := io.ReadFull(reader, pl.Data); err != nil {
+		return 0, 0, err
+	}
+	return header[6], len(header) + payloadSize, nil
 }
 
 // payloadOutTLSToServer Step 4
