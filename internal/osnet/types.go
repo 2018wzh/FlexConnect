@@ -151,6 +151,9 @@ func DiffPrefixes(old map[netip.Prefix]bool, next []netip.Prefix) (add, del []ne
 	state = make(map[netip.Prefix]bool, len(next))
 	for _, prefix := range next {
 		prefix = prefix.Masked()
+		if state[prefix] {
+			continue
+		}
 		state[prefix] = true
 		if !old[prefix] {
 			add = append(add, prefix)

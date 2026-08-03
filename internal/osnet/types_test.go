@@ -53,6 +53,23 @@ func TestDiffPrefixes(t *testing.T) {
 	}
 }
 
+func TestDiffPrefixesDeduplicatesNext(t *testing.T) {
+	next := []netip.Prefix{
+		netip.MustParsePrefix("10.1.2.3/8"),
+		netip.MustParsePrefix("10.0.0.0/8"),
+	}
+	add, del, state := DiffPrefixes(nil, next)
+	if len(add) != 1 || add[0] != netip.MustParsePrefix("10.0.0.0/8") {
+		t.Fatalf("add = %v", add)
+	}
+	if len(del) != 0 {
+		t.Fatalf("del = %v", del)
+	}
+	if len(state) != 1 || !state[netip.MustParsePrefix("10.0.0.0/8")] {
+		t.Fatalf("state = %v", state)
+	}
+}
+
 func TestWithoutPrefixesRemovesMaskedDuplicates(t *testing.T) {
 	routes := []netip.Prefix{
 		netip.MustParsePrefix("10.0.0.1/8"),

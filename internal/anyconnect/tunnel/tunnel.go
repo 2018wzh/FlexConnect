@@ -13,6 +13,7 @@ import (
 	"flexconnect/internal/anyconnect/base"
 	"flexconnect/internal/anyconnect/session"
 	"flexconnect/internal/anyconnect/utils"
+	"flexconnect/internal/router"
 )
 
 var (
@@ -147,20 +148,19 @@ func SetupTunnel() error {
 }
 
 func applyProfileOverrides(cSess *session.ConnSession) {
+	serverInclude := cSess.SplitInclude
+	serverExclude := cSess.SplitExclude
 	if !auth.Prof.AcceptServerRoutes {
-		cSess.SplitInclude = nil
-		cSess.SplitExclude = nil
+		serverInclude = nil
+		serverExclude = nil
 		cSess.DynamicSplitTunneling = false
 		cSess.DynamicSplitIncludeDomains = nil
 		cSess.DynamicSplitExcludeDomains = nil
 		cSess.UseDefaultRouteWhenEmpty = false
 	}
-	if len(auth.Prof.CustomInclude) > 0 {
-		cSess.SplitInclude = append(cSess.SplitInclude, auth.Prof.CustomInclude...)
-	}
-	if len(auth.Prof.CustomExclude) > 0 {
-		cSess.SplitExclude = append(cSess.SplitExclude, auth.Prof.CustomExclude...)
-	}
+	merged := router.MergeRouteLists(serverInclude, serverExclude, auth.Prof.CustomInclude, auth.Prof.CustomExclude)
+	cSess.SplitInclude = merged.Include
+	cSess.SplitExclude = merged.Exclude
 	if !auth.Prof.ApplyDNS {
 		cSess.DNS = nil
 		return

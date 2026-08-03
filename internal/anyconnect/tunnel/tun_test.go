@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"net/netip"
+	"reflect"
 	"testing"
 
+	"flexconnect/internal/anyconnect/auth"
 	"flexconnect/internal/anyconnect/base"
 	"flexconnect/internal/anyconnect/session"
 	"flexconnect/internal/osnet"
@@ -62,6 +64,31 @@ func TestBuildOSNetConfig(t *testing.T) {
 	}
 	if len(cfg.DNSServers) != 2 || cfg.DNSServers[0].String() != "202.120.80.2" {
 		t.Fatalf("DNSServers = %v", cfg.DNSServers)
+	}
+}
+
+func TestApplyProfileOverridesLocalRoutesOverrideServerRoutes(t *testing.T) {
+	originalProfile := auth.Prof
+	t.Cleanup(func() { auth.Prof = originalProfile })
+	auth.Prof = &auth.Profile{
+		AcceptServerRoutes: true,
+		ApplyDNS:           true,
+		CustomInclude:      []string{"49.52.0.0/15"},
+		CustomExclude:      []string{"202.120.0.0/16"},
+	}
+	cSess := &session.ConnSession{
+		SplitInclude: []string{"49.52.0.0/15", "172.20.0.0/12"},
+		SplitExclude: []string{"202.120.0.0/16"},
+		DNS:          []string{"202.120.80.2"},
+	}
+
+	applyProfileOverrides(cSess)
+
+	if !reflect.DeepEqual(cSess.SplitInclude, []string{"49.52.0.0/15", "172.16.0.0/12"}) {
+		t.Fatalf("SplitInclude = %v", cSess.SplitInclude)
+	}
+	if !reflect.DeepEqual(cSess.SplitExclude, []string{"202.120.0.0/16"}) {
+		t.Fatalf("SplitExclude = %v", cSess.SplitExclude)
 	}
 }
 
