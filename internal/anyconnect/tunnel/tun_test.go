@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"flexconnect/internal/anyconnect/auth"
-	"flexconnect/internal/anyconnect/base"
 	"flexconnect/internal/anyconnect/proto"
 	"flexconnect/internal/anyconnect/session"
 	"flexconnect/internal/osnet"
@@ -137,8 +136,6 @@ func TestBuildOSNetConfig(t *testing.T) {
 		return osnet.LocalInterface{Gateway: "192.168.1.1", InterfaceIndex: 36}, nil
 	}
 	t.Cleanup(func() { getLocalInterface = osnet.GetLocalInterface })
-	base.LocalInterface.Name = "Ethernet"
-	base.LocalInterface.Gateway = "192.168.1.1"
 	cSess := &session.ConnSession{
 		TunName:       "FlexConnect",
 		VPNAddress:    "172.20.144.185",
@@ -187,9 +184,7 @@ func TestBuildOSNetConfig(t *testing.T) {
 }
 
 func TestApplyProfileOverridesLocalRoutesOverrideServerRoutes(t *testing.T) {
-	originalProfile := auth.Prof
-	t.Cleanup(func() { auth.Prof = originalProfile })
-	auth.Prof = &auth.Profile{
+	profile := &auth.Profile{
 		AcceptServerRoutes: true,
 		ApplyDNS:           true,
 		CustomInclude:      []string{"49.52.0.0/15"},
@@ -201,7 +196,7 @@ func TestApplyProfileOverridesLocalRoutesOverrideServerRoutes(t *testing.T) {
 		DNS:          []string{"202.120.80.2"},
 	}
 
-	applyProfileOverrides(cSess)
+	applyProfileOverridesWithProfile(cSess, profile)
 
 	if !reflect.DeepEqual(cSess.SplitInclude, []string{"49.52.0.0/15", "172.16.0.0/12"}) {
 		t.Fatalf("SplitInclude = %v", cSess.SplitInclude)

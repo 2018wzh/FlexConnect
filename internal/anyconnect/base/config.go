@@ -1,8 +1,7 @@
 package base
 
 var (
-	Cfg            = &ClientConfig{}
-	LocalInterface = &Interface{}
+	Cfg = &ClientConfig{}
 )
 
 type ClientConfig struct {
@@ -30,4 +29,3 @@ func initCfg() {
 	Cfg.AgentName = ""
 	Cfg.AgentVersion = "4.10.07062"
 }
-

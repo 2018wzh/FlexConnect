@@ -21,6 +21,8 @@ SOCKS5 proxying, and real AnyConnect password-auth sessions.
 - `docs/` contains project audit and acceptance notes.
 - `internal/` contains daemon, API, VPN, routing, IPC, storage, logging, and type code.
   - `anyconnect/` is the embedded AnyConnect protocol, tunnel, TUN, and auth stack.
+  - `netcheck/` owns the CLI connection probe: CSTP/DTLS authentication, user-space traffic
+    probing without an OS TUN, bounded download measurement, and sanitized results.
   - `apiserver/` exposes the local `/v1` control API.
   - `appd/` owns profiles, connection state, notifications, local UI, and proxy state.
   - `ipc/` abstracts Unix sockets and Windows named pipes.
@@ -100,20 +102,20 @@ docker push "${IMAGE}:latest"
 Manual workflow dispatch (optional):
 
 ```bash
-gh workflow run docker-release.yml -f image-tag=1.0.6
+gh workflow run docker-release.yml -f image-tag=1.1.1
 ```
 
 Build distribution artifacts through the unified dist entrypoint:
 
 ```powershell
 go run .\cmd\dist list
-go run .\cmd\dist build --version 1.0.6 linux/amd64/tgz
-go run .\cmd\dist build --version 1.0.6 linux/amd64/deb
-go run .\cmd\dist build --version 1.0.6 linux/amd64/rpm
-go run .\cmd\dist build --version 1.0.6 windows/amd64/zip
-go run .\cmd\dist build --version 1.0.6 windows/amd64/msi
-go run .\cmd\dist build --version 1.0.6 darwin/amd64/pkg
-go run .\cmd\dist build --version 1.0.6 darwin/arm64/pkg
+go run .\cmd\dist build --version 1.1.1 linux/amd64/tgz
+go run .\cmd\dist build --version 1.1.1 linux/amd64/deb
+go run .\cmd\dist build --version 1.1.1 linux/amd64/rpm
+go run .\cmd\dist build --version 1.1.1 windows/amd64/zip
+go run .\cmd\dist build --version 1.1.1 windows/amd64/msi
+go run .\cmd\dist build --version 1.1.1 darwin/amd64/pkg
+go run .\cmd\dist build --version 1.1.1 darwin/arm64/pkg
 ```
 
 Install or remove the Windows service:
@@ -229,6 +231,12 @@ profiles, stores password references in the OS keyring, starts and stops the VPN
 effective routes, manages the optional SOCKS5 listener, serves the local browser console, and emits
 watch notifications. The AnyConnect adapter configures the embedded protocol stack, performs
 password auth, establishes TLS/DTLS and TUN state, then reports session details back to the daemon.
+
+`flexconnect netcheck` is the explicit no-OS-TUN diagnostic path. It owns a connection-local auth
+client and session, performs CSTP/DTLS observation and an optional bounded HTTP download through
+the user-space stack, and prints only sanitized socket, underlay, transport, and throughput data.
+The removed `flexconnect-probe` entry point and old package-global auth/session APIs must not be
+reintroduced.
 
 Connection lifecycle observability is owned by the daemon: AnyConnect records
 the first terminal close reason on each session and emits it with the stable

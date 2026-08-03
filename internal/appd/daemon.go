@@ -100,6 +100,11 @@ type Service struct {
 	activeConnectionStarted time.Time
 	connectionHistory       []types.ConnectionEvent
 	reconnectLifecycleID    string
+	networkReconnectActive  bool
+	networkReconnectID      uint64
+	networkReconnectConnID  string
+	networkReconnectProfile string
+	lastNetworkChange       *types.NetworkChange
 	updater                 updateChecker
 	updateCache             types.UpdateInfo
 	updateCacheAt           time.Time
@@ -212,6 +217,19 @@ func (s *Service) Diagnostics() types.Diagnostics {
 			break
 		}
 	}
+	var runtime *types.RuntimeDiagnostics
+	if provider, ok := s.backend.(interface {
+		RuntimeDiagnostics() *types.RuntimeDiagnostics
+	}); ok {
+		runtime = provider.RuntimeDiagnostics()
+	}
+	if runtime != nil && s.lastNetworkChange != nil {
+		if runtime.Tunnel == nil {
+			runtime.Tunnel = &types.TunnelRuntime{}
+		}
+		runtime.Tunnel.LastNetworkChange = s.lastNetworkChange.Time
+		runtime.Tunnel.LastNetworkChangeInfo = strings.Join(s.lastNetworkChange.Reasons, ",")
+	}
 	return types.Diagnostics{
 		Version:           buildinfo.Version,
 		Status:            status,
@@ -223,6 +241,7 @@ func (s *Service) Diagnostics() types.Diagnostics {
 		GeneratedAt:       now(),
 		ConnectionHistory: append([]types.ConnectionEvent(nil), s.connectionHistory...),
 		Reconnect:         s.reconnectSnapshotLocked(),
+		Runtime:           runtime,
 	}
 }
 
@@ -557,6 +576,7 @@ func (s *Service) Connect(ctx context.Context, id string) error {
 	appdDebugf("connect start profile=%s current=%s connected=%s", id, s.status.CurrentProfileID, s.connectedID)
 	s.mu.Lock()
 	s.stopReconnectLocked()
+	s.cancelNetworkReconnectLocked()
 	profile, err := s.findProfileLocked(id)
 	if err != nil {
 		s.mu.Unlock()
@@ -600,6 +620,7 @@ func (s *Service) disconnect(ctx context.Context, manual bool) error {
 	connected := s.connectedID != ""
 	if manual {
 		s.stopReconnectLocked()
+		s.cancelNetworkReconnectLocked()
 	}
 	if manual && connected {
 		s.disconnectSeq++
@@ -785,6 +806,7 @@ func (s *Service) consumeBackendEvents() {
 		var scheduleAutoReconnect bool
 		var manualSeq uint64
 		var manualDisconnectEvent bool
+		var networkRepairEvent bool
 		switch event.Type {
 		case "connected":
 			if s.currentID != "" {
@@ -807,6 +829,39 @@ func (s *Service) consumeBackendEvents() {
 			}
 			s.sampleTrafficLocked(time.Now().UTC())
 			s.logs.Add("info", "appd: backend event=connected")
+		case "network_change":
+			if event.ConnectionID != "" && s.activeConnectionID != "" && event.ConnectionID != s.activeConnectionID {
+				appdLog.Printf("ignoring stale network change connection=%s active=%s", event.ConnectionID, s.activeConnectionID)
+				s.mu.Unlock()
+				continue
+			}
+			if event.Network == nil || s.connectedID == "" {
+				s.mu.Unlock()
+				continue
+			}
+			if s.networkReconnectActive {
+				s.mu.Unlock()
+				continue
+			}
+			s.networkReconnectActive = true
+			s.networkReconnectID++
+			repairID := s.networkReconnectID
+			s.networkReconnectConnID = event.ConnectionID
+			s.networkReconnectProfile = s.connectedID
+			change := networkChangeFromBackend(event.Network)
+			s.lastNetworkChange = change
+			s.status.State = types.StateReconnecting
+			s.status.LastError = ""
+			s.status.UpdatedAt = now()
+			s.recordConnectionLocked(types.ConnectionEvent{
+				ConnectionID: event.ConnectionID, ProfileID: s.connectedID, Kind: "network_change",
+				ReasonCode: "underlay_changed", Transport: "network", Error: change.Error,
+			})
+			s.logs.Add("info", fmt.Sprintf("appd: underlay changed profile=%s reasons=%s", s.connectedID, strings.Join(change.Reasons, ",")))
+			s.emitLocked(types.Notify{Event: "network", Network: change, Status: ptrStatus(s.status), Message: "Network path changed; reconnecting."})
+			s.mu.Unlock()
+			go s.runNetworkReconnect(repairID, event.ConnectionID, change)
+			continue
 		case "disconnected":
 			if event.ConnectionID != "" && s.activeConnectionID != "" && event.ConnectionID != s.activeConnectionID {
 				appdLog.Printf("ignoring stale backend disconnect connection=%s active=%s", event.ConnectionID, s.activeConnectionID)
@@ -817,6 +872,7 @@ func (s *Service) consumeBackendEvents() {
 			if disconnectedProfileID == "" && s.manualProfileID != "" {
 				disconnectedProfileID = s.manualProfileID
 			}
+			networkRepairEvent = s.networkReconnectActive && event.ConnectionID == s.networkReconnectConnID
 			autoProfile, autoProfileFound := s.profileAutoReconnect(disconnectedProfileID)
 			manual := disconnectedProfileID != "" && disconnectedProfileID == s.manualProfileID && s.manualDisconnectSeq == s.disconnectSeq
 			manualDisconnectEvent = manual
@@ -833,6 +889,9 @@ func (s *Service) consumeBackendEvents() {
 			connectionID := s.activeConnectionID
 			s.connectedID = ""
 			s.status.State = types.StateDisconnected
+			if networkRepairEvent {
+				s.status.State = types.StateReconnecting
+			}
 			s.status.ConnectedProfileID = ""
 			s.status.Session = nil
 			s.status.EffectiveRoutes = nil
@@ -855,6 +914,9 @@ func (s *Service) consumeBackendEvents() {
 			if manual {
 				reasonCode, transport, closeError = "local_requested", "local", ""
 			}
+			if networkRepairEvent {
+				reasonCode, transport, closeError = "underlay_changed", "network", ""
+			}
 			ended := time.Now().UTC()
 			eventRecord := types.ConnectionEvent{ConnectionID: connectionID, ProfileID: disconnectedProfileID, Kind: "connection_lost", ReasonCode: reasonCode, Transport: transport, Error: closeError, SessionEnded: ended.Format(time.RFC3339Nano), TransportFaults: transportFaults}
 			if !s.activeConnectionStarted.IsZero() {
@@ -863,6 +925,8 @@ func (s *Service) consumeBackendEvents() {
 			}
 			if manual {
 				eventRecord.Kind = "disconnected"
+			} else if networkRepairEvent {
+				eventRecord.Kind = "network_reconnect"
 			}
 			s.recordConnectionLocked(eventRecord)
 			s.activeConnectionID = ""
@@ -874,6 +938,9 @@ func (s *Service) consumeBackendEvents() {
 			message = "Backend connection established."
 		case "disconnected":
 			message = "Backend disconnected."
+			if networkRepairEvent {
+				message = "Network path changed; reconnecting."
+			}
 		}
 		if event.Err != nil {
 			appdLog.Printf("backend event error: %v", event.Err)
@@ -882,12 +949,12 @@ func (s *Service) consumeBackendEvents() {
 			s.logs.Add("error", fmt.Sprintf("appd: backend error err=%q", event.Err.Error()))
 			message = "Backend error: " + event.Err.Error()
 		}
-		if event.Type == "disconnected" && event.Err == nil && event.Close != nil && event.Close.Error != "" && !manualDisconnectEvent {
+		if event.Type == "disconnected" && event.Err == nil && event.Close != nil && event.Close.Error != "" && !manualDisconnectEvent && !networkRepairEvent {
 			s.status.State = types.StateError
 			s.status.LastError = sanitizeDiagnostic(event.Close.Error)
 			message = "VPN connection lost: " + s.status.LastError
 		}
-		if event.Type == "disconnected" && event.Close != nil && event.Close.Code != "" && !manualDisconnectEvent && event.Close.Error == "" {
+		if event.Type == "disconnected" && event.Close != nil && event.Close.Code != "" && !manualDisconnectEvent && !networkRepairEvent && event.Close.Error == "" {
 			message = "VPN connection lost (" + event.Close.Code + ")."
 		}
 		s.status.UpdatedAt = now()
@@ -919,6 +986,90 @@ func (s *Service) profileAutoReconnect(profileID string) (types.Profile, bool) {
 		}
 	}
 	return types.Profile{}, false
+}
+
+func networkChangeFromBackend(change *vpn.NetworkChange) *types.NetworkChange {
+	if change == nil {
+		return nil
+	}
+	return &types.NetworkChange{
+		Before: networkSnapshotInfo(change.Before), After: networkSnapshotInfo(change.After),
+		Reasons: append([]string(nil), change.Reasons...), RebindRequired: change.RebindRequired,
+		Error: sanitizeDiagnostic(change.Error), Time: now(),
+	}
+}
+
+func networkSnapshotInfo(snapshot vpn.NetworkSnapshot) *types.UnderlayInfo {
+	if snapshot.InterfaceName == "" && snapshot.LocalIPv4 == "" && snapshot.Gateway == "" {
+		return nil
+	}
+	return &types.UnderlayInfo{
+		InterfaceName: snapshot.InterfaceName, InterfaceIndex: snapshot.InterfaceIndex,
+		LocalIPv4: snapshot.LocalIPv4, Gateway: snapshot.Gateway,
+		GatewayInterface: snapshot.GatewayInterface, RouteMetric: snapshot.RouteMetric,
+		Generation: snapshot.Generation,
+	}
+}
+
+func (s *Service) runNetworkReconnect(repairID uint64, connectionID string, change *types.NetworkChange) {
+	s.mu.Lock()
+	if !s.networkReconnectActive || s.networkReconnectID != repairID || s.networkReconnectConnID != connectionID {
+		s.mu.Unlock()
+		return
+	}
+	profileID := s.networkReconnectProfile
+	profile, err := s.findProfileLocked(profileID)
+	s.mu.Unlock()
+	if err == nil {
+		err = s.disconnect(context.Background(), false)
+	}
+	if err == nil {
+		s.mu.Lock()
+		stillActive := s.networkReconnectActive && s.networkReconnectID == repairID && s.currentID == profileID
+		s.mu.Unlock()
+		if !stillActive {
+			return
+		}
+		password, passwordErr := s.loadProfileSecret(profile)
+		if passwordErr != nil {
+			err = passwordErr
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			err = s.connectPreparedProfile(ctx, profile, password, true)
+			cancel()
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.networkReconnectID != repairID {
+		return
+	}
+	s.networkReconnectActive = false
+	s.networkReconnectConnID = ""
+	s.networkReconnectProfile = ""
+	if err == nil {
+		s.recordConnectionLocked(types.ConnectionEvent{
+			ConnectionID: s.activeConnectionID, ProfileID: profileID, Kind: "network_reconnected",
+			ReasonCode: "underlay_changed", Transport: "network",
+		})
+		s.logs.Add("info", fmt.Sprintf("appd: network reconnect succeeded profile=%s", profileID))
+		return
+	}
+	s.status.State = types.StateError
+	s.status.LastError = sanitizeDiagnostic(err.Error())
+	s.status.UpdatedAt = now()
+	s.recordConnectionLocked(types.ConnectionEvent{
+		ConnectionID: connectionID, ProfileID: profileID, Kind: "network_reconnect_failed",
+		ReasonCode: "reconnect_failed", Transport: "network", Error: s.status.LastError,
+	})
+	s.logs.Add("error", fmt.Sprintf("appd: network reconnect failed profile=%s err=%q", profileID, err.Error()))
+	s.emitLocked(types.Notify{Event: "status", Status: ptrStatus(s.status), Error: s.status.LastError, Message: "Network reconnect failed: " + s.status.LastError})
+	if profile.AutoReconnect != nil && types.BoolValue(profile.AutoReconnect, false) {
+		manualSeq := s.disconnectSeq
+		s.startReconnectLocked(profileID, manualSeq, 1)
+	}
+	_ = change
 }
 
 func (s *Service) startReconnectLocked(profileID string, manualSeq uint64, attempt int) {
@@ -1025,6 +1176,13 @@ func (s *Service) stopReconnectLocked() {
 	s.reconnectNextAt = time.Time{}
 	s.reconnectLifecycleID = ""
 	s.reconnectID++
+}
+
+func (s *Service) cancelNetworkReconnectLocked() {
+	s.networkReconnectActive = false
+	s.networkReconnectID++
+	s.networkReconnectConnID = ""
+	s.networkReconnectProfile = ""
 }
 
 func reconnectDelay(attempt int) time.Duration {

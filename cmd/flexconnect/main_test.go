@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"flexconnect/client/local"
+	"flexconnect/internal/netcheck"
 	"flexconnect/internal/types"
 )
 
@@ -116,6 +117,7 @@ func TestCommandNeedsDaemon(t *testing.T) {
 		{args: []string{"status"}, want: true},
 		{args: []string{"login"}, want: true},
 		{args: []string{"watch"}, want: true},
+		{args: []string{"netcheck"}, want: false},
 		{args: []string{"status", "--help"}, want: false},
 		{args: []string{"profile", "add", "--help"}, want: false},
 		{args: []string{"profile"}, want: false},
@@ -188,6 +190,26 @@ func TestFormatTrafficSnapshotText(t *testing.T) {
 		"Speed Sent: 512 B/s",
 		"Speed Received: 1536 B/s",
 		"Sampled: 2026-06-27T00:00:00Z",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatNetcheckResultTextIncludesSocketsAndSpeed(t *testing.T) {
+	got := formatNetcheckResult(netcheck.Result{
+		Mode: "CSTP", Endpoint: "vpn.example.test", LocalInterface: "Ethernet",
+		LocalIPv4: "192.0.2.10", Gateway: "192.0.2.1", AuthLocalAddress: "192.0.2.10:50000",
+		AuthRemoteAddress: "198.51.100.10:443", CSTPStatus: "200 OK", VPNAddress: "172.20.130.149",
+		MTU: 1399, Transport: "dtls", ObservationDuration: 2 * time.Second, DPDSent: 1,
+		Speedtest: &netcheck.SpeedtestResult{TargetHost: "speed.example.test", Bytes: 1024, Duration: time.Second, MiBPS: 0.01, Transport: "dtls"},
+	})
+	for _, want := range []string{
+		"Auth Socket: 192.0.2.10:50000 -> 198.51.100.10:443",
+		"CSTP: 200 OK vpn_ip=172.20.130.149 mtu=1399",
+		"Speedtest: target=speed.example.test transport=dtls",
+		"0.01 MiB/s",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in:\n%s", want, got)

@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"flexconnect/internal/anyconnect/auth"
@@ -11,80 +12,77 @@ import (
 	"flexconnect/internal/osnet"
 )
 
-// Connect 调用之前必须由前端填充 auth.Prof，建议填充 base.Interface
-func Connect() error {
-	base.Info("ac rpc connect start")
-	err := prepareConnection()
-	if err != nil {
-		base.Error("prepare connection failed:", err)
-		return err
-	}
-	err = auth.PasswordAuth()
-	if err != nil {
-		base.Error("password auth failed:", err)
-		return err
-	}
-	base.Info("password auth done, setup tunnel")
-
-	return SetupTunnel(false)
+// Connection owns the authentication and VPN session state for one connect
+// attempt.
+type Connection struct {
+	Auth    *auth.Client
+	Session *session.Session
 }
 
-// SetupTunnel 操作系统长时间睡眠后再自动连接会失败，仅用于短时间断线自动重连
-func SetupTunnel(reconnect bool) error {
-	// 为适应复杂网络环境，必须能够感知网卡变化，建议由前端获取当前网络信息发送过来，而不是登陆前由 Go 处理
-	// 断网重连时网卡信息可能已经变化，所以建立隧道时重新获取网卡信息
-	if reconnect && !auth.Prof.Initialized {
-		err := refreshLocalInterface()
-		if err != nil {
-			base.Error("reconnect get local interface failed:", err)
-			return err
-		}
-	}
-	base.Info("setup tunnel via rpc", "reconnect", reconnect)
-	return acvpn.SetupTunnel()
+func NewConnection(profile auth.Profile) *Connection {
+	return &Connection{Auth: auth.NewClient(profile, base.Interface{}), Session: &session.Session{}}
 }
 
-func prepareConnection() error {
-	if strings.Contains(auth.Prof.Host, ":") {
-		auth.Prof.HostWithPort = auth.Prof.Host
+func (c *Connection) Connect(ctx context.Context) error {
+	if c == nil || c.Auth == nil || c.Session == nil {
+		return fmt.Errorf("invalid VPN connection")
+	}
+	if ctx == nil {
+		return fmt.Errorf("nil VPN connection context")
+	}
+	if err := refreshConnectionInterface(c); err != nil {
+		return err
+	}
+	if strings.Contains(c.Auth.Prof.Host, ":") {
+		c.Auth.Prof.HostWithPort = c.Auth.Prof.Host
 	} else {
-		auth.Prof.HostWithPort = auth.Prof.Host + ":443"
+		c.Auth.Prof.HostWithPort = c.Auth.Prof.Host + ":443"
 	}
-	if !auth.Prof.Initialized {
-		base.Info("prepare connection: fetch local interface")
-		err := refreshLocalInterface()
-		if err != nil {
-			base.Error("prepare connection failed to get local interface:", err)
-			return err
-		}
+	if err := c.Auth.InitAuth(nil); err != nil {
+		return err
 	}
-	base.Info("prepare connection completed", "host", auth.Prof.HostWithPort)
-	return auth.InitAuth()
+	if err := c.Auth.PasswordAuth(c.Session); err != nil {
+		_ = c.Auth.Close()
+		return err
+	}
+	if err := acvpn.SetupTunnelWithClient(c.Auth, c.Session); err != nil {
+		_ = c.Auth.Close()
+		return err
+	}
+	return nil
 }
 
-// DisConnect 主动断开或者 ctrl+c，不包括网络或tun异常退出
-func DisConnect() {
-	session.Sess.ActiveClose = true
-	if auth.Conn != nil {
-		_ = auth.Conn.Close()
-		auth.Conn = nil
+func (c *Connection) Disconnect(ctx context.Context) error {
+	if c == nil {
+		return nil
 	}
-	if session.Sess.CSess != nil {
-		if session.Sess.CSess.NetworkManager != nil {
-			_ = session.Sess.CSess.NetworkManager.Close(context.Background())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.Session.ActiveClose = true
+	var first error
+	if c.Auth != nil {
+		if err := c.Auth.Close(); err != nil {
+			first = err
 		}
-		session.Sess.CSess.Close()
 	}
+	if c.Session.CSess != nil {
+		if c.Session.CSess.NetworkManager != nil {
+			if err := c.Session.CSess.NetworkManager.Close(ctx); err != nil && first == nil {
+				first = err
+			}
+		}
+		c.Session.CSess.RecordClose("local_requested", "local", nil)
+		c.Session.CSess.Close()
+	}
+	return first
 }
 
-func refreshLocalInterface() error {
+func refreshConnectionInterface(c *Connection) error {
 	info, err := osnet.GetLocalInterface(context.Background())
 	if err != nil {
 		return err
 	}
-	base.LocalInterface.Name = info.Name
-	base.LocalInterface.Ip4 = info.IP4
-	base.LocalInterface.Mac = info.MAC
-	base.LocalInterface.Gateway = info.Gateway
+	c.Auth.LocalInterface = base.Interface{Name: info.Name, Ip4: info.IP4, Mac: info.MAC, Gateway: info.Gateway}
 	return nil
 }

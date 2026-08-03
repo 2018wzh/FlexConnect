@@ -82,6 +82,9 @@ func (m *platformManager) Set(ctx context.Context, cfg *Config) error {
 	if cfg.Gateway.IsValid() {
 		m.gateway = net.ParseIP(cfg.Gateway.String())
 	}
+	if cfg.ServerAddress.IsValid() && (m.localLink == nil || m.gateway == nil) {
+		return fmt.Errorf("missing physical underlay for VPN server route")
+	}
 
 	var server []netip.Prefix
 	if cfg.ServerAddress.IsValid() {
@@ -112,18 +115,20 @@ func (m *platformManager) SetDynamicRoutes(_ context.Context, routes DynamicRout
 func (m *platformManager) Close(ctx context.Context) error {
 	var firstErr error
 	groups := []struct {
-		routes *map[netip.Prefix]bool
-		link   netlink.Link
+		routes   *map[netip.Prefix]bool
+		link     netlink.Link
+		gateway  net.IP
+		priority int
 	}{
-		{&m.serverRoutes, m.localLink},
-		{&m.includeRoutes, m.link},
-		{&m.excludeRoutes, m.localLink},
-		{&m.dynamicInclude, m.link},
-		{&m.dynamicExclude, m.localLink},
+		{&m.serverRoutes, m.localLink, m.gateway, 5},
+		{&m.includeRoutes, m.link, nil, 6},
+		{&m.excludeRoutes, m.localLink, m.gateway, 5},
+		{&m.dynamicInclude, m.link, nil, 6},
+		{&m.dynamicExclude, m.localLink, m.gateway, 5},
 	}
 	for _, group := range groups {
 		for prefix := range *group.routes {
-			if err := routeDel(prefix, group.link); err != nil && firstErr == nil {
+			if err := routeDel(prefix, group.link, group.gateway, group.priority); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
@@ -141,7 +146,7 @@ func (m *platformManager) syncRoutes(old *map[netip.Prefix]bool, next []netip.Pr
 	}
 	add, del, state := DiffPrefixes(*old, next)
 	for _, prefix := range del {
-		if err := routeDel(prefix, link); err != nil {
+		if err := routeDel(prefix, link, gw, priority); err != nil {
 			return err
 		}
 	}
@@ -159,7 +164,7 @@ func (m *platformManager) syncRoutes(old *map[netip.Prefix]bool, next []netip.Pr
 	return nil
 }
 
-func routeDel(prefix netip.Prefix, link netlink.Link) error {
+func routeDel(prefix netip.Prefix, link netlink.Link, gateway net.IP, priority int) error {
 	if link == nil {
 		return fmt.Errorf("missing link for route cleanup %s", prefix)
 	}
@@ -173,7 +178,19 @@ func routeDel(prefix netip.Prefix, link netlink.Link) error {
 		return err
 	}
 	for _, route := range routes {
-		_ = netlink.RouteDel(&route)
+		if priority > 0 && route.Priority != priority {
+			continue
+		}
+		if gateway == nil {
+			if route.Gw != nil && !route.Gw.IsUnspecified() {
+				continue
+			}
+		} else if route.Gw == nil || !route.Gw.Equal(gateway) {
+			continue
+		}
+		if err := netlink.RouteDel(&route); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	return nil
 }

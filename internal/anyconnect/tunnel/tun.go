@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -68,11 +67,16 @@ func setupTun(cSess *session.ConnSession) (wgtun.Device, error) {
 // routes have been installed. This mirrors the Tailscale TUN lifecycle: the
 // device can exist while it is being configured, but no packet worker owns it
 // until the configuration is known to be usable.
-func startTun(dev wgtun.Device, cSess *session.ConnSession) {
+func startTun(dev wgtun.Device, cSess *session.ConnSession) (*TunnelController, error) {
 	base.Info("start tun packet workers", "iface", cSess.TunName)
-	go watchTunEvents(dev, cSess)
-	go tunToPayloadOut(dev, cSess) // read from apps
-	go payloadInToTun(dev, cSess)  // write to apps
+	controller, err := newTunnelController(dev, cSess.NetworkManager, cSess)
+	if err != nil {
+		return nil, err
+	}
+	if err := controller.Start(); err != nil {
+		return nil, err
+	}
+	return controller, nil
 }
 
 // watchTunEvents turns a native-device failure into a session failure. The
@@ -136,7 +140,6 @@ func tunToPayloadOut(dev wgtun.Device, cSess *session.ConnSession) {
 	// tun 设备读错误
 	defer func() {
 		base.Info("tun to payloadOut exit")
-		_ = dev.Close()
 	}()
 
 	sent := 0
@@ -148,6 +151,7 @@ func tunToPayloadOut(dev wgtun.Device, cSess *session.ConnSession) {
 		sizes := []int{0}
 		readCount, err := dev.Read(bufs, sizes, offset) // 如果 tun 没有 up，会在这等待
 		if err != nil {
+			cSess.Stat.TUNReadErrors.Inc()
 			putPayloadBuffer(pl)
 			cSess.RecordClose("tun_read_error", "tun", err)
 			base.Error("tun to payloadOut error:", err)
@@ -158,6 +162,7 @@ func tunToPayloadOut(dev wgtun.Device, cSess *session.ConnSession) {
 			putPayloadBuffer(pl)
 			continue
 		}
+		cSess.Stat.TUNReads.Inc()
 		if readCount != 1 || sizes[0] <= 0 || sizes[0] > len(bufs[0])-offset {
 			err := fmt.Errorf("TUN read returned count=%d size=%d", readCount, sizes[0])
 			putPayloadBuffer(pl)
@@ -197,15 +202,9 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 	defer func() {
 		base.Info("payloadIn to tun exit")
 		closeUserTunnel(cSess)
-		if !cSess.Sess.ActiveClose {
-			if cSess.NetworkManager != nil {
-				_ = cSess.NetworkManager.Close(context.Background())
-			}
-		}
 		// 可能由写错误触发，和 tunToPayloadOut 一起，只要有一处确保退出 cSess 即可，否则 tls 不会退出
 		// 如果由外部触发，cSess.Close() 因为使用 sync.Once，所以没影响
 		cSess.Close()
-		_ = dev.Close()
 	}()
 
 	var (
@@ -270,6 +269,11 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 		received++
 		if err == nil && writeCount != 1 {
 			err = fmt.Errorf("TUN write returned count=%d", writeCount)
+		}
+		if err != nil {
+			cSess.Stat.TUNWriteErrors.Inc()
+		} else {
+			cSess.Stat.TUNWrites.Inc()
 		}
 		// 释放由 serverToPayloadIn 申请的内存 before handling either success
 		// or failure; the failure path otherwise leaks a pooled buffer.
@@ -368,7 +372,15 @@ func buildOSNetConfig(cSess *session.ConnSession) (*osnet.Config, error) {
 		ExcludeRoutes: append([]netip.Prefix(nil), exclude...),
 		DNSServers:    dns,
 	}
-	if info, err := getLocalInterface(context.Background()); err == nil {
+	if cSess.Underlay.LocalIPv4.IsValid() {
+		cfg.Underlay = cSess.Underlay
+		cfg.GatewayInterfaceIndex = cSess.Underlay.GatewayInterface
+		cfg.Gateway = cSess.Underlay.Gateway
+	} else {
+		info, err := getLocalInterface(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("resolve physical underlay: %w", err)
+		}
 		cfg.GatewayInterfaceIndex = info.InterfaceIndex
 		if info.Gateway != "" {
 			if addr, err := netip.ParseAddr(info.Gateway); err == nil {
@@ -377,17 +389,6 @@ func buildOSNetConfig(cSess *session.ConnSession) (*osnet.Config, error) {
 		}
 	}
 	cfg.ServerAddress = serverAddress
-	if !cfg.Gateway.IsValid() {
-		if addr, err := netip.ParseAddr(base.LocalInterface.Gateway); err == nil {
-			cfg.Gateway = addr.Unmap()
-		}
-	}
-	if cfg.GatewayInterfaceIndex == 0 {
-		iface, err := net.InterfaceByName(base.LocalInterface.Name)
-		if err == nil {
-			cfg.GatewayInterfaceIndex = iface.Index
-		}
-	}
 	return cfg, nil
 }
 

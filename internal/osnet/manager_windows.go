@@ -28,6 +28,8 @@ type platformManager struct {
 	exclude      map[netip.Prefix]bool
 	dynamicIn    map[netip.Prefix]bool
 	dynamicEx    map[netip.Prefix]bool
+	dnsOriginal  []netip.Addr
+	dnsCaptured  bool
 }
 
 func newPlatformManager(dev wgtun.Device, name string) (Manager, error) {
@@ -129,8 +131,12 @@ func (m *platformManager) Close(context.Context) error {
 		}
 		*group.routes = map[netip.Prefix]bool{}
 	}
-	if err := m.tunLUID.FlushDNS(windows.AF_INET); err != nil && firstErr == nil {
-		firstErr = err
+	if m.dnsCaptured {
+		if err := m.tunLUID.SetDNS(windows.AF_INET, m.dnsOriginal, nil); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		m.dnsOriginal = nil
+		m.dnsCaptured = false
 	}
 	return firstErr
 }
@@ -166,8 +172,16 @@ func deleteRoute(luid winipcfg.LUID, prefix netip.Prefix, nextHop netip.Addr) er
 }
 
 func (m *platformManager) setDNS(servers []netip.Addr) error {
+	if !m.dnsCaptured {
+		original, err := m.tunLUID.DNS()
+		if err != nil {
+			return err
+		}
+		m.dnsOriginal = append([]netip.Addr(nil), original...)
+		m.dnsCaptured = true
+	}
 	if len(servers) == 0 {
-		return m.tunLUID.FlushDNS(windows.AF_INET)
+		return m.tunLUID.SetDNS(windows.AF_INET, m.dnsOriginal, nil)
 	}
 	return m.tunLUID.SetDNS(windows.AF_INET, servers, nil)
 }

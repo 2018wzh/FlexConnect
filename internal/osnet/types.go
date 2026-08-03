@@ -24,6 +24,7 @@ type Config struct {
 	InterfaceIndex        int
 	VPNAddress            netip.Prefix
 	MTU                   int
+	Underlay              UnderlaySnapshot
 	ServerAddress         netip.Addr
 	Gateway               netip.Addr
 	GatewayInterfaceIndex int

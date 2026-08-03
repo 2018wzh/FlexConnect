@@ -17,6 +17,7 @@ FlexConnect 是一个跨平台可配置的 AnyConnect VPN 客户端，提供守�
 - 应用服务器路由与本地路由策略
 - 提供本地 SOCKS5 代理；代理连接与域名解析只走已连接的 VPN 隧道
 - 导出诊断信息
+- 通过 `flexconnect netcheck` 执行不创建系统 TUN 的 CSTP/DTLS 连接探查和 VPN 流量测速
 - 通过命令行完成 Profile 管理与路由配置
 
 ## 快速开始
@@ -53,6 +54,7 @@ flexconnect login --server https://vpn.example.com --user alice --password-file 
 flexconnect up -p corp
 flexconnect down
 flexconnect diag diag.json
+flexconnect netcheck --env-file .env
 flexconnect proxy status
 flexconnect proxy enable 127.0.0.1:1080
 flexconnect proxy disable
@@ -60,6 +62,19 @@ flexconnect logs
 ```
 
 ## 连接诊断
+
+`flexconnect netcheck` 是独立于守护进程的连接级探查入口。它从指定 dotenv 文件读取
+`ENDPOINT`、`USERNAME`、`PASSWORD` 和可选的 `GROUP`，建立 CSTP/DTLS 链路，在用户态
+网络栈中执行受限下载测速，不创建系统 TUN、不修改系统路由或 DNS，并输出实际本地/远端
+socket、底层网卡、VPN 地址、MTU、DPD、DTLS 和测速帧统计。测速目标可通过
+`--speedtest-url` 覆盖；使用 `--no-speedtest` 只检查连接稳定性。输出不包含密码、Cookie、
+令牌或数据包内容。
+
+```bash
+flexconnect netcheck --env-file .env
+flexconnect netcheck --env-file .env --speedtest-url https://speed.example/download?bytes=4194304
+flexconnect netcheck --env-file .env --no-speedtest --json
+```
 
 守护进程只在运行期间保留有界的近期连接历史。`flexconnect watch` 以
 NDJSON 输出 `connection_lost`、`reconnect_scheduled`、`reconnect_attempt`、
@@ -181,16 +196,16 @@ sudo usermod -aG flexconnect "$USER"
 
 ```bash
 go run ./cmd/dist list
-go run ./cmd/dist build --version 1.0.6 linux/amd64/tgz
-go run ./cmd/dist build --version 1.0.6 linux/amd64/deb
-go run ./cmd/dist build --version 1.0.6 linux/amd64/rpm
-go run ./cmd/dist build --version 1.0.6 windows/amd64/zip
-go run ./cmd/dist build --version 1.0.6 windows/amd64/msi
-go run ./cmd/dist build --version 1.0.6 darwin/amd64/pkg
-go run ./cmd/dist build --version 1.0.6 darwin/arm64/pkg
+go run ./cmd/dist build --version 1.1.1 linux/amd64/tgz
+go run ./cmd/dist build --version 1.1.1 linux/amd64/deb
+go run ./cmd/dist build --version 1.1.1 linux/amd64/rpm
+go run ./cmd/dist build --version 1.1.1 windows/amd64/zip
+go run ./cmd/dist build --version 1.1.1 windows/amd64/msi
+go run ./cmd/dist build --version 1.1.1 darwin/amd64/pkg
+go run ./cmd/dist build --version 1.1.1 darwin/arm64/pkg
 ```
 
-推送形如 `v1.0.6` 的 Git tag 后，GitHub Actions 会自动构建这些产物并创建对应的 GitHub Release。
+推送形如 `v1.1.1` 的 Git tag 后，GitHub Actions 会自动构建这些产物并创建对应的 GitHub Release。
 
 ## 运行与配置
 

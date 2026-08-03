@@ -67,18 +67,60 @@ type ProfileUpdateRequest struct {
 }
 
 type SessionInfo struct {
-	ConnectionID  string   `json:"connection_id,omitempty"`
-	ServerAddress string   `json:"server_address"`
-	Hostname      string   `json:"hostname"`
-	TUNName       string   `json:"tun_name"`
-	VPNAddress    string   `json:"vpn_address"`
-	VPNMask       string   `json:"vpn_mask"`
-	DNS           []string `json:"dns"`
-	MTU           int      `json:"mtu"`
-	SplitInclude  []string `json:"split_include"`
-	SplitExclude  []string `json:"split_exclude"`
-	TLSCipher     string   `json:"tls_cipher"`
-	DTLSCipher    string   `json:"dtls_cipher"`
+	ConnectionID  string        `json:"connection_id,omitempty"`
+	ServerAddress string        `json:"server_address"`
+	LocalAddress  string        `json:"local_address,omitempty"`
+	RemoteAddress string        `json:"remote_address,omitempty"`
+	Hostname      string        `json:"hostname"`
+	TUNName       string        `json:"tun_name"`
+	VPNAddress    string        `json:"vpn_address"`
+	VPNMask       string        `json:"vpn_mask"`
+	DNS           []string      `json:"dns"`
+	MTU           int           `json:"mtu"`
+	SplitInclude  []string      `json:"split_include"`
+	SplitExclude  []string      `json:"split_exclude"`
+	TLSCipher     string        `json:"tls_cipher"`
+	DTLSCipher    string        `json:"dtls_cipher"`
+	Underlay      *UnderlayInfo `json:"underlay,omitempty"`
+}
+
+type UnderlayInfo struct {
+	InterfaceName    string `json:"interface_name"`
+	InterfaceIndex   int    `json:"interface_index"`
+	LocalIPv4        string `json:"local_ipv4"`
+	Gateway          string `json:"gateway"`
+	GatewayInterface int    `json:"gateway_interface"`
+	RouteMetric      int    `json:"route_metric"`
+	Generation       uint64 `json:"generation"`
+}
+
+type TunnelRuntime struct {
+	State                 string `json:"state"`
+	TLSState              string `json:"tls_state"`
+	DTLSState             string `json:"dtls_state"`
+	TUNReads              uint64 `json:"tun_reads"`
+	TUNWrites             uint64 `json:"tun_writes"`
+	TUNReadErrors         uint64 `json:"tun_read_errors"`
+	TUNWriteErrors        uint64 `json:"tun_write_errors"`
+	DPDSent               uint64 `json:"dpd_sent"`
+	DPDResponses          uint64 `json:"dpd_responses"`
+	QueueDrops            uint64 `json:"queue_drops"`
+	LastNetworkChange     string `json:"last_network_change,omitempty"`
+	LastNetworkChangeInfo string `json:"last_network_change_info,omitempty"`
+}
+
+type RuntimeDiagnostics struct {
+	Underlay *UnderlayInfo  `json:"underlay,omitempty"`
+	Tunnel   *TunnelRuntime `json:"tunnel,omitempty"`
+}
+
+type NetworkChange struct {
+	Before         *UnderlayInfo `json:"before,omitempty"`
+	After          *UnderlayInfo `json:"after,omitempty"`
+	Reasons        []string      `json:"reasons,omitempty"`
+	RebindRequired bool          `json:"rebind_required"`
+	Error          string        `json:"error,omitempty"`
+	Time           string        `json:"time"`
 }
 
 // ConnectionEvent is a bounded, sanitized lifecycle record for one VPN
@@ -180,6 +222,7 @@ type Notify struct {
 	Message    string           `json:"message,omitempty"`
 	Error      string           `json:"error,omitempty"`
 	Connection *ConnectionEvent `json:"connection,omitempty"`
+	Network    *NetworkChange   `json:"network,omitempty"`
 	Time       string           `json:"time"`
 }
 
@@ -205,16 +248,17 @@ type UpdateInfo struct {
 }
 
 type Diagnostics struct {
-	Version           string            `json:"version"`
-	Status            Status            `json:"status"`
-	CurrentProfile    *Profile          `json:"current_profile,omitempty"`
-	Profiles          []Profile         `json:"profiles"`
-	ServerConfig      map[string]any    `json:"server_config,omitempty"`
-	Traffic           *TrafficSnapshot  `json:"traffic,omitempty"`
-	Logs              []LogEntry        `json:"logs"`
-	GeneratedAt       string            `json:"generated_at"`
-	ConnectionHistory []ConnectionEvent `json:"connection_history"`
-	Reconnect         ReconnectSnapshot `json:"reconnect"`
+	Version           string              `json:"version"`
+	Status            Status              `json:"status"`
+	CurrentProfile    *Profile            `json:"current_profile,omitempty"`
+	Profiles          []Profile           `json:"profiles"`
+	ServerConfig      map[string]any      `json:"server_config,omitempty"`
+	Traffic           *TrafficSnapshot    `json:"traffic,omitempty"`
+	Logs              []LogEntry          `json:"logs"`
+	GeneratedAt       string              `json:"generated_at"`
+	ConnectionHistory []ConnectionEvent   `json:"connection_history"`
+	Reconnect         ReconnectSnapshot   `json:"reconnect"`
+	Runtime           *RuntimeDiagnostics `json:"runtime,omitempty"`
 }
 
 func BoolPtr(v bool) *bool {

@@ -13,6 +13,25 @@ type Event struct {
 	Session      *types.SessionInfo
 	Err          error
 	Close        *DisconnectInfo
+	Network      *NetworkChange
+}
+
+type NetworkSnapshot struct {
+	InterfaceName    string
+	InterfaceIndex   int
+	LocalIPv4        string
+	Gateway          string
+	GatewayInterface int
+	RouteMetric      int
+	Generation       uint64
+}
+
+type NetworkChange struct {
+	Before         NetworkSnapshot
+	After          NetworkSnapshot
+	Reasons        []string
+	RebindRequired bool
+	Error          string
 }
 
 type DisconnectInfo struct {

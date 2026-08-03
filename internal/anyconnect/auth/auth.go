@@ -22,15 +22,7 @@ import (
 	"github.com/elastic/go-sysinfo"
 )
 
-var (
-	Prof         = &Profile{Initialized: false}
-	Conn         *tls.Conn // tls.Conn 是结构体，net.Conn 是接口，所以这里可以用指针类型
-	BufR         *bufio.Reader
-	reqHeaders   = make(map[string]string)
-	WebVpnCookie string
-)
-
-// Profile 模板变量字段必须导出，虽然全局，但每次连接都被重置
+// Profile contains the per-connection authentication and tunnel parameters.
 type Profile struct {
 	Host      string `json:"host"`
 	Username  string `json:"username"`
@@ -43,6 +35,7 @@ type Profile struct {
 	CustomInclude      []string `json:"custom_include_routes"`
 	CustomExclude      []string `json:"custom_exclude_routes"`
 	DNSOverrides       []string `json:"dns_overrides"`
+	MTU                int      `json:"mtu"`
 
 	Initialized bool
 	AppVersion  string // for report to server in xml
@@ -63,163 +56,193 @@ type Profile struct {
 	UniqueId        string
 }
 
+// Client owns one authentication transaction. A Client must not be shared by
+// concurrent connection attempts.
+type Client struct {
+	Prof           Profile
+	Conn           *tls.Conn
+	BufR           *bufio.Reader
+	WebVpnCookie   string
+	LocalInterface base.Interface
+}
+
+func NewClient(profile Profile, local base.Interface) *Client {
+	defaults := newDefaultProfile()
+	if profile.Scheme == "" {
+		profile.Scheme = defaults.Scheme
+	}
+	if profile.DeviceType == "" {
+		profile.DeviceType = defaults.DeviceType
+	}
+	if profile.PlatformVersion == "" {
+		profile.PlatformVersion = defaults.PlatformVersion
+	}
+	if profile.ComputerName == "" {
+		profile.ComputerName = defaults.ComputerName
+	}
+	if profile.UniqueId == "" {
+		profile.UniqueId = defaults.UniqueId
+	}
+	return &Client{Prof: profile, LocalInterface: local}
+}
+
+func newDefaultProfile() Profile {
+	profile := Profile{
+		Scheme:             "https://",
+		AcceptServerRoutes: true,
+		ApplyDNS:           true,
+		DeviceType:         runtime.GOOS,
+	}
+	if runtime.GOARCH == "amd64" {
+		profile.DeviceType += "-64"
+	}
+	if runtime.GOOS == "windows" {
+		profile.DeviceType = "win"
+	}
+	host, err := sysinfo.Host()
+	if err != nil {
+		base.Warn("collect host metadata failed:", err)
+		return profile
+	}
+	info := host.Info()
+	profile.ComputerName = info.Hostname
+	profile.UniqueId = info.UniqueID
+	profile.PlatformVersion = strings.Split(info.OS.Version, " ")[0]
+	return profile
+}
+
+func (c *Client) Close() error {
+	if c == nil || c.Conn == nil {
+		return nil
+	}
+	err := c.Conn.Close()
+	c.Conn = nil
+	c.BufR = nil
+	return err
+}
+
 const (
 	tplInit = iota
 	tplAuthReply
 )
 
-func init() {
-	reqHeaders["X-Transcend-Version"] = "1"
-	reqHeaders["X-Aggregate-Auth"] = "1"
-
-	Prof.Scheme = "https://"
-	Prof.AcceptServerRoutes = true
-	Prof.ApplyDNS = true
-
-	host, _ := sysinfo.Host()
-	info := host.Info()
-	Prof.ComputerName = info.Hostname
-	Prof.UniqueId = info.UniqueID
-
-	os := info.OS
-	Prof.DeviceType = runtime.GOOS
-	if runtime.GOARCH == "amd64" {
-		Prof.DeviceType += "-64"
-	}
-	if runtime.GOOS == "windows" {
-		Prof.DeviceType = "win"
-	}
-	Prof.PlatformVersion = strings.Split(os.Version, " ")[0]
-	// log.Printf("%+v %+v", info, os)
-}
-
-// InitAuth 确定用户组和服务端认证地址 AuthPath
-func InitAuth() error {
-	return initAuth(configuredLocalAddr())
-}
-
-// InitAuthWithLocalIP is used by diagnostics that need to pin the initial
-// control connection to a known local IPv4 address without changing system
-// routes or tunnel state.
-func InitAuthWithLocalIP(localIP string) error {
-	ip := net.ParseIP(strings.TrimSpace(localIP)).To4()
-	if ip == nil {
-		return fmt.Errorf("invalid local IPv4 address %q", localIP)
-	}
-	return initAuth(&net.TCPAddr{IP: ip})
-}
-
-func configuredLocalAddr() net.Addr {
-	ip := net.ParseIP(strings.TrimSpace(base.LocalInterface.Ip4)).To4()
+func (c *Client) configuredLocalAddr() net.Addr {
+	ip := net.ParseIP(strings.TrimSpace(c.LocalInterface.Ip4)).To4()
 	if ip == nil {
 		return nil
 	}
 	return &net.TCPAddr{IP: ip}
 }
 
-func initAuth(localAddr net.Addr) error {
-	base.Info("init auth with server", Prof.HostWithPort)
-	WebVpnCookie = ""
-	// https://github.com/mwitkow/go-http-dialer
+func (c *Client) InitAuth(localAddr net.Addr) error {
+	if c == nil {
+		return errors.New("nil auth client")
+	}
+	if localAddr == nil {
+		localAddr = c.configuredLocalAddr()
+	}
+	base.Info("init auth with server", c.Prof.HostWithPort)
+	c.WebVpnCookie = ""
 	config := tls.Config{
 		InsecureSkipVerify: base.Cfg.InsecureSkipVerify,
-		ServerName:         strings.Split(Prof.HostWithPort, ":")[0],
+		ServerName:         strings.Split(c.Prof.HostWithPort, ":")[0],
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS12,
 	}
-	var err error
 	dialer := &net.Dialer{Timeout: 6 * time.Second, LocalAddr: localAddr}
-	Conn, err = tls.DialWithDialer(dialer, "tcp4", Prof.HostWithPort, &config)
+	conn, err := tls.DialWithDialer(dialer, "tcp4", c.Prof.HostWithPort, &config)
 	if err != nil {
 		base.Error("auth tcp connect failed:", err)
 		return err
 	}
-	base.Info("auth tcp connection established", "local", Conn.LocalAddr().String(), "remote", Conn.RemoteAddr().String())
-	BufR = bufio.NewReader(Conn)
-	// base.Info(Conn.ConnectionState().Version)
+	c.Conn = conn
+	c.BufR = bufio.NewReader(conn)
+	base.Info("auth tcp connection established", "local", conn.LocalAddr().String(), "remote", conn.RemoteAddr().String())
 
 	dtd := new(proto.DTD)
-
-	Prof.AppVersion = base.Cfg.AgentVersion
-	Prof.MacAddress = base.LocalInterface.Mac
-
-	err = tplPost(tplInit, "", dtd)
-	if err != nil {
+	c.Prof.AppVersion = base.Cfg.AgentVersion
+	c.Prof.MacAddress = c.LocalInterface.Mac
+	if err := c.tplPost(tplInit, "", dtd); err != nil {
 		base.Error("init auth request failed:", err)
 		return err
 	}
 	if dtd.Type == "" {
 		return errors.New("vpn server returned an unrecognized authentication response")
 	}
-	Prof.AuthPath = dtd.Auth.Form.Action
-	if Prof.AuthPath == "" {
-		Prof.AuthPath = "/"
+	c.Prof.AuthPath = dtd.Auth.Form.Action
+	if c.Prof.AuthPath == "" {
+		c.Prof.AuthPath = "/"
 	}
-	Prof.TunnelGroup = dtd.Opaque.TunnelGroup
-	Prof.GroupAlias = dtd.Opaque.GroupAlias
-	Prof.ConfigHash = dtd.Opaque.ConfigHash
-
-	gps := len(dtd.Auth.Form.Groups)
-	if gps != 0 && !utils.InArray(dtd.Auth.Form.Groups, Prof.Group) {
+	c.Prof.TunnelGroup = dtd.Opaque.TunnelGroup
+	c.Prof.GroupAlias = dtd.Opaque.GroupAlias
+	c.Prof.ConfigHash = dtd.Opaque.ConfigHash
+	if len(dtd.Auth.Form.Groups) != 0 && !utils.InArray(dtd.Auth.Form.Groups, c.Prof.Group) {
 		return fmt.Errorf("available user groups are: %s", strings.Join(dtd.Auth.Form.Groups, " "))
 	}
-	base.Info("auth initialization completed", "authPath", Prof.AuthPath, "tunnelGroup", Prof.TunnelGroup, "groupAlias", Prof.GroupAlias)
-
+	c.Prof.Initialized = true
+	base.Info("auth initialization completed", "authPath", c.Prof.AuthPath, "tunnelGroup", c.Prof.TunnelGroup, "groupAlias", c.Prof.GroupAlias)
 	return nil
 }
 
-// PasswordAuth 认证成功后，服务端新建 ConnSession，并生成 SessionToken 或者通过 Header 返回 WebVpnCookie
-func PasswordAuth() error {
+// PasswordAuth completes authentication and stores the resulting token in the
+// supplied connection session.
+func (c *Client) PasswordAuth(sess *session.Session) error {
+	if c == nil || sess == nil {
+		return errors.New("nil authentication session")
+	}
 	base.Info("start password auth")
 	dtd := new(proto.DTD)
-	// 发送用户名或者用户名+密码
-	err := tplPost(tplAuthReply, Prof.AuthPath, dtd)
+	err := c.tplPost(tplAuthReply, c.Prof.AuthPath, dtd)
 	if err != nil {
 		base.Error("password auth first step failed:", err)
 		return err
 	}
 	base.Info("password auth response", "step", 1, "type", dtd.Type)
-	// 兼容两步登陆，如必要则再次发送
 	if dtd.Type == "auth-request" && dtd.Auth.Error.Value == "" {
 		dtd = new(proto.DTD)
-		err = tplPost(tplAuthReply, Prof.AuthPath, dtd)
+		err = c.tplPost(tplAuthReply, c.Prof.AuthPath, dtd)
 		if err != nil {
 			base.Error("password auth second step failed:", err)
 			return err
 		}
 		base.Info("password auth response", "step", 2, "type", dtd.Type)
 	}
-	// 用户名、密码等错误
 	if dtd.Type == "auth-request" {
 		if dtd.Auth.Error.Value != "" {
-			return fmt.Errorf(dtd.Auth.Error.Value, dtd.Auth.Error.Param1)
+			return fmt.Errorf("%s", formatAuthError(dtd.Auth.Error))
 		}
 		return errors.New(dtd.Auth.Message)
 	}
-
-	// AnyConnect 客户端支持 XML，OpenConnect 不使用 XML，而是使用 Cookie 反馈给客户端登陆状态
-	session.Sess.SessionToken = dtd.SessionToken
-	// 兼容 OpenConnect
-	if WebVpnCookie != "" {
-		session.Sess.SessionToken = WebVpnCookie
+	sess.SessionToken = dtd.SessionToken
+	if c.WebVpnCookie != "" {
+		sess.SessionToken = c.WebVpnCookie
 		base.Info("using webvpn session token from cookie")
 	}
 	base.Info("password auth completed")
-	base.Debug("session token received", "length", len(session.Sess.SessionToken))
+	base.Debug("session token received", "length", len(sess.SessionToken))
 	return nil
 }
 
-// 渲染模板并发送请求
-func tplPost(typ int, path string, dtd *proto.DTD) error {
+// tplPost renders and sends one authentication request for this Client.
+func (c *Client) tplPost(typ int, path string, dtd *proto.DTD) error {
+	if c == nil || c.Conn == nil || c.BufR == nil {
+		return errors.New("authentication connection is not initialized")
+	}
 	tplBuffer := new(bytes.Buffer)
 	tplName := "tplInit"
-	if typ == tplInit {
-		t, _ := template.New("init").Parse(templateInit)
-		_ = t.Execute(tplBuffer, Prof)
-	} else {
+	templateName := "init"
+	templateText := templateInit
+	if typ != tplInit {
 		tplName = "tplAuthReply"
-		t, _ := template.New("auth_reply").Parse(templateAuthReply)
-		_ = t.Execute(tplBuffer, Prof)
+		templateName = "auth_reply"
+		templateText = templateAuthReply
+	}
+	t, err := template.New(templateName).Parse(templateText)
+	if err != nil {
+		return err
+	}
+	if err := t.Execute(tplBuffer, c.Prof); err != nil {
+		return err
 	}
 	base.Info("send auth template", "type", tplName, "path", path, "length", tplBuffer.Len())
 	if base.Cfg.LogLevel == "Debug" {
@@ -229,36 +252,36 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
 		}
 		base.Debug(post)
 	}
-	url := fmt.Sprintf("%s%s%s", Prof.Scheme, Prof.HostWithPort, path)
-	if Prof.SecretKey != "" {
-		url += "?" + Prof.SecretKey
+	url := fmt.Sprintf("%s%s%s", c.Prof.Scheme, c.Prof.HostWithPort, path)
+	if c.Prof.SecretKey != "" {
+		url += "?" + c.Prof.SecretKey
 	}
-	req, _ := http.NewRequest("POST", url, tplBuffer)
-
+	req, err := http.NewRequest("POST", url, tplBuffer)
+	if err != nil {
+		return err
+	}
 	utils.SetCommonHeader(req)
-	for k, v := range reqHeaders {
+	for k, v := range map[string]string{
+		"X-Transcend-Version": "1",
+		"X-Aggregate-Auth":    "1",
+	} {
 		req.Header[k] = []string{v}
 	}
-
-	err := req.Write(Conn)
-	if err != nil {
-		Conn.Close()
+	if err := req.Write(c.Conn); err != nil {
+		_ = c.Close()
 		base.Error("write auth request failed:", err)
 		return err
 	}
-
-	var resp *http.Response
-	resp, err = http.ReadResponse(BufR, req)
+	resp, err := http.ReadResponse(c.BufR, req)
 	if err != nil {
-		Conn.Close()
+		_ = c.Close()
 		base.Error("read auth response failed:", err)
 		return err
 	}
 	defer resp.Body.Close()
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		Conn.Close()
+		_ = c.Close()
 		base.Error("read auth body failed:", err)
 		return err
 	}
@@ -266,36 +289,30 @@ func tplPost(typ int, path string, dtd *proto.DTD) error {
 	if base.Cfg.LogLevel == "Debug" {
 		base.Debug(redactAuthBody(string(body)))
 	}
-
-	if resp.StatusCode == http.StatusOK {
-		err = xml.Unmarshal(body, dtd)
-		if err != nil {
-			base.Error("unmarshal auth body failed:", err)
-			return err
-		}
-		if dtd.Error.Value != "" {
-			return fmt.Errorf("vpn server error: %s", formatAuthError(dtd.Error))
-		}
-		if dtd.Auth.Error.Value != "" {
-			return fmt.Errorf("vpn auth error: %s", formatAuthError(dtd.Auth.Error))
-		}
-		if dtd.Type == "complete" && dtd.SessionToken == "" {
-			// 兼容 ocserv
-			cookies := resp.Cookies()
-			if len(cookies) != 0 {
-				for _, c := range cookies {
-					if c.Name == "webvpn" {
-						WebVpnCookie = c.Value
-						break
-					}
-				}
+	if resp.StatusCode != http.StatusOK {
+		_ = c.Close()
+		base.Warn("auth failed with status", resp.Status)
+		return fmt.Errorf("auth error %s", resp.Status)
+	}
+	if err := xml.Unmarshal(body, dtd); err != nil {
+		base.Error("unmarshal auth body failed:", err)
+		return err
+	}
+	if dtd.Error.Value != "" {
+		return fmt.Errorf("vpn server error: %s", formatAuthError(dtd.Error))
+	}
+	if dtd.Auth.Error.Value != "" {
+		return fmt.Errorf("vpn auth error: %s", formatAuthError(dtd.Auth.Error))
+	}
+	if dtd.Type == "complete" && dtd.SessionToken == "" {
+		for _, cookie := range resp.Cookies() {
+			if cookie.Name == "webvpn" {
+				c.WebVpnCookie = cookie.Value
+				break
 			}
 		}
-		return nil
 	}
-	Conn.Close()
-	base.Warn("auth failed with status", resp.Status)
-	return fmt.Errorf("auth error %s", resp.Status)
+	return nil
 }
 
 func redactAuthBody(body string) string {

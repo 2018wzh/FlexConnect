@@ -7,79 +7,87 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"flexconnect/internal/anyconnect/auth"
 	"flexconnect/internal/anyconnect/base"
 	"flexconnect/internal/anyconnect/session"
 	"flexconnect/internal/anyconnect/utils"
+	"flexconnect/internal/osnet"
 	"flexconnect/internal/router"
 )
 
-var (
-	reqHeaders = make(map[string]string)
-)
-
-func init() {
-	reqHeaders["X-CSTP-VPNAddress-Type"] = "IPv4"
-	// Payload + 8 + 加密扩展位 + TCP或UDP头 + IP头 最好小于 1500，这里参考 AnyConnect 设置
-	reqHeaders["X-CSTP-MTU"] = "1399"
-	reqHeaders["X-CSTP-Base-MTU"] = "1399"
-	// if base.Cfg.OS == "android" || base.Cfg.OS == "ios" {
-	//    reqHeaders["X-CSTP-License"] = "mobile"
-	// }
-}
-
-func initTunnel() {
+func initTunnel(client *auth.Client, sess *session.Session) map[string]string {
+	requestedMTU := client.Prof.MTU
+	if requestedMTU <= 0 {
+		requestedMTU = defaultMTU
+	}
+	headers := map[string]string{
+		"X-CSTP-VPNAddress-Type": "IPv4",
+		"X-CSTP-MTU":             strconv.Itoa(requestedMTU),
+		"X-CSTP-Base-MTU":        strconv.Itoa(requestedMTU),
+	}
 	// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-03#section-2.1.3
-	reqHeaders["Cookie"] = "webvpn=" + session.Sess.SessionToken // 无论什么服务端都需要通过 Cookie 发送 Session
-	reqHeaders["X-CSTP-Local-VPNAddress-IP4"] = base.LocalInterface.Ip4
+	headers["Cookie"] = "webvpn=" + sess.SessionToken // 无论什么服务端都需要通过 Cookie 发送 Session
+	headers["X-CSTP-Local-VPNAddress-IP4"] = client.LocalInterface.Ip4
 
 	// Secondary UDP channel setup: https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-02#section-2.1.5.1
 	// worker-vpn.c WSPCONFIG(ws)->udp_port != 0 && req->master_secret_set != 0 否则 disabling UDP (DTLS) connection
 	// 如果开启 dtls_psk（默认开启，见配置说明） 且 CipherSuite 包含 PSK-NEGOTIATE（仅限ocserv），worker-http.c 自动设置 req->master_secret_set = 1
 	// 此时无需手动设置 Secret，会自动协商建立 dtls 链接，AnyConnect 客户端不支持
-	session.Sess.PreMasterSecret, _ = utils.MakeMasterSecret()
-	reqHeaders["X-DTLS-Master-Secret"] = hex.EncodeToString(session.Sess.PreMasterSecret) // Hex-encoded pre-master secret used in DTLS negotiation.
+	sess.PreMasterSecret, _ = utils.MakeMasterSecret()
+	headers["X-DTLS-Master-Secret"] = hex.EncodeToString(sess.PreMasterSecret) // Hex-encoded pre-master secret used in DTLS negotiation.
 
 	// https://gitlab.com/openconnect/ocserv/-/blob/master/src/worker-http.c#L150
 	// https://github.com/openconnect/openconnect/blob/master/gnutls-dtls.c#L75
-	reqHeaders["X-DTLS12-CipherSuite"] = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:AES128-GCM-SHA256"
+	headers["X-DTLS12-CipherSuite"] = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:AES128-GCM-SHA256"
+	return headers
 }
 
-// SetupTunnel initiates an HTTP CONNECT command to establish a VPN
-func SetupTunnel() error {
-	initTunnel()
-	base.Info("start tunnel negotiation", "server", auth.Prof.HostWithPort)
+// SetupTunnelWithClient establishes a tunnel using only the supplied
+// connection-owned authentication and session state.
+func SetupTunnelWithClient(client *auth.Client, sess *session.Session) error {
+	if client == nil || client.Conn == nil || client.BufR == nil {
+		return fmt.Errorf("authentication client is not connected")
+	}
+	if sess == nil {
+		return fmt.Errorf("nil VPN session")
+	}
+	headers := initTunnel(client, sess)
+	base.Info("start tunnel negotiation", "server", client.Prof.HostWithPort)
 
 	// https://github.com/golang/go/commit/da6c168378b4c1deb2a731356f1f438e4723b8a7
 	// https://github.com/golang/go/issues/17227#issuecomment-341855744
-	req, _ := http.NewRequest("CONNECT", auth.Prof.Scheme+auth.Prof.HostWithPort+"/CSCOSSLC/tunnel", nil)
+	req, err := http.NewRequest("CONNECT", client.Prof.Scheme+client.Prof.HostWithPort+"/CSCOSSLC/tunnel", nil)
+	if err != nil {
+		return err
+	}
 	utils.SetCommonHeader(req)
-	for k, v := range reqHeaders {
+	for k, v := range headers {
 		// req.Header.Set 会将首字母大写，其它小写
 		req.Header[k] = []string{v}
 	}
 
 	// 发送 CONNECT 请求
-	err := req.Write(auth.Conn)
+	err = req.Write(client.Conn)
 	if err != nil {
-		auth.Conn.Close()
+		_ = client.Close()
 		base.Error("write tunnel request failed:", err)
 		return err
 	}
 	var resp *http.Response
 	// resp.Body closed when tlsChannel exit
-	resp, err = http.ReadResponse(auth.BufR, req)
+	resp, err = http.ReadResponse(client.BufR, req)
 	if err != nil {
-		auth.Conn.Close()
+		_ = client.Close()
 		base.Error("read tunnel response failed:", err)
 		return err
 	}
 	base.Info("tunnel response status", resp.Status)
 
 	if resp.StatusCode != http.StatusOK {
-		auth.Conn.Close()
+		_ = client.Close()
 		base.Warn("tunnel negotiation failed", resp.Status)
 		return fmt.Errorf("tunnel negotiation failed %s", resp.Status)
 	}
@@ -96,25 +104,49 @@ func SetupTunnel() error {
 		base.Debug(buf.String())
 	}
 
-	cSess := session.Sess.NewConnSession(&resp.Header)
-	cSess.ServerAddress = strings.Split(auth.Conn.RemoteAddr().String(), ":")[0]
-	cSess.Hostname = auth.Prof.Host
-	cSess.TLSCipherSuite = tls.CipherSuiteName(auth.Conn.ConnectionState().CipherSuite)
+	cSess := sess.NewConnSession(&resp.Header)
+	mtu, err := effectiveMTU(cSess.MTU, client.Prof.MTU)
+	if err != nil {
+		_ = client.Close()
+		cSess.RecordClose("invalid_mtu", "tls", err)
+		cSess.Close()
+		return err
+	}
+	cSess.MTU = mtu
+	cSess.ServerAddress = strings.Split(client.Conn.RemoteAddr().String(), ":")[0]
+	cSess.LocalSocketAddress = client.Conn.LocalAddr().String()
+	cSess.RemoteSocketAddress = client.Conn.RemoteAddr().String()
+	cSess.Hostname = client.Prof.Host
+	cSess.TLSCipherSuite = tls.CipherSuiteName(client.Conn.ConnectionState().CipherSuite)
 	base.Info("tls session created", "serverAddress", cSess.ServerAddress, "cipher", cSess.TLSCipherSuite)
-	applyProfileOverrides(cSess)
+	applyProfileOverridesWithProfile(cSess, &client.Prof)
 
 	dev, err := setupTun(cSess)
 	if err != nil {
-		auth.Conn.Close()
+		_ = client.Close()
 		cSess.Close()
 		base.Error("setup tun failed:", err)
 		return err
 	}
 	base.Info("tun created", "name", cSess.TunName, "mtu", cSess.MTU, "dtlsPort", cSess.DTLSPort)
+	underlay, err := osnet.GetUnderlaySnapshot(context.Background(), cSess.TunName)
+	if err != nil {
+		_ = client.Close()
+		if cSess.NetworkManager != nil {
+			_ = cSess.NetworkManager.Close(context.Background())
+		}
+		_ = dev.Close()
+		cSess.RecordClose("underlay_snapshot_failed", "network", err)
+		cSess.Close()
+		return err
+	}
+	cSess.Underlay = underlay
+	cSess.LocalAddress = underlay.LocalIPv4.String()
+	base.Info("underlay selected", "interface", underlay.InterfaceName, "local", underlay.LocalIPv4.String(), "gateway", underlay.Gateway.String(), "metric", underlay.RouteMetric)
 
 	netCfg, err := buildOSNetConfig(cSess)
 	if err != nil {
-		auth.Conn.Close()
+		_ = client.Close()
 		if cSess.NetworkManager != nil {
 			_ = cSess.NetworkManager.Close(context.Background())
 		}
@@ -125,7 +157,7 @@ func SetupTunnel() error {
 	}
 	err = cSess.NetworkManager.Set(context.Background(), netCfg)
 	if err != nil {
-		auth.Conn.Close()
+		_ = client.Close()
 		if cSess.NetworkManager != nil {
 			_ = cSess.NetworkManager.Close(context.Background())
 		}
@@ -134,12 +166,19 @@ func SetupTunnel() error {
 		base.Error("set network config failed:", err)
 		return err
 	}
-	startTun(dev, cSess)
-	base.Info("tls channel negotiation succeeded", "remote", cSess.ServerAddress, "port", auth.Prof.HostWithPort)
+	if _, err := startTun(dev, cSess); err != nil {
+		_ = client.Close()
+		_ = cSess.NetworkManager.Close(context.Background())
+		_ = dev.Close()
+		cSess.RecordClose("tun_start_failed", "tun", err)
+		cSess.Close()
+		return err
+	}
+	base.Info("tls channel negotiation succeeded", "remote", cSess.ServerAddress, "port", client.Prof.HostWithPort)
 
 	// 只有网卡和路由设置成功才会进行下一步
 	// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-03#section-2.1.4
-	go tlsChannel(auth.Conn, auth.BufR, cSess, resp)
+	go tlsChannel(client.Conn, client.BufR, cSess, resp)
 
 	if !base.Cfg.NoDTLS && cSess.DTLSPort != "" {
 		base.Info("start dtls channel", "address", cSess.ServerAddress, "port", cSess.DTLSPort)
@@ -150,13 +189,16 @@ func SetupTunnel() error {
 	cSess.DPDTimer()
 	cSess.ReadDeadTimer()
 
-	return err
+	return nil
 }
 
-func applyProfileOverrides(cSess *session.ConnSession) {
+func applyProfileOverridesWithProfile(cSess *session.ConnSession, profile *auth.Profile) {
 	serverInclude := cSess.SplitInclude
 	serverExclude := cSess.SplitExclude
-	if !auth.Prof.AcceptServerRoutes {
+	if profile == nil {
+		return
+	}
+	if !profile.AcceptServerRoutes {
 		serverInclude = nil
 		serverExclude = nil
 		cSess.DynamicSplitTunneling = false
@@ -164,19 +206,40 @@ func applyProfileOverrides(cSess *session.ConnSession) {
 		cSess.DynamicSplitExcludeDomains = nil
 		cSess.UseDefaultRouteWhenEmpty = false
 	}
-	merged := router.MergeRouteLists(serverInclude, serverExclude, auth.Prof.CustomInclude, auth.Prof.CustomExclude)
+	merged := router.MergeRouteLists(serverInclude, serverExclude, profile.CustomInclude, profile.CustomExclude)
 	cSess.SplitInclude = merged.Include
 	cSess.SplitExclude = merged.Exclude
-	if !auth.Prof.ApplyDNS {
+	if !profile.ApplyDNS {
 		cSess.DNS = nil
 		return
 	}
-	if len(auth.Prof.DNSOverrides) > 0 {
-		cSess.DNS = append([]string{}, auth.Prof.DNSOverrides...)
+	if len(profile.DNSOverrides) > 0 {
+		cSess.DNS = append([]string{}, profile.DNSOverrides...)
 	}
 	if len(cSess.SplitInclude) == 0 {
-		cSess.UseDefaultRouteWhenEmpty = auth.Prof.AcceptServerRoutes
+		cSess.UseDefaultRouteWhenEmpty = profile.AcceptServerRoutes
 	} else {
 		cSess.UseDefaultRouteWhenEmpty = false
 	}
+}
+
+const defaultMTU = 1399
+
+func effectiveMTU(serverMTU, profileMTU int) (int, error) {
+	if profileMTU <= 0 {
+		profileMTU = defaultMTU
+	}
+	if profileMTU < 576 || profileMTU > 65535 {
+		return 0, fmt.Errorf("invalid profile MTU %d", profileMTU)
+	}
+	if serverMTU <= 0 {
+		return profileMTU, nil
+	}
+	if serverMTU < 576 || serverMTU > 65535 {
+		return 0, fmt.Errorf("invalid server MTU %d", serverMTU)
+	}
+	if serverMTU < profileMTU {
+		return serverMTU, nil
+	}
+	return profileMTU, nil
 }

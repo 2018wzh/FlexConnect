@@ -22,17 +22,14 @@ func TestRedactAuthBodyRemovesCredentials(t *testing.T) {
 }
 
 func TestConfiguredLocalAddrUsesValidatedIPv4(t *testing.T) {
-	original := base.LocalInterface.Ip4
-	t.Cleanup(func() { base.LocalInterface.Ip4 = original })
-
-	base.LocalInterface.Ip4 = "192.0.2.10"
-	addr, ok := configuredLocalAddr().(*net.TCPAddr)
+	client := &Client{LocalInterface: base.Interface{Ip4: "192.0.2.10"}}
+	addr, ok := client.configuredLocalAddr().(*net.TCPAddr)
 	if !ok || !addr.IP.Equal(net.ParseIP("192.0.2.10")) {
 		t.Fatalf("configured local address = %#v", addr)
 	}
 
-	base.LocalInterface.Ip4 = "not-an-ip"
-	if configuredLocalAddr() != nil {
+	client.LocalInterface.Ip4 = "not-an-ip"
+	if client.configuredLocalAddr() != nil {
 		t.Fatal("invalid configured local address was accepted")
 	}
 }

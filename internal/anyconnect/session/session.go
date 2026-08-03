@@ -15,10 +15,6 @@ import (
 	"go.uber.org/atomic"
 )
 
-var (
-	Sess = &Session{}
-)
-
 type Session struct {
 	SessionToken    string
 	PreMasterSecret []byte
@@ -30,8 +26,15 @@ type Session struct {
 
 type stat struct {
 	// be sure to use the double type when parsing
-	BytesSent     *atomic.Uint64 `json:"bytesSent"`
-	BytesReceived *atomic.Uint64 `json:"bytesReceived"`
+	BytesSent      *atomic.Uint64 `json:"bytesSent"`
+	BytesReceived  *atomic.Uint64 `json:"bytesReceived"`
+	TUNReads       *atomic.Uint64 `json:"tunReads"`
+	TUNWrites      *atomic.Uint64 `json:"tunWrites"`
+	TUNReadErrors  *atomic.Uint64 `json:"tunReadErrors"`
+	TUNWriteErrors *atomic.Uint64 `json:"tunWriteErrors"`
+	DPDSent        *atomic.Uint64 `json:"dpdSent"`
+	DPDResponses   *atomic.Uint64 `json:"dpdResponses"`
+	QueueDrops     *atomic.Uint64 `json:"queueDrops"`
 }
 
 // ConnSession used for both TLS and DTLS
@@ -41,6 +44,8 @@ type ConnSession struct {
 
 	ServerAddress            string
 	LocalAddress             string
+	LocalSocketAddress       string
+	RemoteSocketAddress      string
 	Hostname                 string
 	TunName                  string
 	VPNAddress               string // The IPv4 address of the client
@@ -57,7 +62,8 @@ type ConnSession struct {
 	DynamicSplitExcludeDomains  []string
 	DynamicSplitExcludeResolved sync.Map
 
-	NetworkManager osnet.Manager `json:"-"`
+	NetworkManager osnet.Manager          `json:"-"`
+	Underlay       osnet.UnderlaySnapshot `json:"-"`
 
 	TLSCipherSuite    string
 	TLSDpdTime        int // https://datatracker.ietf.org/doc/html/rfc3706
@@ -78,14 +84,20 @@ type ConnSession struct {
 	DtlsConnected *atomic.Bool
 	DtlsSetupChan chan struct{} `json:"-"`
 	DSess         *DtlsSession  `json:"-"`
+	dtlsSetupOnce sync.Once     `json:"-"`
 
-	ResetTLSReadDead  *atomic.Bool `json:"-"`
-	ResetDTLSReadDead *atomic.Bool `json:"-"`
+	ResetTLSReadDead  *atomic.Bool   `json:"-"`
+	ResetDTLSReadDead *atomic.Bool   `json:"-"`
+	LifecycleState    *atomic.String `json:"-"`
+	TLSState          *atomic.String `json:"-"`
+	DTLSState         *atomic.String `json:"-"`
 
 	closeInfoMu     sync.Mutex
 	closeInfo       CloseInfo
 	closeInfoSet    bool
 	transportFaults []TransportFault
+	closeHookMu     sync.Mutex
+	closeHook       func()
 }
 
 type TransportFault struct {
@@ -103,6 +115,18 @@ type CloseInfo struct {
 	TransportFaults []TransportFault
 }
 
+type RuntimeStats struct {
+	BytesSent      uint64
+	BytesReceived  uint64
+	TUNReads       uint64
+	TUNWrites      uint64
+	TUNReadErrors  uint64
+	TUNWriteErrors uint64
+	DPDSent        uint64
+	DPDResponses   uint64
+	QueueDrops     uint64
+}
+
 type DtlsSession struct {
 	closeOnce sync.Once
 	CloseChan chan struct{}
@@ -111,11 +135,17 @@ type DtlsSession struct {
 
 func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
 	cSess := &ConnSession{
-		Sess:         sess,
-		LocalAddress: base.LocalInterface.Ip4,
+		Sess: sess,
 		Stat: &stat{
-			BytesSent:     atomic.NewUint64(0),
-			BytesReceived: atomic.NewUint64(0),
+			BytesSent:      atomic.NewUint64(0),
+			BytesReceived:  atomic.NewUint64(0),
+			TUNReads:       atomic.NewUint64(0),
+			TUNWrites:      atomic.NewUint64(0),
+			TUNReadErrors:  atomic.NewUint64(0),
+			TUNWriteErrors: atomic.NewUint64(0),
+			DPDSent:        atomic.NewUint64(0),
+			DPDResponses:   atomic.NewUint64(0),
+			QueueDrops:     atomic.NewUint64(0),
 		},
 		closeOnce:         sync.Once{},
 		CloseChan:         make(chan struct{}),
@@ -126,6 +156,9 @@ func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
 		DtlsConnected:     atomic.NewBool(false),
 		ResetTLSReadDead:  atomic.NewBool(true),
 		ResetDTLSReadDead: atomic.NewBool(true),
+		LifecycleState:    atomic.NewString("Created"),
+		TLSState:          atomic.NewString("Starting"),
+		DTLSState:         atomic.NewString("Disabled"),
 		DSess: &DtlsSession{
 			closeOnce: sync.Once{},
 			CloseChan: make(chan struct{}),
@@ -220,12 +253,16 @@ func (cSess *ConnSession) DPDTimer() {
 				base.Debug("send DPD", "tls", true)
 				select {
 				case cSess.PayloadOutTLS <- &tlsDpd:
+					cSess.Stat.DPDSent.Inc()
 				default:
+					cSess.Stat.QueueDrops.Inc()
 				}
 				if cSess.DtlsConnected.Load() {
 					select {
 					case cSess.PayloadOutDTLS <- &dtlsDpd:
+						cSess.Stat.DPDSent.Inc()
 					default:
+						cSess.Stat.QueueDrops.Inc()
 					}
 				}
 			case <-cSess.CloseChan:
@@ -327,6 +364,7 @@ func diagnosticError(err error) string {
 
 func (cSess *ConnSession) Close() {
 	cSess.closeOnce.Do(func() {
+		cSess.SetLifecycleState("Draining")
 		cSess.RecordClose("", "", nil)
 		base.Info("conn session close")
 		if cSess.DtlsConnected.Load() {
@@ -340,7 +378,77 @@ func (cSess *ConnSession) Close() {
 			cSess.Sess.CSess = nil
 			close(cSess.Sess.CloseChan)
 		}
+		cSess.SetLifecycleState("Closed")
+		cSess.closeHookMu.Lock()
+		hook := cSess.closeHook
+		cSess.closeHookMu.Unlock()
+		if hook != nil {
+			hook()
+		}
 	})
+}
+
+func (cSess *ConnSession) SetCloseHook(hook func()) {
+	if cSess == nil {
+		return
+	}
+	cSess.closeHookMu.Lock()
+	select {
+	case <-cSess.CloseChan:
+		cSess.closeHookMu.Unlock()
+		if hook != nil {
+			hook()
+		}
+		return
+	default:
+	}
+	cSess.closeHook = hook
+	cSess.closeHookMu.Unlock()
+}
+
+func (cSess *ConnSession) SetLifecycleState(state string) {
+	if cSess == nil || cSess.LifecycleState == nil || state == "" {
+		return
+	}
+	cSess.LifecycleState.Store(state)
+}
+
+func (cSess *ConnSession) SetTLSState(state string) {
+	if cSess == nil || cSess.TLSState == nil || state == "" {
+		return
+	}
+	cSess.TLSState.Store(state)
+}
+
+func (cSess *ConnSession) SetDTLSState(state string) {
+	if cSess == nil || cSess.DTLSState == nil || state == "" {
+		return
+	}
+	cSess.DTLSState.Store(state)
+}
+
+func (cSess *ConnSession) SignalDTLSSetup() {
+	if cSess == nil || cSess.DtlsSetupChan == nil {
+		return
+	}
+	cSess.dtlsSetupOnce.Do(func() { close(cSess.DtlsSetupChan) })
+}
+
+func (cSess *ConnSession) RuntimeStats() RuntimeStats {
+	if cSess == nil || cSess.Stat == nil {
+		return RuntimeStats{}
+	}
+	return RuntimeStats{
+		BytesSent:      cSess.Stat.BytesSent.Load(),
+		BytesReceived:  cSess.Stat.BytesReceived.Load(),
+		TUNReads:       cSess.Stat.TUNReads.Load(),
+		TUNWrites:      cSess.Stat.TUNWrites.Load(),
+		TUNReadErrors:  cSess.Stat.TUNReadErrors.Load(),
+		TUNWriteErrors: cSess.Stat.TUNWriteErrors.Load(),
+		DPDSent:        cSess.Stat.DPDSent.Load(),
+		DPDResponses:   cSess.Stat.DPDResponses.Load(),
+		QueueDrops:     cSess.Stat.QueueDrops.Load(),
+	}
 }
 
 func (dSess *DtlsSession) Close() {

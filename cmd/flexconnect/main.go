@@ -18,6 +18,7 @@ import (
 	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
+	"flexconnect/internal/netcheck"
 	"flexconnect/internal/types"
 	"golang.org/x/term"
 )
@@ -110,7 +111,7 @@ func runWithTimeouts(parent context.Context, client *local.Client, args []string
 	cancel := func() {}
 	if args[0] != "watch" {
 		commandTimeout := timeout
-		if args[0] == "login" || args[0] == "up" {
+		if args[0] == "login" || args[0] == "up" || args[0] == "netcheck" {
 			commandTimeout = connectTimeout
 		}
 		ctx, cancel = context.WithTimeout(parent, commandTimeout)
@@ -261,6 +262,12 @@ func runCommand(ctx context.Context, client *local.Client, args []string) error 
 		}
 		_, err = io.WriteString(cliOut, formatTrafficSnapshot(*traffic))
 		return err
+	case "netcheck":
+		debugf("handling netcheck")
+		if wantCommandHelp(args[1:]) {
+			return printNamedHelp("netcheck")
+		}
+		return runNetcheck(ctx, args[1:])
 	case "profile":
 		debugf("handling profile")
 		return runProfile(ctx, client, args[1:])
@@ -320,6 +327,60 @@ func runInteractiveLogin(parent context.Context, client *local.Client, in io.Rea
 		return err
 	}
 	return printCurrentStatus(ctx, client)
+}
+
+func runNetcheck(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("netcheck", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	envFile := fs.String("env-file", netcheck.DefaultEnvFile, "dotenv file containing ENDPOINT, USERNAME, PASSWORD, and optional GROUP")
+	endpoint := fs.String("endpoint", "", "optional VPN endpoint override; credentials still come from env-file")
+	observeFor := fs.Duration("observe", netcheck.DefaultObserveFor, "how long to keep the user-space TLS tunnel under observation")
+	dpdInterval := fs.Duration("dpd-interval", 0, "DPD interval; zero derives it from X-CSTP-DPD")
+	noDTLS := fs.Bool("no-dtls", false, "do not open the secondary DTLS channel")
+	localIP := fs.String("local-ip", "", "optional local IPv4 source address for the control connection")
+	mtu := fs.Int("mtu", 1399, "CSTP MTU used by the user-space traffic probe")
+	speedtestURL := fs.String("speedtest-url", netcheck.DefaultSpeedtestURL, "HTTP(S) download URL to probe through the VPN user-space stack")
+	speedtestBytes := fs.Int64("speedtest-bytes", netcheck.DefaultSpeedBytes, "maximum bytes to download")
+	speedtestTimeout := fs.Duration("speedtest-timeout", netcheck.DefaultSpeedLimit, "maximum duration of the traffic probe")
+	noSpeedtest := fs.Bool("no-speedtest", false, "only check connection stability; skip the traffic probe")
+	debug := fs.Bool("debug", false, "enable protocol debug logging")
+	jsonOutput := fs.Bool("json", false, "print the result as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: flexconnect netcheck [--env-file .env] [--speedtest-url URL] [--json]")
+	}
+	creds, err := netcheck.LoadCredentials(*envFile)
+	if err != nil {
+		return fmt.Errorf("load netcheck credentials: %w", err)
+	}
+	if strings.TrimSpace(*endpoint) != "" {
+		creds.Endpoint = strings.TrimSpace(*endpoint)
+	}
+	var speedtest *netcheck.SpeedtestConfig
+	if !*noSpeedtest && strings.TrimSpace(*speedtestURL) != "" {
+		speedtest, err = netcheck.NewSpeedtestConfig(*speedtestURL, *speedtestBytes, *speedtestTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid speedtest configuration: %w", err)
+		}
+	}
+	result, err := netcheck.Run(ctx, netcheck.Config{
+		Credentials: creds, ObserveFor: *observeFor, DPDInterval: *dpdInterval,
+		WithDTLS: !*noDTLS, Debug: verbose || *debug, LocalIP: *localIP,
+		Speedtest: speedtest, MTU: *mtu,
+	})
+	if err != nil {
+		if result.Endpoint != "" {
+			_, _ = io.WriteString(cliErr, formatNetcheckResult(result))
+		}
+		return fmt.Errorf("netcheck failed: %w", err)
+	}
+	if *jsonOutput {
+		return printJSON(result)
+	}
+	_, err = io.WriteString(cliOut, formatNetcheckResult(result))
+	return err
 }
 
 func runLogin(ctx context.Context, client *local.Client, args []string) error {
@@ -1019,6 +1080,41 @@ func formatTrafficSnapshot(traffic types.TrafficSnapshot) string {
 	return buf.String()
 }
 
+func formatNetcheckResult(result netcheck.Result) string {
+	var buf bytes.Buffer
+	status := result.Status
+	if status == "" {
+		status = "unknown"
+	}
+	fmt.Fprintf(&buf, "Netcheck: %s\n", status)
+	fmt.Fprintf(&buf, "Mode: %s (user-space stack, no OS TUN)\n", result.Mode)
+	fmt.Fprintf(&buf, "Endpoint: %s\n", result.Endpoint)
+	fmt.Fprintf(&buf, "Underlay: %s local=%s gateway=%s\n", result.LocalInterface, result.LocalIPv4, result.Gateway)
+	if result.RequestedLocalIP != "" {
+		fmt.Fprintf(&buf, "Requested Source IP: %s\n", result.RequestedLocalIP)
+	}
+	fmt.Fprintf(&buf, "Auth Socket: %s -> %s\n", result.AuthLocalAddress, result.AuthRemoteAddress)
+	fmt.Fprintf(&buf, "CSTP: %s vpn_ip=%s mtu=%d\n", result.CSTPStatus, result.VPNAddress, result.MTU)
+	fmt.Fprintf(&buf, "TLS: dpd=%s keepalive=%s transport=%s\n", result.TLSDPD, result.TLSKeepalive, result.Transport)
+	if result.DTLSEnabled {
+		fmt.Fprintf(&buf, "DTLS: enabled port=%s peer=%s\n", result.DTLSPort, result.DTLSPeer)
+	} else {
+		buf.WriteString("DTLS: disabled or unavailable\n")
+	}
+	fmt.Fprintf(&buf, "Observation: %s dpd_sent=%d tls_frames=%d dtls_frames=%d\n",
+		result.ObservationDuration.Round(time.Millisecond), result.DPDSent, result.TLSFrames, result.DTLSFrames)
+	if result.Speedtest == nil {
+		buf.WriteString("Speedtest: skipped\n")
+	} else {
+		test := result.Speedtest
+		fmt.Fprintf(&buf, "Speedtest: target=%s transport=%s\n", test.TargetHost, test.Transport)
+		fmt.Fprintf(&buf, "  Result: %d bytes in %s (%.2f MiB/s)\n", test.Bytes, test.Duration.Round(time.Millisecond), test.MiBPS)
+		fmt.Fprintf(&buf, "  Frames: outbound=%d B/%d packets inbound=%d B/%d packets\n",
+			test.OutboundFrameBytes, test.OutboundPackets, test.InboundFrameBytes, test.InboundPackets)
+	}
+	return buf.String()
+}
+
 func formatUpdateInfo(info *types.UpdateInfo) string {
 	if info == nil {
 		return "No update information available.\n"
@@ -1150,6 +1246,7 @@ func rootHelpTopic() helpTopic {
 			{Name: "logs", Summary: "Show recent daemon logs"},
 			{Name: "diag", Summary: "Export diagnostics as JSON"},
 			{Name: "traffic", Summary: "Show traffic totals and speeds"},
+			{Name: "netcheck", Summary: "Connect, inspect the underlay, and measure VPN traffic"},
 			{Name: "watch", Summary: "Stream daemon events as NDJSON"},
 			{Name: "update", Summary: "Check for a new FlexConnect release"},
 		},
@@ -1161,6 +1258,7 @@ func rootHelpTopic() helpTopic {
 			"flexconnect up -p corp",
 			"flexconnect down",
 			"flexconnect traffic",
+			"flexconnect netcheck --env-file .env",
 			"flexconnect profile update -p corp --user alice --server vpn.example.com --password-file ./secrets/flexconnect_password --auto-reconnect true --apply-dns true --socks5-listen 127.0.0.1:1080",
 			"flexconnect proxy enable 127.0.0.1:1080",
 		},
@@ -1212,6 +1310,16 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 			Usage:       "flexconnect traffic [--json]",
 			Description: "Show VPN traffic totals and sampled upload/download speeds.",
 			Examples:    []string{"flexconnect traffic", "flexconnect traffic --json"},
+		},
+		"netcheck": {
+			Name:        "netcheck",
+			Usage:       "flexconnect netcheck [--env-file <path>] [--speedtest-url <url>] [--json]",
+			Description: "Run a connection-level CSTP/DTLS probe without an OS TUN, keep it under observation, and download a bounded payload through the user-space VPN stack.",
+			Examples: []string{
+				"flexconnect netcheck --env-file .env",
+				"flexconnect netcheck --env-file .env --speedtest-url https://speed.example/download?bytes=4194304",
+				"flexconnect netcheck --env-file .env --no-speedtest --json",
+			},
 		},
 		"watch": {
 			Name:        "watch",

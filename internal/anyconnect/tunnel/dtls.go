@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"net"
 	"strconv"
 	"time"
@@ -23,6 +24,7 @@ func dtlsChannel(cSess *session.ConnSession) {
 		dead          = time.Duration(cSess.DTLSDpdTime+5) * time.Second
 	)
 	base.Info("start dtls channel", "server", cSess.ServerAddress)
+	cSess.SetDTLSState("Starting")
 	defer func() {
 		base.Info("dtls channel exit")
 		if conn != nil {
@@ -31,6 +33,12 @@ func dtlsChannel(cSess *session.ConnSession) {
 		if dSess != nil {
 			dSess.Close()
 		}
+		if cSess.LifecycleState == nil || cSess.LifecycleState.Load() != "Closed" {
+			cSess.SetDTLSState("Degraded")
+		} else {
+			cSess.SetDTLSState("Closed")
+		}
+		cSess.SignalDTLSSetup()
 	}()
 
 	port, _ := strconv.Atoi(cSess.DTLSPort)
@@ -55,7 +63,7 @@ func dtlsChannel(cSess *session.ConnSession) {
 				return []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}
 			}
 		}(),
-		SessionStore: &SessionStore{dtls.Session{ID: id, Secret: session.Sess.PreMasterSecret}},
+		SessionStore: &SessionStore{dtls.Session{ID: id, Secret: cSess.Sess.PreMasterSecret}},
 		// PSK: func(hint []byte) ([]byte, error) {
 		//     // return []byte{0xAB, 0xC1, 0x23}, nil
 		//     return id, nil
@@ -66,22 +74,23 @@ func dtlsChannel(cSess *session.ConnSession) {
 	conn, err = dtls.Dial("udp4", addr, config)
 	// https://github.com/pion/dtls/pull/649
 	if err != nil {
+		cSess.RecordTransportFault("dtls_dial_error", "dtls", err)
 		base.Error(err)
-		close(cSess.DtlsSetupChan) // 没有成功建立 DTLS 隧道
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err = conn.HandshakeContext(ctx); err != nil {
+		cSess.RecordTransportFault("dtls_handshake_error", "dtls", err)
 		base.Error(err)
-		close(cSess.DtlsSetupChan) // 没有成功建立 DTLS 隧道
 		return
 	}
 	base.Info("dtls handshake done", "id", cSess.DTLSId)
 
 	cSess.DtlsConnected.Store(true)
 	dSess = cSess.DSess
-	close(cSess.DtlsSetupChan) // 成功建立 DTLS 隧道
+	cSess.SetDTLSState("Ready")
+	cSess.SignalDTLSSetup()
 
 	// rewrite cSess.DTLSCipherSuite
 	state, success := conn.ConnectionState()
@@ -107,6 +116,7 @@ func dtlsChannel(cSess *session.ConnSession) {
 		pl := getPayloadBuffer()                // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
 		bytesReceived, err = conn.Read(pl.Data) // 服务器没有数据返回时，会阻塞
 		if err != nil {
+			putPayloadBuffer(pl)
 			code := "dtls_read_error"
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				code = "dtls_read_timeout"
@@ -115,9 +125,13 @@ func dtlsChannel(cSess *session.ConnSession) {
 			base.Error("dtls server to payloadIn error:", err)
 			return
 		}
-		if bytesReceived > 0 {
-			base.Debug("dtls receive frame", "type", pl.Data[0], "len", bytesReceived)
+		if bytesReceived <= 0 || bytesReceived > len(pl.Data) {
+			putPayloadBuffer(pl)
+			err = errors.New("DTLS returned an invalid packet length")
+			cSess.RecordTransportFault("dtls_read_invalid", "dtls", err)
+			return
 		}
+		base.Debug("dtls receive frame", "type", pl.Data[0], "len", bytesReceived)
 
 		// base.Debug("dtls server to payloadIn")
 		// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-02#section-2.3
@@ -125,6 +139,7 @@ func dtlsChannel(cSess *session.ConnSession) {
 		switch pl.Data[0] {
 		case 0x07: // KEEPALIVE
 			// base.Debug("dtls receive KEEPALIVE")
+			putPayloadBuffer(pl)
 		case 0x05: // DISCONNECT
 			cSess.RecordTransportFault("server_disconnect", "dtls", nil)
 			return
@@ -134,16 +149,26 @@ func dtlsChannel(cSess *session.ConnSession) {
 			select {
 			case cSess.PayloadOutDTLS <- pl:
 			case <-dSess.CloseChan:
+				putPayloadBuffer(pl)
+				return
 			}
 		case 0x04:
 			base.Debug("dtls receive DPD-RESP")
+			cSess.Stat.DPDResponses.Inc()
+			putPayloadBuffer(pl)
 		case 0x00: // DATA
 			pl.Data = append(pl.Data[:0], pl.Data[1:bytesReceived]...)
 			select {
 			case cSess.PayloadIn <- pl:
 			case <-dSess.CloseChan:
+				putPayloadBuffer(pl)
 				return
 			}
+		default:
+			putPayloadBuffer(pl)
+			err = errors.New("unsupported DTLS frame type")
+			cSess.RecordTransportFault("dtls_protocol_error", "dtls", err)
+			return
 		}
 		cSess.Stat.BytesReceived.Add(uint64(bytesReceived))
 	}
@@ -170,6 +195,11 @@ func payloadOutDTLSToServer(conn *dtls.Conn, dSess *session.DtlsSession, cSess *
 		case <-dSess.CloseChan:
 			return
 		}
+		if pl == nil {
+			err := errors.New("nil DTLS payload")
+			cSess.RecordTransportFault("dtls_payload_invalid", "dtls", err)
+			return
+		}
 
 		// base.Debug("dtls payloadOut to server")
 		if pl.Type == 0x00 {
@@ -188,6 +218,7 @@ func payloadOutDTLSToServer(conn *dtls.Conn, dSess *session.DtlsSession, cSess *
 
 		bytesSent, err = conn.Write(pl.Data)
 		if err != nil {
+			putPayloadBuffer(pl)
 			code := "dtls_write_error"
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				code = "dtls_write_timeout"

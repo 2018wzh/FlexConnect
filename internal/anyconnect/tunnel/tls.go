@@ -21,10 +21,12 @@ import (
 func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, resp *http.Response) {
 	defer func() {
 		base.Info("tls channel exit")
+		cSess.SetTLSState("Closed")
 		resp.Body.Close()
 		_ = conn.Close()
 		cSess.Close()
 	}()
+	cSess.SetTLSState("Ready")
 	base.Info("start tls channel", "peer", conn.RemoteAddr().String())
 	dead := time.Duration(cSess.TLSDpdTime+5) * time.Second
 
@@ -69,6 +71,9 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 			}
 		case 0x04, 0x07: // DPD-RESP / KEEPALIVE
 			base.Debug("tls receive DPD-RESP")
+			if frameType == 0x04 {
+				cSess.Stat.DPDResponses.Inc()
+			}
 			putPayloadBuffer(pl)
 		case 0x03: // DPD-REQ
 			pl.Type = 0x04
@@ -147,6 +152,12 @@ func payloadOutTLSToServer(conn *tls.Conn, cSess *session.ConnSession) {
 		case <-cSess.CloseChan:
 			return
 		}
+		if pl == nil {
+			err := errors.New("nil TLS payload")
+			cSess.RecordClose("tls_payload_invalid", "tls", err)
+			cSess.Close()
+			return
+		}
 
 		// base.Debug("tls payloadOut to server", "Type", pl.Type)
 		if pl.Type == 0x00 {
@@ -167,6 +178,7 @@ func payloadOutTLSToServer(conn *tls.Conn, cSess *session.ConnSession) {
 		}
 		bytesSent, err = conn.Write(pl.Data)
 		if err != nil {
+			putPayloadBuffer(pl)
 			code := "tls_write_error"
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				code = "tls_write_timeout"
