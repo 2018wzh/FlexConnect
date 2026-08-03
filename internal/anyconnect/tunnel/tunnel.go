@@ -103,7 +103,7 @@ func SetupTunnel() error {
 	base.Info("tls session created", "serverAddress", cSess.ServerAddress, "cipher", cSess.TLSCipherSuite)
 	applyProfileOverrides(cSess)
 
-	err = setupTun(cSess)
+	dev, err := setupTun(cSess)
 	if err != nil {
 		auth.Conn.Close()
 		cSess.Close()
@@ -115,6 +115,10 @@ func SetupTunnel() error {
 	netCfg, err := buildOSNetConfig(cSess)
 	if err != nil {
 		auth.Conn.Close()
+		if cSess.NetworkManager != nil {
+			_ = cSess.NetworkManager.Close(context.Background())
+		}
+		_ = dev.Close()
 		cSess.Close()
 		base.Error("build network config failed:", err)
 		return err
@@ -125,10 +129,12 @@ func SetupTunnel() error {
 		if cSess.NetworkManager != nil {
 			_ = cSess.NetworkManager.Close(context.Background())
 		}
+		_ = dev.Close()
 		cSess.Close()
 		base.Error("set network config failed:", err)
 		return err
 	}
+	startTun(dev, cSess)
 	base.Info("tls channel negotiation succeeded", "remote", cSess.ServerAddress, "port", auth.Prof.HostWithPort)
 
 	// 只有网卡和路由设置成功才会进行下一步

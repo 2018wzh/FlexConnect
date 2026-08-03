@@ -106,6 +106,7 @@ type CloseInfo struct {
 type DtlsSession struct {
 	closeOnce sync.Once
 	CloseChan chan struct{}
+	owner     *ConnSession
 }
 
 func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
@@ -130,6 +131,7 @@ func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
 			CloseChan: make(chan struct{}),
 		},
 	}
+	cSess.DSess.owner = cSess
 	sess.CSess = cSess
 
 	sess.ActiveClose = false
@@ -331,9 +333,13 @@ func (cSess *ConnSession) Close() {
 			cSess.DSess.Close()
 		}
 		close(cSess.CloseChan)
-		Sess.CSess = nil
-
-		close(Sess.CloseChan)
+		// A reconnect can create a new ConnSession before all goroutines from
+		// the previous session have returned. Do not let a stale session clear
+		// or signal the replacement session through the process-global fields.
+		if cSess.Sess != nil && cSess.Sess.CSess == cSess {
+			cSess.Sess.CSess = nil
+			close(cSess.Sess.CloseChan)
+		}
 	})
 }
 
@@ -341,9 +347,9 @@ func (dSess *DtlsSession) Close() {
 	dSess.closeOnce.Do(func() {
 		base.Info("dtls session close")
 		close(dSess.CloseChan)
-		if Sess.CSess != nil {
-			Sess.CSess.DtlsConnected.Store(false)
-			Sess.CSess.DTLSCipherSuite = ""
+		if dSess.owner != nil {
+			dSess.owner.DtlsConnected.Store(false)
+			dSess.owner.DTLSCipherSuite = ""
 		}
 	})
 }

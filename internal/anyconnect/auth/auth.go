@@ -95,7 +95,7 @@ func init() {
 
 // InitAuth 确定用户组和服务端认证地址 AuthPath
 func InitAuth() error {
-	return initAuth(nil)
+	return initAuth(configuredLocalAddr())
 }
 
 // InitAuthWithLocalIP is used by diagnostics that need to pin the initial
@@ -107,6 +107,14 @@ func InitAuthWithLocalIP(localIP string) error {
 		return fmt.Errorf("invalid local IPv4 address %q", localIP)
 	}
 	return initAuth(&net.TCPAddr{IP: ip})
+}
+
+func configuredLocalAddr() net.Addr {
+	ip := net.ParseIP(strings.TrimSpace(base.LocalInterface.Ip4)).To4()
+	if ip == nil {
+		return nil
+	}
+	return &net.TCPAddr{IP: ip}
 }
 
 func initAuth(localAddr net.Addr) error {
@@ -126,7 +134,7 @@ func initAuth(localAddr net.Addr) error {
 		base.Error("auth tcp connect failed:", err)
 		return err
 	}
-	base.Info("auth tcp connection established", Conn.RemoteAddr().String())
+	base.Info("auth tcp connection established", "local", Conn.LocalAddr().String(), "remote", Conn.RemoteAddr().String())
 	BufR = bufio.NewReader(Conn)
 	// base.Info(Conn.ConnectionState().Version)
 

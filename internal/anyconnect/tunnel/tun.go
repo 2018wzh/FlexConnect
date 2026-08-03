@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"runtime"
@@ -24,7 +25,7 @@ var offset = 0 // reserve space for header
 
 var getLocalInterface = osnet.GetLocalInterface
 
-func setupTun(cSess *session.ConnSession) error {
+func setupTun(cSess *session.ConnSession) (wgtun.Device, error) {
 	if runtime.GOOS == "windows" {
 		cSess.TunName = "FlexConnect"
 		setPlatformTunnelType()
@@ -37,7 +38,7 @@ func setupTun(cSess *session.ConnSession) error {
 	dev, err := wgtun.CreateTUN(cSess.TunName, cSess.MTU)
 	if err != nil {
 		base.Error("failed to creates a new tun interface")
-		return err
+		return nil, err
 	}
 	base.Info("tun interface created", "name", cSess.TunName, "mtu", cSess.MTU)
 	if runtime.GOOS == "darwin" {
@@ -49,21 +50,60 @@ func setupTun(cSess *session.ConnSession) error {
 	manager, err := osnet.NewManager(dev, cSess.TunName)
 	if err != nil {
 		_ = dev.Close()
-		return err
+		return nil, err
 	}
 	if err = waitManagerUp(context.Background(), manager, 30*time.Second); err != nil {
 		_ = manager.Close(context.Background())
 		_ = dev.Close()
-		return err
+		return nil, err
 	}
 	if name, err := dev.Name(); err == nil && name != "" {
 		cSess.TunName = name
 	}
 	cSess.NetworkManager = manager
+	return dev, nil
+}
 
+// startTun begins packet I/O only after the operating-system address and
+// routes have been installed. This mirrors the Tailscale TUN lifecycle: the
+// device can exist while it is being configured, but no packet worker owns it
+// until the configuration is known to be usable.
+func startTun(dev wgtun.Device, cSess *session.ConnSession) {
+	base.Info("start tun packet workers", "iface", cSess.TunName)
+	go watchTunEvents(dev, cSess)
 	go tunToPayloadOut(dev, cSess) // read from apps
 	go payloadInToTun(dev, cSess)  // write to apps
-	return nil
+}
+
+// watchTunEvents turns a native-device failure into a session failure. The
+// wireguard-go Device contract exposes Events for exactly this lifecycle
+// boundary; ignoring it leaves the CSTP workers alive after the interface is
+// down and makes the next failure look like a remote disconnect.
+func watchTunEvents(dev wgtun.Device, cSess *session.ConnSession) {
+	for {
+		select {
+		case <-cSess.CloseChan:
+			return
+		case event, ok := <-dev.Events():
+			if !ok {
+				select {
+				case <-cSess.CloseChan:
+					return
+				default:
+				}
+				cSess.RecordClose("tun_events_closed", "tun", io.EOF)
+				cSess.Close()
+				return
+			}
+			base.Debug("tun event", "event", event)
+			if event&wgtun.EventDown != 0 {
+				err := fmt.Errorf("TUN interface reported down")
+				cSess.RecordClose("tun_down", "tun", err)
+				cSess.Close()
+				return
+			}
+		}
+	}
 }
 
 func waitManagerUp(ctx context.Context, manager osnet.Manager, timeout time.Duration) error {
@@ -98,10 +138,6 @@ func tunToPayloadOut(dev wgtun.Device, cSess *session.ConnSession) {
 		base.Info("tun to payloadOut exit")
 		_ = dev.Close()
 	}()
-	var (
-		err error
-		n   int
-	)
 
 	sent := 0
 	for {
@@ -110,13 +146,27 @@ func tunToPayloadOut(dev wgtun.Device, cSess *session.ConnSession) {
 		pl := getPayloadBuffer()
 		bufs := [][]byte{pl.Data}
 		sizes := []int{0}
-		_, err = dev.Read(bufs, sizes, offset) // 如果 tun 没有 up，会在这等待
-		n = sizes[0]
+		readCount, err := dev.Read(bufs, sizes, offset) // 如果 tun 没有 up，会在这等待
 		if err != nil {
+			putPayloadBuffer(pl)
 			cSess.RecordClose("tun_read_error", "tun", err)
 			base.Error("tun to payloadOut error:", err)
+			cSess.Close()
 			return
 		}
+		if readCount == 0 {
+			putPayloadBuffer(pl)
+			continue
+		}
+		if readCount != 1 || sizes[0] <= 0 || sizes[0] > len(bufs[0])-offset {
+			err := fmt.Errorf("TUN read returned count=%d size=%d", readCount, sizes[0])
+			putPayloadBuffer(pl)
+			cSess.RecordClose("tun_read_invalid", "tun", err)
+			base.Error("tun to payloadOut invalid read:", err)
+			cSess.Close()
+			return
+		}
+		n := sizes[0]
 		if sent < 3 {
 			base.Debug("tun to payloadOut", "size", n, "useDTLS", cSess.DtlsConnected.Load())
 		}
@@ -133,18 +183,9 @@ func tunToPayloadOut(dev wgtun.Device, cSess *session.ConnSession) {
 		//     }
 		// }
 
-		dSess := cSess.DSess
-		if cSess.DtlsConnected.Load() {
-			select {
-			case cSess.PayloadOutDTLS <- pl:
-			case <-dSess.CloseChan:
-			}
-		} else {
-			select {
-			case cSess.PayloadOutTLS <- pl:
-			case <-cSess.CloseChan:
-				return
-			}
+		if !sendPayloadToServer(cSess, pl) {
+			putPayloadBuffer(pl)
+			return
 		}
 	}
 }
@@ -168,15 +209,26 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 	}()
 
 	var (
-		err error
-		pl  *proto.Payload
+		err        error
+		pl         *proto.Payload
+		writeCount int
 	)
 
 	received := 0
 	for {
 		select {
-		case pl = <-cSess.PayloadIn:
+		case payload, ok := <-cSess.PayloadIn:
+			if !ok {
+				return
+			}
+			pl = payload
 		case <-cSess.CloseChan:
+			return
+		}
+		if pl == nil {
+			err := fmt.Errorf("nil payload received from CSTP worker")
+			cSess.RecordClose("payload_in_invalid", "tun", err)
+			base.Error("payloadIn to tun invalid payload:", err)
 			return
 		}
 
@@ -189,7 +241,11 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 		if cSess.DynamicSplitTunneling {
 			_, srcPort, _, _ := utils.ResolvePacket(pl.Data)
 			if srcPort == 53 {
-				go dynamicSplitRoutes(pl.Data, cSess)
+				// The payload buffer returns to a sync.Pool immediately after the
+				// TUN write. Give the asynchronous DNS parser an owned snapshot so
+				// a later packet cannot overwrite the bytes it is still parsing.
+				data := append([]byte(nil), pl.Data...)
+				go dynamicSplitRoutes(data, cSess)
 			}
 		}
 		// base.Debug("payloadInToTun")
@@ -203,23 +259,26 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 		if offset > 0 {
 			expand := make([]byte, offset+len(pl.Data))
 			copy(expand[offset:], pl.Data)
-			_, err = dev.Write([][]byte{expand}, offset)
+			writeCount, err = dev.Write([][]byte{expand}, offset)
 		} else {
-			_, err = dev.Write([][]byte{pl.Data}, offset)
+			writeCount, err = dev.Write([][]byte{pl.Data}, offset)
 		}
 
 		if received < 3 {
 			base.Debug("payloadIn to tun", "size", len(pl.Data))
 		}
 		received++
+		if err == nil && writeCount != 1 {
+			err = fmt.Errorf("TUN write returned count=%d", writeCount)
+		}
+		// 释放由 serverToPayloadIn 申请的内存 before handling either success
+		// or failure; the failure path otherwise leaks a pooled buffer.
+		putPayloadBuffer(pl)
 		if err != nil {
 			cSess.RecordClose("tun_write_error", "tun", err)
 			base.Error("payloadIn to tun error:", err)
 			return
 		}
-
-		// 释放由 serverToPayloadIn 申请的内存
-		putPayloadBuffer(pl)
 	}
 }
 

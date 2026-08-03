@@ -27,3 +27,27 @@ func TestConnSessionClassifiesActiveClose(t *testing.T) {
 		t.Fatalf("close info = %+v", info)
 	}
 }
+
+func TestStaleSessionCloseDoesNotSignalReplacement(t *testing.T) {
+	sess := &Session{}
+	oldSession := sess.NewConnSession(&http.Header{})
+	newSession := sess.NewConnSession(&http.Header{})
+
+	oldSession.Close()
+
+	if sess.CSess != newSession {
+		t.Fatal("stale session cleared the replacement session")
+	}
+	select {
+	case <-newSession.CloseChan:
+		t.Fatal("stale session closed the replacement close channel")
+	default:
+	}
+	select {
+	case <-sess.CloseChan:
+		t.Fatal("stale session closed the replacement session notification")
+	default:
+	}
+
+	newSession.Close()
+}

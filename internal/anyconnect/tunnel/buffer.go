@@ -26,6 +26,9 @@ func getPayloadBuffer() *proto.Payload {
 }
 
 func putPayloadBuffer(pl *proto.Payload) {
+	if pl == nil {
+		return
+	}
 	// DPD-REQ、KEEPALIVE 等数据
 	if cap(pl.Data) != BufferSize {
 		// base.Debug("payload is:", pl.Data)
@@ -36,4 +39,3 @@ func putPayloadBuffer(pl *proto.Payload) {
 	pl.Data = pl.Data[:BufferSize]
 	pool.Put(pl)
 }
-

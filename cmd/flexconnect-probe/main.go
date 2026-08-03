@@ -91,6 +91,7 @@ type trafficBridge struct {
 
 func main() {
 	envFile := flag.String("env-file", defaultEnvFile, "dotenv file containing ENDPOINT, USERNAME, PASSWORD, and optional GROUP")
+	endpointOverride := flag.String("endpoint", "", "optional VPN endpoint override; credentials still come from env-file")
 	observeFor := flag.Duration("observe", defaultObserveFor, "how long to keep the TLS tunnel under observation")
 	dpdInterval := flag.Duration("dpd-interval", 0, "TLS DPD interval; zero derives it from X-CSTP-DPD")
 	noDTLS := flag.Bool("no-dtls", false, "do not open the secondary DTLS channel")
@@ -115,6 +116,9 @@ func main() {
 	creds, err := loadCredentials(*envFile)
 	if err != nil {
 		fatal("load credentials: %v", err)
+	}
+	if strings.TrimSpace(*endpointOverride) != "" {
+		creds.Endpoint = strings.TrimSpace(*endpointOverride)
 	}
 	if err := run(context.Background(), creds, *observeFor, *dpdInterval, !*noDTLS, *debug, *localIP, speedtest); err != nil {
 		fatal("probe failed: %v", err)
@@ -165,6 +169,7 @@ func run(ctx context.Context, creds credentials, observeFor, dpdInterval time.Du
 	if initAuthErr != nil {
 		return initAuthErr
 	}
+	fmt.Printf("auth connection local=%s remote=%s\n", safeAddr(acAuth.Conn.LocalAddr()), safeAddr(acAuth.Conn.RemoteAddr()))
 	defer closeAuthConnection()
 	if err := acAuth.PasswordAuth(); err != nil {
 		return err
@@ -811,6 +816,13 @@ func endpointForOutput(raw string) string {
 
 func safeHeader(value string) string {
 	return strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(value, "\r", " "), "\n", " "))
+}
+
+func safeAddr(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return safeHeader(addr.String())
 }
 
 func fatal(format string, args ...any) {

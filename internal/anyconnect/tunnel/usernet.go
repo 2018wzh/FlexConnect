@@ -143,17 +143,32 @@ func (t *userTunnel) Close() error {
 func (t *userTunnel) userTunToPayloadOut() {
 	defer t.Close()
 	for {
+		t.mu.RLock()
+		dev := t.dev
+		t.mu.RUnlock()
+		if dev == nil {
+			return
+		}
 		pl := getPayloadBuffer()
 		bufs := [][]byte{pl.Data}
 		sizes := []int{0}
-		_, err := t.dev.Read(bufs, sizes, 0)
+		readCount, err := dev.Read(bufs, sizes, 0)
 		if err != nil {
 			putPayloadBuffer(pl)
 			return
 		}
-		n := sizes[0]
-		if n <= 0 {
+		if readCount != 1 {
 			putPayloadBuffer(pl)
+			base.Warn("user-space VPN tunnel returned invalid read count", "count", readCount)
+			return
+		}
+		n := sizes[0]
+		if n <= 0 || n > len(bufs[0]) {
+			putPayloadBuffer(pl)
+			if n < 0 || n > len(bufs[0]) {
+				base.Warn("user-space VPN tunnel returned invalid packet size", "size", n)
+				return
+			}
 			continue
 		}
 		pl.Data = pl.Data[:n]
@@ -174,7 +189,9 @@ func sendPayloadToServer(cSess *session.ConnSession, pl *proto.Payload) bool {
 		case cSess.PayloadOutDTLS <- pl:
 			return true
 		case <-cSess.DSess.CloseChan:
-			return false
+			// DTLS is an optimization. If it disappears while a packet is
+			// being queued, retry on the reliable CSTP channel instead of
+			// terminating the user-space tunnel.
 		case <-cSess.CloseChan:
 			return false
 		}

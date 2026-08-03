@@ -3,15 +3,134 @@ package vpn
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"net/http"
 	"net/netip"
+	"os"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"flexconnect/internal/anyconnect/auth"
 	"flexconnect/internal/anyconnect/base"
+	"flexconnect/internal/anyconnect/proto"
 	"flexconnect/internal/anyconnect/session"
 	"flexconnect/internal/osnet"
+	wgtun "github.com/tailscale/wireguard-go/tun"
 )
+
+type testTUNDevice struct {
+	events    chan wgtun.Event
+	readErr   error
+	writeErr  error
+	closeOnce sync.Once
+}
+
+func newTestTUNDevice() *testTUNDevice {
+	return &testTUNDevice{events: make(chan wgtun.Event, 1)}
+}
+
+func (d *testTUNDevice) File() *os.File { return nil }
+func (d *testTUNDevice) Read(_ [][]byte, _ []int, _ int) (int, error) {
+	if d.readErr != nil {
+		return 0, d.readErr
+	}
+	return 0, nil
+}
+func (d *testTUNDevice) Write(_ [][]byte, _ int) (int, error) {
+	if d.writeErr != nil {
+		return 0, d.writeErr
+	}
+	return 1, nil
+}
+func (d *testTUNDevice) MTU() (int, error)          { return 1399, nil }
+func (d *testTUNDevice) Name() (string, error)      { return "test-tun", nil }
+func (d *testTUNDevice) Events() <-chan wgtun.Event { return d.events }
+func (d *testTUNDevice) BatchSize() int             { return 1 }
+func (d *testTUNDevice) Close() error {
+	d.closeOnce.Do(func() { close(d.events) })
+	return nil
+}
+
+func waitSessionClosed(t *testing.T, cSess *session.ConnSession) {
+	t.Helper()
+	select {
+	case <-cSess.CloseChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not close")
+	}
+}
+
+func TestWatchTunEventsClosesSessionOnDown(t *testing.T) {
+	sess := &session.Session{}
+	cSess := sess.NewConnSession(&http.Header{})
+	dev := newTestTUNDevice()
+
+	done := make(chan struct{})
+	go func() {
+		watchTunEvents(dev, cSess)
+		close(done)
+	}()
+	dev.events <- wgtun.EventDown
+
+	waitSessionClosed(t, cSess)
+	if info := cSess.CloseInfo(); info.Code != "tun_down" || info.Transport != "tun" {
+		t.Fatalf("close info = %+v", info)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TUN event watcher did not stop")
+	}
+}
+
+func TestTunReadErrorClosesSession(t *testing.T) {
+	sess := &session.Session{}
+	cSess := sess.NewConnSession(&http.Header{})
+	dev := newTestTUNDevice()
+	dev.readErr = errors.New("read failed")
+
+	done := make(chan struct{})
+	go func() {
+		tunToPayloadOut(dev, cSess)
+		close(done)
+	}()
+
+	waitSessionClosed(t, cSess)
+	if info := cSess.CloseInfo(); info.Code != "tun_read_error" || info.Transport != "tun" {
+		t.Fatalf("close info = %+v", info)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TUN read worker did not stop")
+	}
+}
+
+func TestTunWriteErrorClosesSession(t *testing.T) {
+	sess := &session.Session{}
+	cSess := sess.NewConnSession(&http.Header{})
+	dev := newTestTUNDevice()
+	dev.writeErr = errors.New("write failed")
+	cSess.PayloadIn <- &proto.Payload{Data: make([]byte, 20)}
+
+	done := make(chan struct{})
+	go func() {
+		payloadInToTun(dev, cSess)
+		close(done)
+	}()
+
+	waitSessionClosed(t, cSess)
+	if info := cSess.CloseInfo(); info.Code != "tun_write_error" || info.Transport != "tun" {
+		t.Fatalf("close info = %+v", info)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TUN write worker did not stop")
+	}
+}
 
 func TestBuildOSNetConfig(t *testing.T) {
 	getLocalInterface = func(context.Context) (osnet.LocalInterface, error) {
