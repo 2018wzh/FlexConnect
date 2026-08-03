@@ -163,3 +163,23 @@ func DiffPrefixes(old map[netip.Prefix]bool, next []netip.Prefix) (add, del []ne
 	}
 	return add, del, state
 }
+
+func withoutPrefixes(prefixes, removed []netip.Prefix) []netip.Prefix {
+	// The protected server prefix is installed separately before tunnel routes;
+	// avoid attempting to add the same host route a second time.
+	if len(prefixes) == 0 || len(removed) == 0 {
+		return append([]netip.Prefix(nil), prefixes...)
+	}
+	removedSet := make(map[netip.Prefix]struct{}, len(removed))
+	for _, prefix := range removed {
+		removedSet[prefix.Masked()] = struct{}{}
+	}
+	out := make([]netip.Prefix, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		if _, ok := removedSet[prefix.Masked()]; ok {
+			continue
+		}
+		out = append(out, prefix)
+	}
+	return out
+}

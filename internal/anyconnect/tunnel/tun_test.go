@@ -47,8 +47,18 @@ func TestBuildOSNetConfig(t *testing.T) {
 			t.Fatalf("IncludeRoutes[%d] = %s, want %s", i, cfg.IncludeRoutes[i], wantInclude[i])
 		}
 	}
-	if got := cfg.ExcludeRoutes[1].String(); got != "198.51.100.0/24" {
-		t.Fatalf("ExcludeRoutes[1] = %s", got)
+	wantExclude := []netip.Prefix{
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("222.66.117.109/32"),
+	}
+	if len(cfg.ExcludeRoutes) != len(wantExclude) {
+		t.Fatalf("ExcludeRoutes = %v, want %v", cfg.ExcludeRoutes, wantExclude)
+	}
+	for i := range wantExclude {
+		if cfg.ExcludeRoutes[i] != wantExclude[i] {
+			t.Fatalf("ExcludeRoutes[%d] = %s, want %s", i, cfg.ExcludeRoutes[i], wantExclude[i])
+		}
 	}
 	if len(cfg.DNSServers) != 2 || cfg.DNSServers[0].String() != "202.120.80.2" {
 		t.Fatalf("DNSServers = %v", cfg.DNSServers)
@@ -109,6 +119,21 @@ func TestBuildOSNetConfigAddsDefaultRouteWhenServerIncludesAreEmpty(t *testing.T
 	}
 	if len(cfg.IncludeRoutes) != 1 || cfg.IncludeRoutes[0].String() != "0.0.0.0/0" {
 		t.Fatalf("IncludeRoutes = %v", cfg.IncludeRoutes)
+	}
+}
+
+func TestBuildOSNetConfigRejectsInvalidServerAddress(t *testing.T) {
+	getLocalInterface = func(context.Context) (osnet.LocalInterface, error) {
+		return osnet.LocalInterface{}, nil
+	}
+	t.Cleanup(func() { getLocalInterface = osnet.GetLocalInterface })
+	cSess := &session.ConnSession{
+		VPNAddress:    "172.20.144.185",
+		VPNMask:       "255.255.255.255",
+		ServerAddress: "vpn.example.test",
+	}
+	if _, err := buildOSNetConfig(cSess); err == nil {
+		t.Fatal("buildOSNetConfig accepted an invalid VPN server address")
 	}
 }
 

@@ -2,9 +2,11 @@ package vpn
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"runtime"
+	"strings"
 	"time"
 
 	"flexconnect/internal/anyconnect/base"
@@ -276,6 +278,10 @@ func buildOSNetConfig(cSess *session.ConnSession) (*osnet.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	serverAddress, err := parseServerAddress(cSess.ServerAddress)
+	if err != nil {
+		return nil, err
+	}
 	include, err := osnet.ParsePrefixes(cSess.SplitInclude)
 	if err != nil {
 		return nil, err
@@ -286,6 +292,10 @@ func buildOSNetConfig(cSess *session.ConnSession) (*osnet.Config, error) {
 	}
 	if cSess.UseDefaultRouteWhenEmpty && len(include) == 0 {
 		include = append(include, netip.PrefixFrom(netip.IPv4Unspecified(), 0))
+	}
+	if serverAddress.IsValid() {
+		exclude = appendUniquePrefix(exclude, netip.PrefixFrom(serverAddress, serverAddress.BitLen()))
+		base.Debug("protect vpn server route", "serverAddress", serverAddress.String())
 	}
 	dns, err := osnet.ParseAddrs(cSess.DNS)
 	if err != nil {
@@ -307,9 +317,7 @@ func buildOSNetConfig(cSess *session.ConnSession) (*osnet.Config, error) {
 			}
 		}
 	}
-	if addr, err := netip.ParseAddr(cSess.ServerAddress); err == nil {
-		cfg.ServerAddress = addr.Unmap()
-	}
+	cfg.ServerAddress = serverAddress
 	if !cfg.Gateway.IsValid() {
 		if addr, err := netip.ParseAddr(base.LocalInterface.Gateway); err == nil {
 			cfg.Gateway = addr.Unmap()
@@ -322,6 +330,28 @@ func buildOSNetConfig(cSess *session.ConnSession) (*osnet.Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+func parseServerAddress(raw string) (netip.Addr, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return netip.Addr{}, nil
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("invalid VPN server address %q: %w", raw, err)
+	}
+	return addr.Unmap(), nil
+}
+
+func appendUniquePrefix(prefixes []netip.Prefix, prefix netip.Prefix) []netip.Prefix {
+	prefix = prefix.Masked()
+	for _, existing := range prefixes {
+		if existing.Masked() == prefix {
+			return prefixes
+		}
+	}
+	return append(prefixes, prefix)
 }
 
 func collectDynamicRoutes(cSess *session.ConnSession) osnet.DynamicRoutes {

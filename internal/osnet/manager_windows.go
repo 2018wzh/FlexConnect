@@ -92,7 +92,7 @@ func (m *platformManager) Set(ctx context.Context, cfg *Config) error {
 	if err := m.syncRoutes(&m.routes, cfg.IncludeRoutes, m.tunLUID, cfg.VPNAddress.Addr(), 6); err != nil {
 		return err
 	}
-	if err := m.syncRoutes(&m.exclude, cfg.ExcludeRoutes, m.gatewayLUID, m.gateway, 5); err != nil {
+	if err := m.syncRoutes(&m.exclude, withoutPrefixes(cfg.ExcludeRoutes, server), m.gatewayLUID, m.gateway, 5); err != nil {
 		return err
 	}
 	if err := m.setDNS(cfg.DNSServers); err != nil {

@@ -52,3 +52,24 @@ func TestDiffPrefixes(t *testing.T) {
 		t.Fatalf("state = %v", state)
 	}
 }
+
+func TestWithoutPrefixesRemovesMaskedDuplicates(t *testing.T) {
+	routes := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.1/8"),
+		netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+	}
+	got := withoutPrefixes(routes, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+	want := []netip.Prefix{
+		netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("withoutPrefixes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("withoutPrefixes[%d] = %s, want %s", i, got[i], want[i])
+		}
+	}
+}

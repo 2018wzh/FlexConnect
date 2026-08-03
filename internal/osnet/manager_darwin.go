@@ -56,7 +56,7 @@ func (m *platformManager) Set(ctx context.Context, cfg *Config) error {
 	if err := m.syncRoutes(ctx, &m.includeRoutes, cfg.IncludeRoutes, m.vpnAddr); err != nil {
 		return err
 	}
-	if err := m.syncRoutes(ctx, &m.excludeRoutes, cfg.ExcludeRoutes, m.gateway); err != nil {
+	if err := m.syncRoutes(ctx, &m.excludeRoutes, withoutPrefixes(cfg.ExcludeRoutes, server), m.gateway); err != nil {
 		return err
 	}
 	if len(cfg.DNSServers) > 0 {
