@@ -2,7 +2,6 @@ package anyconnect
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -27,13 +26,14 @@ type Backend struct {
 	monitor       osnet.Monitor
 	monitorCancel context.CancelFunc
 	monitorID     string
+	newMonitor    func(ctx context.Context, opts osnet.MonitorOptions) (osnet.Monitor, error)
 	active        *acRPC.Connection
 }
 
 func New() *Backend {
 	acBase.Setup()
 	acBase.Info("vpn backend initialized")
-	return &Backend{events: make(chan vpn.Event, 32)}
+	return &Backend{events: make(chan vpn.Event, 32), newMonitor: osnet.NewMonitor}
 }
 
 func (b *Backend) Connect(ctx context.Context, profile types.Profile, password string) (*types.SessionInfo, error) {
@@ -108,6 +108,10 @@ func (b *Backend) monitorClose(cSess *acSession.ConnSession, connectionID string
 	}
 	acBase.Info("vpn monitor close started")
 	<-cSess.CloseChan
+	// Sessions can end for reasons that never pass through Backend.Disconnect
+	// (server disconnect, transport failure). Release the underlay monitor
+	// here too so the next connect does not inherit a stale one.
+	b.stopMonitorFor(connectionID)
 	acBase.Info("vpn monitor close done")
 	info := cSess.CloseInfo()
 	faults := make([]vpn.TransportFault, 0, len(info.TransportFaults))
@@ -228,10 +232,14 @@ func (b *Backend) startUnderlayMonitor(cSess *acSession.ConnSession, connectionI
 	b.monitorMu.Lock()
 	defer b.monitorMu.Unlock()
 	if b.monitor != nil {
-		return errors.New("underlay monitor already active")
+		// A leftover monitor means the previous session ended without going
+		// through Backend.Disconnect. Replacing it keeps a new profile or
+		// reconnect from failing on "underlay monitor already active".
+		acBase.Warn("replacing stale underlay monitor", "previous", b.monitorID, "current", connectionID)
+		b.stopUnderlayMonitorLocked()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	monitor, err := osnet.NewMonitor(ctx, osnet.MonitorOptions{ExcludeInterface: cSess.TunName})
+	monitor, err := b.newMonitor(ctx, osnet.MonitorOptions{ExcludeInterface: cSess.TunName})
 	if err != nil {
 		cancel()
 		return err
@@ -267,6 +275,22 @@ func (b *Backend) watchUnderlay(ctx context.Context, monitor osnet.Monitor, conn
 func (b *Backend) stopUnderlayMonitor() {
 	b.monitorMu.Lock()
 	defer b.monitorMu.Unlock()
+	b.stopUnderlayMonitorLocked()
+}
+
+// stopMonitorFor releases the monitor only when it still belongs to the given
+// connection, so a delayed teardown of an old session cannot stop the monitor
+// of its replacement.
+func (b *Backend) stopMonitorFor(connectionID string) {
+	b.monitorMu.Lock()
+	defer b.monitorMu.Unlock()
+	if connectionID != "" && b.monitorID != connectionID {
+		return
+	}
+	b.stopUnderlayMonitorLocked()
+}
+
+func (b *Backend) stopUnderlayMonitorLocked() {
 	if b.monitorCancel != nil {
 		b.monitorCancel()
 	}

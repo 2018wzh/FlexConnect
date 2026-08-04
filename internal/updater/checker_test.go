@@ -87,7 +87,7 @@ func TestCheckParsesLatestRelease(t *testing.T) {
 	if info.CurrentVersion != buildinfo.Version {
 		t.Errorf("CurrentVersion = %q, want %q", info.CurrentVersion, buildinfo.Version)
 	}
-	// 9.9.9 is newer than the current build version (1.2.0).
+	// 9.9.9 is newer than the current build version (1.2.1).
 	if !info.UpdateAvailable {
 		t.Error("expected UpdateAvailable=true")
 	}
