@@ -151,6 +151,7 @@ func SetupTunnelWithClient(client *auth.Client, sess *session.Session) error {
 			_ = cSess.NetworkManager.Close(context.Background())
 		}
 		_ = dev.Close()
+		cSess.RecordClose("net_config_build_failed", "network", err)
 		cSess.Close()
 		base.Error("build network config failed:", err)
 		return err
@@ -162,6 +163,7 @@ func SetupTunnelWithClient(client *auth.Client, sess *session.Session) error {
 			_ = cSess.NetworkManager.Close(context.Background())
 		}
 		_ = dev.Close()
+		cSess.RecordClose("net_config_apply_failed", "network", err)
 		cSess.Close()
 		base.Error("set network config failed:", err)
 		return err

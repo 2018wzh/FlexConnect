@@ -51,3 +51,28 @@ func TestStaleSessionCloseDoesNotSignalReplacement(t *testing.T) {
 
 	newSession.Close()
 }
+
+func TestEffectiveDPDFallsBackWhenServerDoesNotAdvertise(t *testing.T) {
+	if got := EffectiveDPD(0); got != defaultDPDSeconds {
+		t.Fatalf("EffectiveDPD(0) = %d, want %d", got, defaultDPDSeconds)
+	}
+	if got := EffectiveDPD(-5); got != defaultDPDSeconds {
+		t.Fatalf("EffectiveDPD(-5) = %d, want %d", got, defaultDPDSeconds)
+	}
+	if got := EffectiveDPD(25); got != 25 {
+		t.Fatalf("EffectiveDPD(25) = %d, want 25", got)
+	}
+}
+
+func TestTunnelDoneDefaultsToNil(t *testing.T) {
+	sess := &Session{}
+	c := sess.NewConnSession(&http.Header{})
+	if c.TunnelDone() != nil {
+		t.Fatal("TunnelDone should be nil before a controller registers")
+	}
+	done := make(chan struct{})
+	c.SetTunnelDone(done)
+	if c.TunnelDone() == nil {
+		t.Fatal("TunnelDone should expose the registered channel")
+	}
+}

@@ -58,6 +58,7 @@ func (c *TunnelController) Start() error {
 	c.state = "Running"
 	c.stateMu.Unlock()
 	c.cSess.SetCloseHook(func() { _ = c.Close(context.Background()) })
+	c.cSess.SetTunnelDone(c.done)
 	c.cSess.SetLifecycleState("Running")
 	c.workers.Add(3)
 	go func() {

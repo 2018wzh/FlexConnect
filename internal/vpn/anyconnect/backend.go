@@ -40,6 +40,15 @@ func (b *Backend) Connect(ctx context.Context, profile types.Profile, password s
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// A lingering connection means the previous teardown never completed; a
+	// new session would reuse the same TUN device name and fight the stale
+	// packet workers for routes. Drain it before dialing.
+	if stale := b.active; stale != nil {
+		acBase.Warn("tearing down lingering connection before new connect")
+		_ = stale.Disconnect(context.Background())
+		b.active = nil
+	}
+
 	acBase.Info("vpn connect start", "host", profile.ServerURL, "username", profile.Username)
 	connection := acRPC.NewConnection(buildAuthProfile(profile, password))
 	b.active = connection

@@ -1,0 +1,99 @@
+package rpc
+
+import (
+	"context"
+	"net/http"
+	"sync"
+	"testing"
+	"time"
+
+	"flexconnect/internal/anyconnect/session"
+	"flexconnect/internal/osnet"
+)
+
+type fakeManager struct {
+	mu     sync.Mutex
+	closed int
+}
+
+func (m *fakeManager) Up(context.Context) error { return nil }
+func (m *fakeManager) Set(context.Context, *osnet.Config) error {
+	return nil
+}
+func (m *fakeManager) SetDynamicRoutes(context.Context, osnet.DynamicRoutes) error {
+	return nil
+}
+func (m *fakeManager) Close(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed++
+	return nil
+}
+
+func (m *fakeManager) closeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
+
+func TestDisconnectWithoutSessionIsNoop(t *testing.T) {
+	connection := &Connection{Session: &session.Session{}}
+	if err := connection.Disconnect(context.Background()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	var nilConnection *Connection
+	if err := nilConnection.Disconnect(context.Background()); err != nil {
+		t.Fatalf("nil Disconnect: %v", err)
+	}
+}
+
+func TestDisconnectClosesManagerWhenControllerNeverStarted(t *testing.T) {
+	sess := &session.Session{}
+	cSess := sess.NewConnSession(&http.Header{})
+	manager := &fakeManager{}
+	cSess.NetworkManager = manager
+
+	connection := &Connection{Session: sess}
+	if err := connection.Disconnect(context.Background()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	select {
+	case <-cSess.CloseChan:
+	default:
+		t.Fatal("session close channel was not signaled")
+	}
+	if manager.closeCount() != 1 {
+		t.Fatalf("manager closed %d times, want 1", manager.closeCount())
+	}
+	if info := cSess.CloseInfo(); info.Code != "local_requested" || info.Transport != "local" {
+		t.Fatalf("close info = %+v", info)
+	}
+}
+
+func TestDisconnectWaitsForOwnedTunnelDrain(t *testing.T) {
+	sess := &session.Session{}
+	cSess := sess.NewConnSession(&http.Header{})
+	manager := &fakeManager{}
+	cSess.NetworkManager = manager
+
+	done := make(chan struct{})
+	cSess.SetTunnelDone(done)
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		close(done)
+	}()
+
+	connection := &Connection{Session: sess}
+	start := time.Now()
+	if err := connection.Disconnect(context.Background()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("Disconnect returned before the tunnel drained (%v)", elapsed)
+	}
+	// The tunnel controller owns the manager once it has started; the RPC
+	// disconnect must not close it a second time.
+	if manager.closeCount() != 0 {
+		t.Fatalf("manager closed %d times, want 0 while controller owns teardown", manager.closeCount())
+	}
+}

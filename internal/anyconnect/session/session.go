@@ -98,6 +98,21 @@ type ConnSession struct {
 	transportFaults []TransportFault
 	closeHookMu     sync.Mutex
 	closeHook       func()
+	tunnelDone      chan struct{}
+}
+
+// defaultDPDSeconds substitutes for a dead-peer interval the server did not
+// advertise. A zero interval must not collapse the transport read deadline to
+// a few seconds and drop idle sessions.
+const defaultDPDSeconds = 30
+
+// EffectiveDPD normalizes the server-advertised dead-peer detection interval
+// so transport read deadlines stay meaningful when a header is missing.
+func EffectiveDPD(advertised int) int {
+	if advertised <= 0 {
+		return defaultDPDSeconds
+	}
+	return advertised
 }
 
 type TransportFault struct {
@@ -386,6 +401,29 @@ func (cSess *ConnSession) Close() {
 			hook()
 		}
 	})
+}
+
+// SetTunnelDone registers the channel the tunnel controller closes after all
+// packet workers have drained. Disconnect paths wait on it so a replacement
+// connection never races the previous teardown.
+func (cSess *ConnSession) SetTunnelDone(done chan struct{}) {
+	if cSess == nil || done == nil {
+		return
+	}
+	cSess.closeHookMu.Lock()
+	cSess.tunnelDone = done
+	cSess.closeHookMu.Unlock()
+}
+
+// TunnelDone returns the tunnel controller drain channel, or nil when no
+// controller owns the TUN device for this session.
+func (cSess *ConnSession) TunnelDone() <-chan struct{} {
+	if cSess == nil {
+		return nil
+	}
+	cSess.closeHookMu.Lock()
+	defer cSess.closeHookMu.Unlock()
+	return cSess.tunnelDone
 }
 
 func (cSess *ConnSession) SetCloseHook(hook func()) {

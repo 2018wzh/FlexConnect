@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"flexconnect/internal/anyconnect/auth"
 	"flexconnect/internal/anyconnect/base"
@@ -11,6 +12,12 @@ import (
 	acvpn "flexconnect/internal/anyconnect/tunnel"
 	"flexconnect/internal/osnet"
 )
+
+// disconnectDrainTimeout bounds how long a disconnect waits for the tunnel
+// controller to stop its packet workers before handing control back. A new
+// connection reuses the same TUN device name, so a slow teardown must not
+// block the control plane indefinitely.
+const disconnectDrainTimeout = 15 * time.Second
 
 // Connection owns the authentication and VPN session state for one connect
 // attempt.
@@ -30,7 +37,7 @@ func (c *Connection) Connect(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("nil VPN connection context")
 	}
-	if err := refreshConnectionInterface(c); err != nil {
+	if err := refreshConnectionInterface(c, ctx); err != nil {
 		return err
 	}
 	if strings.Contains(c.Auth.Prof.Host, ":") {
@@ -67,19 +74,41 @@ func (c *Connection) Disconnect(ctx context.Context) error {
 		}
 	}
 	if c.Session.CSess != nil {
-		if c.Session.CSess.NetworkManager != nil {
-			if err := c.Session.CSess.NetworkManager.Close(ctx); err != nil && first == nil {
+		cSess := c.Session.CSess
+		cSess.RecordClose("local_requested", "local", nil)
+		cSess.Close()
+		// The tunnel controller owns the TUN device and network manager once
+		// it has started; wait for its ordered drain instead of closing the
+		// manager out from under the packet workers. When no controller took
+		// ownership, fall back to closing the manager directly.
+		if done := cSess.TunnelDone(); done != nil {
+			timer := time.NewTimer(disconnectDrainTimeout)
+			defer timer.Stop()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				if first == nil {
+					first = ctx.Err()
+				}
+			case <-timer.C:
+				base.Warn("tunnel drain timed out during disconnect")
+				if cSess.NetworkManager != nil {
+					if err := cSess.NetworkManager.Close(ctx); err != nil && first == nil {
+						first = err
+					}
+				}
+			}
+		} else if cSess.NetworkManager != nil {
+			if err := cSess.NetworkManager.Close(ctx); err != nil && first == nil {
 				first = err
 			}
 		}
-		c.Session.CSess.RecordClose("local_requested", "local", nil)
-		c.Session.CSess.Close()
 	}
 	return first
 }
 
-func refreshConnectionInterface(c *Connection) error {
-	info, err := osnet.GetLocalInterface(context.Background())
+func refreshConnectionInterface(c *Connection, ctx context.Context) error {
+	info, err := osnet.GetLocalInterface(ctx)
 	if err != nil {
 		return err
 	}

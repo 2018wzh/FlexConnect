@@ -21,7 +21,7 @@ func dtlsChannel(cSess *session.ConnSession) {
 		dSess         *session.DtlsSession
 		err           error
 		bytesReceived int
-		dead          = time.Duration(cSess.DTLSDpdTime+5) * time.Second
+		dead          = time.Duration(session.EffectiveDPD(cSess.DTLSDpdTime)+5) * time.Second
 	)
 	base.Info("start dtls channel", "server", cSess.ServerAddress)
 	cSess.SetDTLSState("Starting")

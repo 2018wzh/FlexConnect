@@ -28,7 +28,7 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 	}()
 	cSess.SetTLSState("Ready")
 	base.Info("start tls channel", "peer", conn.RemoteAddr().String())
-	dead := time.Duration(cSess.TLSDpdTime+5) * time.Second
+	dead := time.Duration(session.EffectiveDPD(cSess.TLSDpdTime)+5) * time.Second
 
 	go payloadOutTLSToServer(conn, cSess)
 
