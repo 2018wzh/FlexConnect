@@ -6,11 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"flexconnect/internal/ipc"
+	"flexconnect/internal/logging"
 	"flexconnect/internal/secret"
 	"flexconnect/internal/types"
 )
@@ -21,6 +23,8 @@ const (
 	defaultSecretStore    = "keyring"
 	defaultStartupProfile = "docker"
 	defaultConnectTimeout = 2 * time.Minute
+	keyringService        = "flexconnect"
+	fileSecretName        = "secrets.json"
 )
 
 type envLookup func(string) (string, bool)
@@ -247,20 +251,47 @@ func bootstrapStartup(ctx context.Context, daemon startupDaemon, cfg *startupCon
 	return nil
 }
 
-func newSecretStore(kind string) (secret.Store, error) {
+// fileSecretPath derives the fallback secret file from the daemon state path,
+// so the secrets live next to state.json (for example
+// /var/lib/flexconnect/secrets.json).
+func fileSecretPath(statePath string) string {
+	if strings.TrimSpace(statePath) == "" {
+		statePath = defaultStatePath()
+	}
+	return filepath.Join(filepath.Dir(statePath), fileSecretName)
+}
+
+// newSecretStore builds the secret.Store selected by kind. The default
+// "keyring" mode probes the OS keyring and automatically falls back to a file
+// secret store when no keyring is available, so the daemon still starts on
+// headless hosts.
+func newSecretStore(statePath, kind string) (secret.Store, error) {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "", "keyring":
-		return secret.NewKeyringStore("flexconnect"), nil
+		ks := secret.NewKeyringStore(keyringService)
+		if err := ks.Probe(); err != nil {
+			path := fileSecretPath(statePath)
+			logging.WithComponent("flexconnectd").Warnf(
+				"OS keyring unavailable (%v); falling back to file secret store at %s", err, path)
+			return secret.NewFileStore(path), nil
+		}
+		return ks, nil
+	case "file":
+		return secret.NewFileStore(fileSecretPath(statePath)), nil
 	case "memory":
 		return secret.NewMemoryStore(), nil
 	default:
-		return nil, fmt.Errorf("invalid FLEXCONNECT_SECRET_STORE %q: expected keyring or memory", kind)
+		return nil, fmt.Errorf("invalid FLEXCONNECT_SECRET_STORE %q: expected keyring, memory, or file", kind)
 	}
 }
 
 func validateSecretStore(kind string) error {
-	_, err := newSecretStore(kind)
-	return err
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "", "keyring", "memory", "file":
+		return nil
+	default:
+		return fmt.Errorf("invalid FLEXCONNECT_SECRET_STORE %q: expected keyring, memory, or file", kind)
+	}
 }
 
 func envStringDefault(lookup envLookup, key, fallback string) string {

@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zalando/go-keyring"
+
+	"flexconnect/internal/secret"
 	"flexconnect/internal/types"
 )
 
@@ -53,7 +56,7 @@ func TestParseDaemonOptionsRejectsInvalidEnv(t *testing.T) {
 		},
 		{
 			name: "bad secret store",
-			env:  mapEnv{"FLEXCONNECT_SECRET_STORE": "file"},
+			env:  mapEnv{"FLEXCONNECT_SECRET_STORE": "vault"},
 			want: "FLEXCONNECT_SECRET_STORE",
 		},
 		{
@@ -320,6 +323,74 @@ func TestBootstrapStartupFailsWhenRequiredSOCKS5IsNotListening(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "SOCKS5") {
 		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestNewSecretStoreUsesKeyringWhenAvailable(t *testing.T) {
+	keyring.MockInit()
+	defer keyring.MockInit()
+
+	store, err := newSecretStore(filepath.Join(t.TempDir(), "state.json"), "keyring")
+	if err != nil {
+		t.Fatalf("newSecretStore: %v", err)
+	}
+	if _, ok := store.(*secret.KeyringStore); !ok {
+		t.Fatalf("store = %T, want *secret.KeyringStore", store)
+	}
+}
+
+func TestNewSecretStoreFallsBackToFileWhenKeyringUnavailable(t *testing.T) {
+	keyring.MockInitWithError(errors.New("no secret service available"))
+	defer keyring.MockInit()
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	store, err := newSecretStore(statePath, "keyring")
+	if err != nil {
+		t.Fatalf("newSecretStore: %v", err)
+	}
+	fileStore, ok := store.(*secret.FileStore)
+	if !ok {
+		t.Fatalf("store = %T, want *secret.FileStore", store)
+	}
+	// The fallback store must be fully functional.
+	if err := fileStore.Put("profile/corp", "pw"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got, err := fileStore.Get("profile/corp"); err != nil || got != "pw" {
+		t.Fatalf("Get = %q, %v", got, err)
+	}
+}
+
+func TestNewSecretStoreExplicitFileAndMemory(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	store, err := newSecretStore(statePath, "file")
+	if err != nil {
+		t.Fatalf("newSecretStore(file): %v", err)
+	}
+	if _, ok := store.(*secret.FileStore); !ok {
+		t.Fatalf("store = %T, want *secret.FileStore", store)
+	}
+
+	store, err = newSecretStore(statePath, "memory")
+	if err != nil {
+		t.Fatalf("newSecretStore(memory): %v", err)
+	}
+	if _, ok := store.(*secret.MemoryStore); !ok {
+		t.Fatalf("store = %T, want *secret.MemoryStore", store)
+	}
+}
+
+func TestNewSecretStoreRejectsUnknownKind(t *testing.T) {
+	if _, err := newSecretStore(t.TempDir(), "vault"); err == nil || !strings.Contains(err.Error(), "FLEXCONNECT_SECRET_STORE") {
+		t.Fatalf("newSecretStore(vault) error = %v", err)
+	}
+}
+
+func TestFileSecretPathDerivesFromStatePath(t *testing.T) {
+	got := fileSecretPath("/var/lib/flexconnect/state.json")
+	if got != filepath.Join("/var/lib/flexconnect", "secrets.json") {
+		t.Fatalf("fileSecretPath = %q", got)
 	}
 }
 

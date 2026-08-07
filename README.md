@@ -148,7 +148,7 @@ docker pull ghcr.io/<OWNER>/flexconnect:<VERSION>
 | `FLEXCONNECT_SOCKET` | daemon 本地 Unix socket，镜像默认 `/run/flexconnect/flexconnect.sock` |
 | `FLEXCONNECT_STATE` | 状态文件路径，镜像默认 `/var/lib/flexconnect/state.json` |
 | `FLEXCONNECT_VERBOSE` | `true` 时启用 debug 日志 |
-| `FLEXCONNECT_SECRET_STORE` | `keyring` 或 `memory`；镜像默认 `memory` |
+| `FLEXCONNECT_SECRET_STORE` | `keyring`（默认，OS keyring 不可用时自动回退到 `file`）、`file`、`memory`；镜像默认 `memory` |
 | `FLEXCONNECT_CONNECT_ON_START` | `true` 时启动即 upsert Profile 并连接；镜像默认 `true` |
 | `FLEXCONNECT_CONNECT_TIMEOUT` | 启动连接超时，例如 `45s`、`2m` |
 | `FLEXCONNECT_PROFILE_ID` | 启动 Profile 的固定 ID，镜像默认 `docker` |

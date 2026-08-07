@@ -297,6 +297,11 @@ go test ./...
   outputs are ignored by `.gitignore`; do not commit them.
 - Passwords are stored through `internal/secret` using the OS keyring in production and a memory
   store in tests.
+- `FLEXCONNECT_SECRET_STORE=keyring` (the default) probes the OS keyring at startup and, when no
+  keyring is available (e.g. headless Linux without a Secret Service), automatically falls back to
+  `file`: a `0600` JSON file (`secrets.json` next to the state file) holding plaintext secrets
+  protected only by file permissions. Prefer `keyring` or `memory` where the OS keyring is not
+  needed; `file` is a degraded but functional mode.
 - Docker defaults `FLEXCONNECT_SECRET_STORE=memory`; secrets are injected from
   `FLEXCONNECT_PASSWORD` or `FLEXCONNECT_PASSWORD_FILE`, and both set together must fail fast.
 - Profile state persists only metadata and `secret_ref` values, not raw passwords.
@@ -358,7 +363,8 @@ go test ./...
   - `FLEXCONNECT_SOCKET` selects the daemon Unix socket or named pipe through environment.
   - `FLEXCONNECT_STATE` selects the daemon state file through environment.
   - `FLEXCONNECT_VERBOSE=true` enables debug logging through environment.
-  - `FLEXCONNECT_SECRET_STORE=keyring|memory` selects password persistence.
+  - `FLEXCONNECT_SECRET_STORE=keyring|file|memory` selects password persistence; `keyring` (default)
+    falls back to `file` automatically when no OS keyring is available.
   - `FLEXCONNECT_CONNECT_ON_START=true` creates or updates the startup profile and connects during daemon startup.
   - `FLEXCONNECT_CONNECT_TIMEOUT` bounds startup connection attempts, for example `45s`.
   - `FLEXCONNECT_PROFILE_ID` and `FLEXCONNECT_PROFILE_NAME` identify the env-managed profile.

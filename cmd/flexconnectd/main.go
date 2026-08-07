@@ -157,7 +157,7 @@ func condLevel(verbose bool) logging.Level {
 
 func newService(statePath, secretStore string) (*appd.Service, error) {
 	store := storefile.New(statePath)
-	secrets, err := newSecretStore(secretStore)
+	secrets, err := newSecretStore(statePath, secretStore)
 	if err != nil {
 		return nil, err
 	}

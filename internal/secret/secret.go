@@ -44,6 +44,17 @@ func (s *KeyringStore) Delete(ref string) error {
 	return err
 }
 
+// Probe reports whether the OS keyring is reachable. A not-found result for
+// the probe key still proves the keyring answers; any other error means the
+// keyring is unavailable (for example no Secret Service on a headless host).
+func (s *KeyringStore) Probe() error {
+	_, err := keyring.Get(s.service, "flexconnect.keyring-probe")
+	if err == nil || errors.Is(err, keyring.ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 type MemoryStore struct {
 	mu   sync.Mutex
 	data map[string]string
