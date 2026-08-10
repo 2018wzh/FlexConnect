@@ -243,7 +243,9 @@ the first terminal close reason on each session and emits it with the stable
 connection ID. The daemon publishes bounded in-memory lifecycle history through
 `/v1/watch` and `/v1/diagnostics`; the tray consumes these events for
 cross-platform desktop notifications. Manual disconnects are explicitly
-classified and do not enter the unexpected-disconnect notification path.
+classified and do not enter the unexpected-disconnect notification path. Automatic
+reconnect uses exponential backoff and stops after 10 failed attempts with a
+`reconnect_exhausted` lifecycle event; a manual connect starts a fresh attempt cycle.
 
 On Linux the packaged daemon runs as `root:flexconnect`; systemd owns `/run/flexconnect` and
 `/var/lib/flexconnect`, and the control socket is `0660`. Only users explicitly added to the

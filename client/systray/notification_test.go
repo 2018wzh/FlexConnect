@@ -51,11 +51,11 @@ func TestTrayErrorsAlertAndDeduplicate(t *testing.T) {
 func TestConnectionNotificationKinds(t *testing.T) {
 	recorder := &recordingNotifier{}
 	menu := &Menu{rebuildCh: make(chan struct{}, 1), notifier: recorder}
-	for _, kind := range []string{"connection_lost", "reconnect_scheduled", "reconnected", "reconnect_failed"} {
+	for _, kind := range []string{"connection_lost", "reconnect_scheduled", "reconnected", "reconnect_failed", "reconnect_exhausted"} {
 		event := types.ConnectionEvent{ID: kind, ConnectionID: kind, Kind: kind, ReasonCode: "tls_read_error", Attempt: 2}
 		menu.handleNotify(types.Notify{Connection: &event}, func() {})
 	}
-	if len(recorder.calls) != 4 {
-		t.Fatalf("notification calls = %d, want 4", len(recorder.calls))
+	if len(recorder.calls) != 5 {
+		t.Fatalf("notification calls = %d, want 5", len(recorder.calls))
 	}
 }

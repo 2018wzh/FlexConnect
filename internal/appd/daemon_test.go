@@ -157,7 +157,7 @@ func TestTrafficClearsOnDisconnect(t *testing.T) {
 }
 
 func TestAutoReconnectRetriesWithBackoff(t *testing.T) {
-	restoreReconnectDelays(t, 5*time.Millisecond, 10*time.Millisecond)
+	restoreReconnectPolicy(t, 5*time.Millisecond, 10*time.Millisecond, 10)
 	profile := testProfile("p1", true)
 	backend := newFakeBackend(nil, errors.New("temporary dial failure"), nil)
 	service := newTestService(t, backend, profile)
@@ -170,6 +170,40 @@ func TestAutoReconnectRetriesWithBackoff(t *testing.T) {
 	waitUntil(t, 500*time.Millisecond, func() bool {
 		return backend.connectCount() >= 3 && service.Status().State == types.StateConnected
 	})
+}
+
+func TestAutoReconnectStopsAfterRetryLimit(t *testing.T) {
+	restoreReconnectPolicy(t, time.Millisecond, time.Millisecond, 2)
+	profile := testProfile("p1", true)
+	backend := newFakeBackend(nil, errors.New("permanent dial failure"), errors.New("permanent dial failure"), nil)
+	service := newTestService(t, backend, profile)
+
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatalf("initial connect: %v", err)
+	}
+	backend.emit(vpn.Event{Type: "disconnected", Err: errors.New("link lost")})
+
+	waitUntil(t, 500*time.Millisecond, func() bool {
+		history := service.Diagnostics().ConnectionHistory
+		return len(history) > 0 && history[len(history)-1].Kind == "reconnect_exhausted"
+	})
+	time.Sleep(10 * time.Millisecond)
+
+	if got := backend.connectCount(); got != 3 {
+		t.Fatalf("connect count = %d, want initial connection plus 2 retries", got)
+	}
+	status := service.Status()
+	if status.State != types.StateError || status.LastError != "permanent dial failure" {
+		t.Fatalf("status after retry exhaustion = %+v", status)
+	}
+	diagnostics := service.Diagnostics()
+	if diagnostics.Reconnect.Active {
+		t.Fatalf("reconnect remains active after retry exhaustion: %+v", diagnostics.Reconnect)
+	}
+	last := diagnostics.ConnectionHistory[len(diagnostics.ConnectionHistory)-1]
+	if last.ReasonCode != "retry_limit_reached" || last.Attempt != 2 {
+		t.Fatalf("last connection event = %+v", last)
+	}
 }
 
 func TestUnexpectedDisconnectIsRecordedInDiagnostics(t *testing.T) {
@@ -215,7 +249,7 @@ func TestManualDisconnectIsNotUnexpectedConnectionLoss(t *testing.T) {
 }
 
 func TestManualDisconnectCancelsScheduledAutoReconnect(t *testing.T) {
-	restoreReconnectDelays(t, 50*time.Millisecond, 50*time.Millisecond)
+	restoreReconnectPolicy(t, 50*time.Millisecond, 50*time.Millisecond, 10)
 	profile := testProfile("p1", true)
 	backend := newFakeBackend()
 	service := newTestService(t, backend, profile)
@@ -381,12 +415,14 @@ func testProfile(id string, autoReconnect bool) types.Profile {
 	}
 }
 
-func restoreReconnectDelays(t *testing.T, minDelay, maxDelay time.Duration) {
+func restoreReconnectPolicy(t *testing.T, minDelay, maxDelay time.Duration, maxTries int) {
 	t.Helper()
-	oldMin, oldMax := autoReconnectMinDelay, autoReconnectMaxDelay
+	oldMin, oldMax, oldMaxTries := autoReconnectMinDelay, autoReconnectMaxDelay, autoReconnectMaxTries
 	autoReconnectMinDelay, autoReconnectMaxDelay = minDelay, maxDelay
+	autoReconnectMaxTries = maxTries
 	t.Cleanup(func() {
 		autoReconnectMinDelay, autoReconnectMaxDelay = oldMin, oldMax
+		autoReconnectMaxTries = oldMaxTries
 	})
 }
 

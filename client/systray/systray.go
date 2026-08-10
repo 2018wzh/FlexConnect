@@ -726,7 +726,7 @@ func (m *Menu) handleNotify(notify types.Notify, updateTooltip func()) {
 }
 
 func (m *Menu) notifyConnection(event types.ConnectionEvent) {
-	if event.Kind != "connection_lost" && event.Kind != "reconnect_scheduled" && event.Kind != "reconnected" && event.Kind != "reconnect_failed" {
+	if event.Kind != "connection_lost" && event.Kind != "reconnect_scheduled" && event.Kind != "reconnected" && event.Kind != "reconnect_failed" && event.Kind != "reconnect_exhausted" {
 		return
 	}
 	m.init()
@@ -779,6 +779,8 @@ func (m *Menu) notifyConnection(event types.ConnectionEvent) {
 		body = "The VPN session was restored."
 	case "reconnect_failed":
 		title = "VPN reconnect failed"
+	case "reconnect_exhausted":
+		title = "VPN reconnect stopped"
 		body = fmt.Sprintf("Attempt %d", event.Attempt)
 		if event.Error != "" {
 			body += ": " + event.Error

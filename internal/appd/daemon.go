@@ -25,6 +25,7 @@ import (
 var (
 	autoReconnectMinDelay = 2 * time.Second
 	autoReconnectMaxDelay = 1 * time.Minute
+	autoReconnectMaxTries = 10
 )
 
 var appdDebug bool
@@ -1143,7 +1144,7 @@ func (s *Service) runScheduledReconnect(profileID string, manualSeq uint64, atte
 		s.logs.Add("error", fmt.Sprintf("appd: auto reconnect failed id=%q err=%q", profileID, err.Error()))
 		s.recordConnectionLocked(types.ConnectionEvent{ConnectionID: s.reconnectLifecycleID, ProfileID: profileID, Kind: "reconnect_failed", ReasonCode: "disconnect_failed", Error: err.Error(), Attempt: attempt})
 		appdLog.Printf("auto reconnect failed id=%q attempt=%d err=%v", profileID, attempt, err)
-		s.startReconnectLocked(profileID, manualSeq, attempt+1)
+		s.retryReconnectLocked(profileID, manualSeq, attempt, err)
 		s.mu.Unlock()
 		return
 	}
@@ -1157,12 +1158,42 @@ func (s *Service) runScheduledReconnect(profileID string, manualSeq uint64, atte
 		s.logs.Add("error", fmt.Sprintf("appd: auto reconnect failed id=%q err=%q", profileID, err.Error()))
 		s.recordConnectionLocked(types.ConnectionEvent{ConnectionID: s.reconnectLifecycleID, ProfileID: profileID, Kind: "reconnect_failed", ReasonCode: "connect_failed", Error: err.Error(), Attempt: attempt})
 		appdLog.Printf("auto reconnect failed id=%q attempt=%d err=%v", profileID, attempt, err)
-		s.startReconnectLocked(profileID, manualSeq, attempt+1)
+		s.retryReconnectLocked(profileID, manualSeq, attempt, err)
 		s.mu.Unlock()
 		return
 	}
 	s.stopReconnectLocked()
 	s.mu.Unlock()
+}
+
+func (s *Service) retryReconnectLocked(profileID string, manualSeq uint64, attempt int, err error) {
+	if attempt < autoReconnectMaxTries {
+		s.startReconnectLocked(profileID, manualSeq, attempt+1)
+		return
+	}
+
+	errorMessage := sanitizeDiagnostic(err.Error())
+	lifecycleID := s.reconnectLifecycleID
+	s.status.State = types.StateError
+	s.status.LastError = errorMessage
+	s.status.UpdatedAt = now()
+	s.recordConnectionLocked(types.ConnectionEvent{
+		ConnectionID: lifecycleID,
+		ProfileID:    profileID,
+		Kind:         "reconnect_exhausted",
+		ReasonCode:   "retry_limit_reached",
+		Error:        errorMessage,
+		Attempt:      attempt,
+	})
+	s.logs.Add("error", fmt.Sprintf("appd: auto reconnect exhausted id=%q attempts=%d err=%q", profileID, attempt, errorMessage))
+	appdLog.Printf("auto reconnect exhausted id=%q attempts=%d err=%v", profileID, attempt, err)
+	s.stopReconnectLocked()
+	s.emitLocked(types.Notify{
+		Event:   "status",
+		Status:  ptrStatus(s.status),
+		Error:   errorMessage,
+		Message: fmt.Sprintf("Automatic reconnect stopped after %d failed attempts: %s", attempt, errorMessage),
+	})
 }
 
 func (s *Service) stopReconnectLocked() {
