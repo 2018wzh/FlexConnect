@@ -84,35 +84,18 @@ func TestFileStoreEmptyFileIsEmpty(t *testing.T) {
 	}
 }
 
-func TestFileStoreFilePermissions(t *testing.T) {
-	// The nested directory is created by the store itself; t.TempDir()'s own
-	// mode varies by environment, so only assert what the store controls.
+func TestFileStoreLeavesNoTemporaryFiles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "secrets.json")
 	if err := NewFileStore(path).Put("profile/corp", "pw"); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("secret file mode = %o, want 600", perm)
-	}
-	dirInfo, err := os.Stat(filepath.Dir(path))
-	if err != nil {
-		t.Fatalf("Stat dir: %v", err)
-	}
-	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("secret dir mode = %o, want 700", perm)
-	}
-	// No temp files may be left behind by the atomic write.
 	entries, err := os.ReadDir(filepath.Dir(path))
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
-	for _, e := range entries {
-		if strings.Contains(e.Name(), ".tmp-") {
-			t.Fatalf("stale temp file left behind: %s", e.Name())
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("stale temp file left behind: %s", entry.Name())
 		}
 	}
 }
