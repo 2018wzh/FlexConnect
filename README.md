@@ -121,7 +121,7 @@ FLEXCONNECT_SERVER=https://vpn.example.com FLEXCONNECT_USERNAME=alice docker com
 
 ### 发布到 GitHub Packages
 
-仓库中的 `Docker Release` 工作流会在推送 `v*` tag 时将镜像发布到 `ghcr.io`，并自动打上 `v` 去掉前缀后的版本标签（如 `1.2.3`）以及 `<major>`、`<major>.<minor>`。
+仓库中的 `Docker Release` 工作流会在推送 `v*` tag 时将镜像发布到 `ghcr.io`，并自动打上 `v` 去掉前缀后的版本标签（如 `1.2.4`）以及 `<major>`、`<major>.<minor>`。
 
 从 GHCR 发布镜像（可选）：
 
@@ -197,16 +197,16 @@ sudo usermod -aG flexconnect "$USER"
 
 ```bash
 go run ./cmd/dist list
-go run ./cmd/dist build --version 1.2.3 linux/amd64/tgz
-go run ./cmd/dist build --version 1.2.3 linux/amd64/deb
-go run ./cmd/dist build --version 1.2.3 linux/amd64/rpm
-go run ./cmd/dist build --version 1.2.3 windows/amd64/zip
-go run ./cmd/dist build --version 1.2.3 windows/amd64/msi
-go run ./cmd/dist build --version 1.2.3 darwin/amd64/pkg
-go run ./cmd/dist build --version 1.2.3 darwin/arm64/pkg
+go run ./cmd/dist build --version 1.2.4 linux/amd64/tgz
+go run ./cmd/dist build --version 1.2.4 linux/amd64/deb
+go run ./cmd/dist build --version 1.2.4 linux/amd64/rpm
+go run ./cmd/dist build --version 1.2.4 windows/amd64/zip
+go run ./cmd/dist build --version 1.2.4 windows/amd64/msi
+go run ./cmd/dist build --version 1.2.4 darwin/amd64/pkg
+go run ./cmd/dist build --version 1.2.4 darwin/arm64/pkg
 ```
 
-推送形如 `v1.2.3` 的 Git tag 后，GitHub Actions 会自动构建这些产物并创建对应的 GitHub Release。
+推送形如 `v1.2.4` 的 Git tag 后，GitHub Actions 会自动构建这些产物并创建对应的 GitHub Release。
 
 ## 运行与配置
 
