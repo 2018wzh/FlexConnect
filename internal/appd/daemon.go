@@ -806,7 +806,7 @@ func (s *Service) consumeBackendEvents() {
 		var disconnectedProfileID string
 		var scheduleAutoReconnect bool
 		var manualSeq uint64
-		var manualDisconnectEvent bool
+		var intentionalDisconnectEvent bool
 		var networkRepairEvent bool
 		switch event.Type {
 		case "connected":
@@ -876,12 +876,16 @@ func (s *Service) consumeBackendEvents() {
 			networkRepairEvent = s.networkReconnectActive && event.ConnectionID == s.networkReconnectConnID
 			autoProfile, autoProfileFound := s.profileAutoReconnect(disconnectedProfileID)
 			manual := disconnectedProfileID != "" && disconnectedProfileID == s.manualProfileID && s.manualDisconnectSeq == s.disconnectSeq
-			manualDisconnectEvent = manual
+			localRequested := event.Close != nil && event.Close.Code == "local_requested"
+			intentionalDisconnectEvent = manual || localRequested
 			if manual {
 				s.manualProfileID = ""
 				s.manualDisconnectSeq = 0
 			}
-			if !manual && s.currentID == disconnectedProfileID &&
+			// A network repair owns its reconnect transaction. Scheduling the
+			// generic auto-reconnect timer for the planned teardown races the
+			// in-flight repair and can disconnect its replacement session.
+			if !intentionalDisconnectEvent && !networkRepairEvent && s.currentID == disconnectedProfileID &&
 				autoProfileFound && types.BoolValue(autoProfile.AutoReconnect, false) &&
 				s.reconnectTimer == nil {
 				manualSeq = s.disconnectSeq
@@ -899,7 +903,7 @@ func (s *Service) consumeBackendEvents() {
 			s.status.SOCKS5Enabled = false
 			s.status.SOCKS5Listen = ""
 			s.clearTrafficLocked()
-			s.logs.Add("info", "appd: backend event=disconnected")
+			s.logs.Add("info", fmt.Sprintf("appd: backend event=disconnected intentional=%t network_repair=%t", intentionalDisconnectEvent, networkRepairEvent))
 			reasonCode, transport, closeError := "unknown_close", "", ""
 			var transportFaults []types.ConnectionFault
 			if event.Close != nil {
@@ -912,7 +916,7 @@ func (s *Service) consumeBackendEvents() {
 				reasonCode = "backend_error"
 				closeError = event.Err.Error()
 			}
-			if manual {
+			if intentionalDisconnectEvent {
 				reasonCode, transport, closeError = "local_requested", "local", ""
 			}
 			if networkRepairEvent {
@@ -924,10 +928,10 @@ func (s *Service) consumeBackendEvents() {
 				eventRecord.SessionStarted = s.activeConnectionStarted.Format(time.RFC3339Nano)
 				eventRecord.DurationMS = ended.Sub(s.activeConnectionStarted).Milliseconds()
 			}
-			if manual {
-				eventRecord.Kind = "disconnected"
-			} else if networkRepairEvent {
+			if networkRepairEvent {
 				eventRecord.Kind = "network_reconnect"
+			} else if intentionalDisconnectEvent {
+				eventRecord.Kind = "disconnected"
 			}
 			s.recordConnectionLocked(eventRecord)
 			s.activeConnectionID = ""
@@ -950,12 +954,12 @@ func (s *Service) consumeBackendEvents() {
 			s.logs.Add("error", fmt.Sprintf("appd: backend error err=%q", event.Err.Error()))
 			message = "Backend error: " + event.Err.Error()
 		}
-		if event.Type == "disconnected" && event.Err == nil && event.Close != nil && event.Close.Error != "" && !manualDisconnectEvent && !networkRepairEvent {
+		if event.Type == "disconnected" && event.Err == nil && event.Close != nil && event.Close.Error != "" && !intentionalDisconnectEvent && !networkRepairEvent {
 			s.status.State = types.StateError
 			s.status.LastError = sanitizeDiagnostic(event.Close.Error)
 			message = "VPN connection lost: " + s.status.LastError
 		}
-		if event.Type == "disconnected" && event.Close != nil && event.Close.Code != "" && !manualDisconnectEvent && !networkRepairEvent && event.Close.Error == "" {
+		if event.Type == "disconnected" && event.Close != nil && event.Close.Code != "" && !intentionalDisconnectEvent && !networkRepairEvent && event.Close.Error == "" {
 			message = "VPN connection lost (" + event.Close.Code + ")."
 		}
 		s.status.UpdatedAt = now()

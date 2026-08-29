@@ -279,6 +279,67 @@ func TestManualDisconnectCancelsScheduledAutoReconnect(t *testing.T) {
 	}
 }
 
+func TestLocalRequestedDisconnectDoesNotScheduleAutoReconnect(t *testing.T) {
+	restoreReconnectPolicy(t, 50*time.Millisecond, 50*time.Millisecond, 3)
+	profile := testProfile("p1", true)
+	backend := newFakeBackend()
+	service := newTestService(t, backend, profile)
+
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatalf("initial connect: %v", err)
+	}
+	backend.emit(vpn.Event{Type: "disconnected", Close: &vpn.DisconnectInfo{Code: "local_requested", Transport: "local"}})
+
+	waitUntil(t, 500*time.Millisecond, func() bool {
+		history := service.Diagnostics().ConnectionHistory
+		return len(history) > 0 && history[len(history)-1].ReasonCode == "local_requested"
+	})
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.reconnectTimer != nil {
+		t.Fatal("local-requested disconnect scheduled automatic reconnect")
+	}
+	history := service.connectionHistory
+	if got := history[len(history)-1].Kind; got != "disconnected" {
+		t.Fatalf("local-requested event kind = %q, want disconnected", got)
+	}
+}
+
+func TestNetworkRepairDisconnectDoesNotScheduleGenericReconnect(t *testing.T) {
+	for _, closeInfo := range []*vpn.DisconnectInfo{
+		{Code: "tls_closed", Transport: "tls"},
+		{Code: "local_requested", Transport: "local"},
+	} {
+		t.Run(closeInfo.Code, func(t *testing.T) {
+			restoreReconnectPolicy(t, 50*time.Millisecond, 50*time.Millisecond, 3)
+			profile := testProfile("p1", true)
+			backend := newFakeBackend()
+			service := newTestService(t, backend, profile)
+
+			if err := service.Connect(context.Background(), profile.ID); err != nil {
+				t.Fatalf("initial connect: %v", err)
+			}
+			service.mu.Lock()
+			connectionID := service.activeConnectionID
+			service.networkReconnectActive = true
+			service.networkReconnectConnID = connectionID
+			service.networkReconnectProfile = profile.ID
+			service.mu.Unlock()
+			backend.emit(vpn.Event{Type: "disconnected", ConnectionID: connectionID, Close: closeInfo})
+
+			waitUntil(t, 500*time.Millisecond, func() bool {
+				history := service.Diagnostics().ConnectionHistory
+				return len(history) > 0 && history[len(history)-1].Kind == "network_reconnect"
+			})
+			service.mu.Lock()
+			defer service.mu.Unlock()
+			if service.reconnectTimer != nil {
+				t.Fatal("network repair teardown scheduled generic automatic reconnect")
+			}
+		})
+	}
+}
+
 func TestProxyStartsOnlyWithTunnelDialer(t *testing.T) {
 	profile := testProfile("p1", false)
 	profile.SOCKS5Enabled = true

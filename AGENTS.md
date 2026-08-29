@@ -246,6 +246,9 @@ cross-platform desktop notifications. Manual disconnects are explicitly
 classified and do not enter the unexpected-disconnect notification path. Automatic
 reconnect uses exponential backoff and stops after 3 failed attempts with a
 `reconnect_exhausted` lifecycle event; a manual connect starts a fresh attempt cycle.
+`local_requested` closes are intentional and never enter automatic reconnect. An active
+network-repair transaction exclusively owns its teardown and replacement connection, so
+the generic reconnect scheduler must not run concurrently with it.
 
 On Linux the packaged daemon runs as `root:flexconnect`; systemd owns `/run/flexconnect` and
 `/var/lib/flexconnect`, and the control socket is `0660`. Only users explicitly added to the
