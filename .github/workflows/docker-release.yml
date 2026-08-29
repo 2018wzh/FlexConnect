@@ -10,6 +10,10 @@ on:
         description: "用于手工发布的镜像标签（可选）"
         required: false
         default: ""
+      source-ref:
+        description: "用于手工重发的源码 ref（可选）"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -48,6 +52,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.source-ref || github.ref }}
+
+      - name: Resolve source revision
+        id: source
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Resolve image name
         shell: bash
@@ -72,7 +83,10 @@ jobs:
             type=semver,pattern={{version}},event=tag
             type=semver,pattern={{major}},event=tag
             type=semver,pattern={{major}}.{{minor}},event=tag
-            type=raw,value=${{ github.event.inputs.image-tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image-tag != '' }}
+            type=semver,pattern={{version}},value=${{ github.event.inputs.image-tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image-tag != '' }}
+            type=semver,pattern={{major}},value=${{ github.event.inputs.image-tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image-tag != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ github.event.inputs.image-tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image-tag != '' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image-tag != '' }}
             type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image-tag == '' }}
 
       - name: Derive binary version
@@ -99,7 +113,11 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
+          provenance: false
+          sbom: false
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
           build-args: |
             VERSION=${{ steps.version.outputs.value }}
