@@ -124,6 +124,7 @@ func (c *Client) Close() error {
 const (
 	tplInit = iota
 	tplAuthReply
+	maxAuthResponseBytes = 4 << 20
 )
 
 func (c *Client) configuredLocalAddr() net.Addr {
@@ -143,11 +144,14 @@ func (c *Client) InitAuth(localAddr net.Addr) error {
 	}
 	base.Info("init auth with server", c.Prof.HostWithPort)
 	c.WebVpnCookie = ""
+	serverName, err := tlsServerName(c.Prof.HostWithPort)
+	if err != nil {
+		return err
+	}
 	config := tls.Config{
-		InsecureSkipVerify: base.Cfg.InsecureSkipVerify,
-		ServerName:         strings.Split(c.Prof.HostWithPort, ":")[0],
-		MinVersion:         tls.VersionTLS12,
-		MaxVersion:         tls.VersionTLS12,
+		ServerName: serverName,
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS12,
 	}
 	dialer := &net.Dialer{Timeout: 6 * time.Second, LocalAddr: localAddr}
 	conn, err := tls.DialWithDialer(dialer, "tcp4", c.Prof.HostWithPort, &config)
@@ -279,7 +283,7 @@ func (c *Client) tplPost(typ int, path string, dtd *proto.DTD) error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readAuthResponse(resp.Body)
 	if err != nil {
 		_ = c.Close()
 		base.Error("read auth body failed:", err)
@@ -313,6 +317,29 @@ func (c *Client) tplPost(typ int, path string, dtd *proto.DTD) error {
 		}
 	}
 	return nil
+}
+
+func readAuthResponse(body io.Reader) ([]byte, error) {
+	value, err := io.ReadAll(io.LimitReader(body, maxAuthResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read authentication response: %w", err)
+	}
+	if len(value) > maxAuthResponseBytes {
+		return nil, fmt.Errorf("authentication response exceeds %d bytes", maxAuthResponseBytes)
+	}
+	return value, nil
+}
+
+func tlsServerName(hostPort string) (string, error) {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(hostPort))
+	if err != nil {
+		return "", fmt.Errorf("invalid VPN server address %q: %w", hostPort, err)
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", errors.New("VPN server hostname is empty")
+	}
+	return host, nil
 }
 
 func redactAuthBody(body string) string {

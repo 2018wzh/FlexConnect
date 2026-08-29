@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +51,10 @@ type IncompatibleAPIError struct {
 
 type APIError struct {
 	StatusCode int
+	Code       string
 	Message    string
+	RequestID  string
+	Retryable  bool
 }
 
 func (e *APIError) Error() string {
@@ -114,94 +119,212 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*
 
 func (c *Client) Status(ctx context.Context) (*types.Status, error) {
 	var out types.Status
-	return &out, c.getJSON(ctx, "/v1/status", &out)
+	return &out, c.getJSON(ctx, "/v2/status", &out)
 }
 
 func (c *Client) Health(ctx context.Context) (*types.Health, error) {
-	var out types.Health
-	if err := c.getJSON(ctx, "/v1/health", &out); err != nil {
+	live, err := c.Live(ctx)
+	if err != nil {
 		return nil, err
 	}
-	if out.Status != "ok" {
-		return nil, fmt.Errorf("flexconnectd is not ready: status=%q", out.Status)
+	ready, err := c.Ready(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if out.APIVersion != buildinfo.LocalAPIVersion {
-		return nil, &IncompatibleAPIError{ClientVersion: buildinfo.LocalAPIVersion, DaemonVersion: out.APIVersion}
+	if !ready.Ready {
+		return nil, &NotReadyError{Status: *ready}
 	}
-	return &out, nil
+	return &types.Health{Status: "ok", Version: live.Version, APIVersion: strconv.Itoa(live.APIMajor)}, nil
+}
+
+type NotReadyError struct{ Status types.ReadyStatus }
+
+func (e *NotReadyError) Error() string {
+	problems := make([]string, 0, len(e.Status.Components))
+	for _, component := range e.Status.Components {
+		if !component.Ready {
+			message := component.Name
+			if component.Message != "" {
+				message += ": " + component.Message
+			}
+			problems = append(problems, message)
+		}
+	}
+	if len(problems) == 0 {
+		return "flexconnectd is not ready"
+	}
+	return "flexconnectd is not ready: " + strings.Join(problems, "; ")
+}
+
+func (c *Client) Live(ctx context.Context) (*types.LiveStatus, error) {
+	var live types.LiveStatus
+	if err := c.getJSON(ctx, "/v2/live", &live); err != nil {
+		return nil, err
+	}
+	if live.APIMajor != buildinfo.LocalAPIMajor {
+		return nil, &IncompatibleAPIError{ClientVersion: buildinfo.LocalAPIVersion, DaemonVersion: strconv.Itoa(live.APIMajor)}
+	}
+	capabilities := make(map[string]bool, len(live.Capabilities))
+	for _, capability := range live.Capabilities {
+		capabilities[capability] = true
+	}
+	for _, required := range buildinfo.LocalAPICapabilities {
+		if !capabilities[required] {
+			return nil, fmt.Errorf("local API is missing required capability %q", required)
+		}
+	}
+	return &live, nil
+}
+
+func (c *Client) Ready(ctx context.Context) (*types.ReadyStatus, error) {
+	var ready types.ReadyStatus
+	res, err := c.do(ctx, http.MethodGet, "/v2/ready", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusServiceUnavailable {
+		return nil, responseError(res)
+	}
+	if err := json.NewDecoder(res.Body).Decode(&ready); err != nil {
+		return nil, err
+	}
+	return &ready, nil
 }
 
 func (c *Client) Profiles(ctx context.Context) ([]types.Profile, error) {
 	var out []types.Profile
-	return out, c.getJSON(ctx, "/v1/profiles", &out)
+	return out, c.getJSON(ctx, "/v2/profiles", &out)
 }
 
 func (c *Client) CurrentProfile(ctx context.Context) (*types.Profile, error) {
-	var out types.Profile
-	return &out, c.getJSON(ctx, "/v1/profiles/current", &out)
+	status, err := c.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := c.Profiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range profiles {
+		if profiles[i].ID == status.SelectedProfileID {
+			return &profiles[i], nil
+		}
+	}
+	return nil, &APIError{StatusCode: http.StatusNotFound, Code: "profile_not_found", Message: "selected profile not found"}
 }
 
 func (c *Client) CreateProfile(ctx context.Context, profile types.Profile, password string) (*types.Profile, error) {
-	payload := types.ProfileUpsertRequest{Profile: profile, Password: password}
+	payload := types.ProfileCreateRequest{Name: profile.Name, ServerURL: profile.ServerURL, Username: profile.Username, Password: password, Group: profile.Group, Scope: profile.Scope, AcceptServerRoutes: &profile.AcceptServerRoutes, AutoReconnect: profile.AutoReconnect, ApplyDNS: profile.ApplyDNS, CustomInclude: profile.CustomInclude, CustomExclude: profile.CustomExclude, DNSOverrides: profile.DNSOverrides, SOCKS5Enabled: profile.SOCKS5Enabled, SOCKS5Listen: profile.SOCKS5Listen, MTU: profile.MTU}
 	var out types.Profile
-	return &out, c.sendJSON(ctx, http.MethodPut, "/v1/profiles", payload, &out, http.StatusCreated)
+	return &out, c.sendJSON(ctx, http.MethodPost, "/v2/profiles", payload, &out, http.StatusCreated)
 }
 
-func (c *Client) UpdateProfile(ctx context.Context, id string, req types.ProfileUpdateRequest) (*types.Profile, error) {
-	var out types.Profile
-	return &out, c.sendJSON(ctx, http.MethodPut, "/v1/profiles/"+id, req, &out, http.StatusOK)
+func (c *Client) UpdateProfile(ctx context.Context, id string, req types.ProfileUpdateRequest) (types.ProfileMutationResult, error) {
+	path := "/v2/profiles/" + url.PathEscape(id)
+	res, err := c.sendRequest(ctx, http.MethodPatch, path, req)
+	if err != nil {
+		return types.ProfileMutationResult{}, err
+	}
+	defer res.Body.Close()
+	switch res.StatusCode {
+	case http.StatusOK:
+		var profile types.Profile
+		if err := json.NewDecoder(res.Body).Decode(&profile); err != nil {
+			return types.ProfileMutationResult{}, err
+		}
+		return types.ProfileMutationResult{Profile: &profile}, nil
+	case http.StatusAccepted:
+		var ref types.OperationRef
+		if err := json.NewDecoder(res.Body).Decode(&ref); err != nil {
+			return types.ProfileMutationResult{}, err
+		}
+		return types.ProfileMutationResult{Operation: &ref.Operation}, nil
+	default:
+		return types.ProfileMutationResult{}, responseError(res)
+	}
 }
 
 func (c *Client) SwitchProfile(ctx context.Context, id string) error {
-	return c.expectNoContent(ctx, http.MethodPost, "/v1/profiles/"+id+"/switch", nil)
+	return c.Connect(ctx, id)
 }
 
 func (c *Client) DeleteProfile(ctx context.Context, id string) error {
-	return c.expectNoContent(ctx, http.MethodDelete, "/v1/profiles/"+id, nil)
+	return c.expectStatus(ctx, http.MethodDelete, "/v2/profiles/"+url.PathEscape(id), nil, http.StatusNoContent, http.StatusAccepted)
 }
 
 func (c *Client) Login(ctx context.Context, req types.LoginRequest) error {
-	return c.expectNoContentJSON(ctx, http.MethodPost, "/v1/login", req)
+	if req.ProfileID != "" {
+		_, err := c.UpdateProfile(ctx, req.ProfileID, types.ProfileUpdateRequest{Name: stringPtrNonEmpty(req.Name), ServerURL: stringPtrNonEmpty(req.ServerURL), Username: stringPtrNonEmpty(req.Username), Group: stringPtrNonEmpty(req.Group), Password: stringPtrNonEmpty(req.Password)})
+		return err
+	}
+	profile, err := types.NewProfile(req.Name)
+	if err != nil {
+		return err
+	}
+	profile.ServerURL, profile.Username, profile.Group, profile.Scope = req.ServerURL, req.Username, req.Group, types.ProfileScopeUser
+	_, err = c.CreateProfile(ctx, profile, req.Password)
+	return err
+}
+
+func stringPtrNonEmpty(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func (c *Client) Connect(ctx context.Context, id string) error {
 	if id == "" {
 		return c.ConnectCurrent(ctx)
 	}
-	return c.expectNoContent(ctx, http.MethodPost, "/v1/connect/"+id, nil)
+	return c.expectStatusJSON(ctx, http.MethodPut, "/v2/connection", types.ConnectionRequest{ProfileID: id}, http.StatusAccepted)
 }
 
 func (c *Client) ConnectCurrent(ctx context.Context) error {
-	return c.expectNoContent(ctx, http.MethodPost, "/v1/connect", nil)
+	profile, err := c.CurrentProfile(ctx)
+	if err != nil {
+		return err
+	}
+	return c.Connect(ctx, profile.ID)
 }
 
 func (c *Client) Disconnect(ctx context.Context) error {
-	return c.expectNoContent(ctx, http.MethodPost, "/v1/disconnect", nil)
+	return c.expectStatus(ctx, http.MethodDelete, "/v2/connection", nil, http.StatusNoContent, http.StatusAccepted)
+}
+
+func (c *Client) SetControlMode(ctx context.Context, mode, profileID string) (*types.Operation, error) {
+	var ref types.OperationRef
+	if err := c.sendJSON(ctx, http.MethodPut, "/v2/control-mode", types.ControlModeRequest{Mode: mode, ProfileID: profileID}, &ref, http.StatusAccepted); err != nil {
+		return nil, err
+	}
+	return &ref.Operation, nil
 }
 
 func (c *Client) UpdateRoutes(ctx context.Context, id string, req types.RouteUpdateRequest) (*types.Profile, error) {
 	var out types.Profile
-	return &out, c.sendJSON(ctx, http.MethodPut, "/v1/routes/"+id, req, &out, http.StatusOK)
+	update := types.ProfileUpdateRequest{AcceptServerRoutes: req.AcceptServerRoutes, CustomInclude: req.CustomInclude, CustomExclude: req.CustomExclude}
+	return &out, c.sendJSON(ctx, http.MethodPatch, "/v2/profiles/"+url.PathEscape(id), update, &out, http.StatusOK)
 }
 
 func (c *Client) Logs(ctx context.Context) ([]types.LogEntry, error) {
 	var out []types.LogEntry
-	return out, c.getJSON(ctx, "/v1/logs", &out)
+	return out, c.getJSON(ctx, "/v2/logs", &out)
 }
 
 func (c *Client) Diagnostics(ctx context.Context) (*types.Diagnostics, error) {
 	var out types.Diagnostics
-	return &out, c.getJSON(ctx, "/v1/diagnostics", &out)
+	return &out, c.getJSON(ctx, "/v2/diagnostics", &out)
 }
 
 func (c *Client) Traffic(ctx context.Context) (*types.TrafficSnapshot, error) {
 	var out types.TrafficSnapshot
-	return &out, c.getJSON(ctx, "/v1/traffic", &out)
+	return &out, c.getJSON(ctx, "/v2/traffic", &out)
 }
 
 func (c *Client) UpdateCheck(ctx context.Context) (*types.UpdateInfo, error) {
 	var out types.UpdateInfo
-	return &out, c.getJSON(ctx, "/v1/update/check", &out)
+	return &out, c.getJSON(ctx, "/v2/update/check", &out)
 }
 
 func (c *Client) DiagnosticsText(ctx context.Context) (string, error) {
@@ -217,18 +340,26 @@ func (c *Client) DiagnosticsText(ctx context.Context) (string, error) {
 }
 
 func (c *Client) Watch(ctx context.Context) (*Watcher, error) {
-	localDebug("GET", "/v1/watch")
-	res, err := c.do(ctx, http.MethodGet, "/v1/watch", nil)
+	return c.WatchSince(ctx, "", 0)
+}
+
+func (c *Client) WatchSince(ctx context.Context, epoch string, since uint64) (*Watcher, error) {
+	path := "/v2/watch?since=" + strconv.FormatUint(since, 10)
+	if epoch != "" {
+		path += "&epoch=" + url.QueryEscape(epoch)
+	}
+	localDebug("GET", path)
+	res, err := c.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
 	if res.StatusCode != http.StatusOK {
 		defer res.Body.Close()
 		err := responseError(res)
-		localDebug("/v1/watch unexpected status", res.StatusCode, err)
+		localDebug(path, "unexpected status", res.StatusCode, err)
 		return nil, err
 	}
-	localDebug("/v1/watch started")
+	localDebug(path, "started")
 	return &Watcher{ctx: ctx, res: res, dec: json.NewDecoder(res.Body)}, nil
 }
 
@@ -276,6 +407,15 @@ func (c *Client) sendJSON(ctx context.Context, method, path string, in, out any,
 	return json.NewDecoder(res.Body).Decode(out)
 }
 
+func (c *Client) sendRequest(ctx context.Context, method, path string, in any) (*http.Response, error) {
+	b, err := json.Marshal(in)
+	if err != nil {
+		return nil, err
+	}
+	localDebug(method, path, "payload_bytes", len(b))
+	return c.do(ctx, method, path, strings.NewReader(string(b)))
+}
+
 func (c *Client) expectNoContent(ctx context.Context, method, path string, body io.Reader) error {
 	localDebug(method, path)
 	res, err := c.do(ctx, method, path, body)
@@ -292,6 +432,28 @@ func (c *Client) expectNoContent(ctx context.Context, method, path string, body 
 	return nil
 }
 
+func (c *Client) expectStatus(ctx context.Context, method, path string, body io.Reader, allowed ...int) error {
+	res, err := c.do(ctx, method, path, body)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	for _, status := range allowed {
+		if res.StatusCode == status {
+			return nil
+		}
+	}
+	return responseError(res)
+}
+
+func (c *Client) expectStatusJSON(ctx context.Context, method, path string, in any, allowed ...int) error {
+	b, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	return c.expectStatus(ctx, method, path, strings.NewReader(string(b)), allowed...)
+}
+
 func responseError(res *http.Response) error {
 	const maxErrorBytes = 64 * 1024
 	all, err := io.ReadAll(io.LimitReader(res.Body, maxErrorBytes+1))
@@ -304,6 +466,17 @@ func responseError(res *http.Response) error {
 	}
 	if message == "" {
 		message = http.StatusText(res.StatusCode)
+	}
+	var envelope struct {
+		Error struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			RequestID string `json:"request_id"`
+			Retryable bool   `json:"retryable"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(all, &envelope) == nil && envelope.Error.Code != "" {
+		return &APIError{StatusCode: res.StatusCode, Code: envelope.Error.Code, Message: envelope.Error.Message, RequestID: envelope.Error.RequestID, Retryable: envelope.Error.Retryable}
 	}
 	return &APIError{StatusCode: res.StatusCode, Message: message}
 }

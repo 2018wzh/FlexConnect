@@ -54,7 +54,7 @@ type daemonClient interface {
 	SwitchProfile(context.Context, string) error
 	Connect(context.Context, string) error
 	ConnectCurrent(context.Context) error
-	UpdateProfile(context.Context, string, types.ProfileUpdateRequest) (*types.Profile, error)
+	UpdateProfile(context.Context, string, types.ProfileUpdateRequest) (types.ProfileMutationResult, error)
 	DiagnosticsText(context.Context) (string, error)
 	Watch(context.Context) (*local.Watcher, error)
 }
@@ -284,7 +284,7 @@ func (m *Menu) handleProfileSelection(ctx context.Context, profileID string) {
 	m.mu.Lock()
 	status := copyStatus(m.status)
 	m.mu.Unlock()
-	if status != nil && status.CurrentProfileID == profileID {
+	if status != nil && status.SelectedProfileID == profileID {
 		return
 	}
 
@@ -313,7 +313,7 @@ func statusCurrentID(status *types.Status) string {
 	if status == nil {
 		return ""
 	}
-	return status.CurrentProfileID
+	return status.SelectedProfileID
 }
 
 func currentProfileByID(profiles []types.Profile, id string) *types.Profile {
@@ -331,13 +331,13 @@ func (m *Menu) handleSocks5Toggle(enabled bool) {
 	status := copyStatus(m.status)
 	m.mu.Unlock()
 	req := types.ProfileUpdateRequest{SOCKS5Enabled: &enabled}
-	if status == nil || status.CurrentProfileID == "" {
+	if status == nil || status.SelectedProfileID == "" {
 		m.reportError("update SOCKS5 setting failed", fmt.Errorf("no profile selected"))
 		return
 	}
 	ctx, cancel := m.opCtx()
 	defer cancel()
-	if _, err := m.Client.UpdateProfile(ctx, status.CurrentProfileID, req); err != nil {
+	if _, err := m.Client.UpdateProfile(ctx, status.SelectedProfileID, req); err != nil {
 		m.reportError("update SOCKS5 setting failed", err)
 		return
 	}
@@ -349,14 +349,14 @@ func (m *Menu) handleAutoReconnectToggle(enabled bool) {
 	m.mu.Lock()
 	status := copyStatus(m.status)
 	m.mu.Unlock()
-	if status == nil || status.CurrentProfileID == "" {
+	if status == nil || status.SelectedProfileID == "" {
 		m.reportError("update auto-reconnect setting failed", fmt.Errorf("no profile selected"))
 		return
 	}
 	req := types.ProfileUpdateRequest{AutoReconnect: &enabled}
 	ctx, cancel := m.opCtx()
 	defer cancel()
-	if _, err := m.Client.UpdateProfile(ctx, status.CurrentProfileID, req); err != nil {
+	if _, err := m.Client.UpdateProfile(ctx, status.SelectedProfileID, req); err != nil {
 		m.reportError("update auto-reconnect setting failed", err)
 		return
 	}
@@ -368,14 +368,14 @@ func (m *Menu) handleApplyDNSToggle(enabled bool) {
 	m.mu.Lock()
 	status := copyStatus(m.status)
 	m.mu.Unlock()
-	if status == nil || status.CurrentProfileID == "" {
+	if status == nil || status.SelectedProfileID == "" {
 		m.reportError("update DNS setting failed", fmt.Errorf("no profile selected"))
 		return
 	}
 	req := types.ProfileUpdateRequest{ApplyDNS: &enabled}
 	ctx, cancel := m.opCtx()
 	defer cancel()
-	if _, err := m.Client.UpdateProfile(ctx, status.CurrentProfileID, req); err != nil {
+	if _, err := m.Client.UpdateProfile(ctx, status.SelectedProfileID, req); err != nil {
 		m.reportError("update DNS setting failed", err)
 		return
 	}
@@ -967,10 +967,10 @@ func trafficSummaryRows(status *types.Status, traffic types.TrafficSnapshot, pro
 
 // profileNameForStatus returns the display name of the current profile, or empty.
 func profileNameForStatus(status *types.Status, profiles []types.Profile) string {
-	if status == nil || status.CurrentProfileID == "" {
+	if status == nil || status.SelectedProfileID == "" {
 		return ""
 	}
-	return profileNameByID(profiles, status.CurrentProfileID)
+	return profileNameByID(profiles, status.SelectedProfileID)
 }
 
 func trafficIdentity(status *types.Status, profiles []types.Profile) string {
@@ -978,8 +978,8 @@ func trafficIdentity(status *types.Status, profiles []types.Profile) string {
 		return ""
 	}
 	parts := []string{}
-	if status.CurrentProfileID != "" {
-		parts = append(parts, profileNameByID(profiles, status.CurrentProfileID))
+	if status.SelectedProfileID != "" {
+		parts = append(parts, profileNameByID(profiles, status.SelectedProfileID))
 	}
 	if status.Session != nil && strings.TrimSpace(status.Session.VPNAddress) != "" {
 		parts = append(parts, status.Session.VPNAddress)

@@ -71,4 +71,3 @@ func (r *Record) Write(content string, prepend bool) error {
 
 	return nil
 }
-

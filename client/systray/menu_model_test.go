@@ -22,7 +22,7 @@ func TestMenuModelUnavailableHasCoreItems(t *testing.T) {
 }
 
 func TestMenuModelConnectingDisablesMainAction(t *testing.T) {
-	model := buildMenuModel(&types.Status{State: types.StateConnecting, CurrentProfileID: "p1"}, types.TrafficSnapshot{}, []types.Profile{
+	model := buildMenuModel(&types.Status{State: types.StateConnecting, SelectedProfileID: "p1"}, types.TrafficSnapshot{}, []types.Profile{
 		{ID: "p1", Name: "Work"},
 	}, nil)
 
@@ -38,7 +38,7 @@ func TestMenuModelConnectingDisablesMainAction(t *testing.T) {
 func TestMenuModelConnectedShowsDisconnectAndVPNIP(t *testing.T) {
 	status := &types.Status{
 		State:              types.StateConnected,
-		CurrentProfileID:   "p1",
+		SelectedProfileID:  "p1",
 		ConnectedProfileID: "p1",
 		Session:            &types.SessionInfo{VPNAddress: "10.0.0.8"},
 	}
@@ -69,7 +69,7 @@ func TestMenuModelConnectedShowsDisconnectAndVPNIP(t *testing.T) {
 	if !child.Checked {
 		t.Fatalf("current profile not checked: %+v", child)
 	}
-	if countItemsWithPrefix(model.Items, "Current Profile: Work")+countItemsWithPrefix(model.Items, "Connected Profile: Work") != 1 {
+	if countItemsWithPrefix(model.Items, "Selected Profile: Work")+countItemsWithPrefix(model.Items, "Connected Profile: Work") != 1 {
 		t.Fatalf("duplicate current/connected profile rows: %+v", itemTitles(model.Items))
 	}
 }
@@ -140,8 +140,8 @@ func countItemsWithPrefix(items []menuItemModel, prefix string) int {
 
 func TestMenuModelInformationRichSession(t *testing.T) {
 	status := &types.Status{
-		State:            types.StateConnected,
-		CurrentProfileID: "p1",
+		State:             types.StateConnected,
+		SelectedProfileID: "p1",
 		Session: &types.SessionInfo{
 			ServerAddress: "vpn.example.com",
 			Hostname:      "myhost",
@@ -184,9 +184,9 @@ func TestMenuModelInformationRichSession(t *testing.T) {
 
 func TestMenuModelInformationNoSession(t *testing.T) {
 	status := &types.Status{
-		State:            types.StateDisconnected,
-		CurrentProfileID: "p1",
-		EffectiveRoutes:  []types.RouteSpec{},
+		State:             types.StateDisconnected,
+		SelectedProfileID: "p1",
+		EffectiveRoutes:   []types.RouteSpec{},
 	}
 	model := buildMenuModel(status, types.TrafficSnapshot{}, []types.Profile{{ID: "p1", Name: "Work"}}, nil)
 
@@ -258,9 +258,9 @@ func TestTooltipTextFitsWithinLimit(t *testing.T) {
 		{
 			name: "short identity",
 			status: &types.Status{
-				State:            types.StateConnected,
-				CurrentProfileID: "p1",
-				Session:          &types.SessionInfo{VPNAddress: "10.0.0.8"},
+				State:             types.StateConnected,
+				SelectedProfileID: "p1",
+				Session:           &types.SessionInfo{VPNAddress: "10.0.0.8"},
 			},
 			traffic: types.TrafficSnapshot{
 				BytesSent:              1024,
@@ -273,9 +273,9 @@ func TestTooltipTextFitsWithinLimit(t *testing.T) {
 		{
 			name: "long identity gets truncated",
 			status: &types.Status{
-				State:            types.StateConnected,
-				CurrentProfileID: "p1",
-				Session:          &types.SessionInfo{VPNAddress: "192.168.100.200"},
+				State:             types.StateConnected,
+				SelectedProfileID: "p1",
+				Session:           &types.SessionInfo{VPNAddress: "192.168.100.200"},
 			},
 			traffic: types.TrafficSnapshot{
 				BytesSent:              1024,
@@ -288,9 +288,9 @@ func TestTooltipTextFitsWithinLimit(t *testing.T) {
 		{
 			name: "zero traffic shows 0",
 			status: &types.Status{
-				State:            types.StateConnected,
-				CurrentProfileID: "p1",
-				Session:          &types.SessionInfo{VPNAddress: "10.0.0.1"},
+				State:             types.StateConnected,
+				SelectedProfileID: "p1",
+				Session:           &types.SessionInfo{VPNAddress: "10.0.0.1"},
 			},
 			traffic:  types.TrafficSnapshot{},
 			profiles: []types.Profile{{ID: "p1", Name: "Work"}},

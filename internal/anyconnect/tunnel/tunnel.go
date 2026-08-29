@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"flexconnect/internal/anyconnect/auth"
 	"flexconnect/internal/anyconnect/base"
@@ -18,7 +21,7 @@ import (
 	"flexconnect/internal/router"
 )
 
-func initTunnel(client *auth.Client, sess *session.Session) map[string]string {
+func initTunnel(client *auth.Client, sess *session.Session) (map[string]string, error) {
 	requestedMTU := client.Prof.MTU
 	if requestedMTU <= 0 {
 		requestedMTU = defaultMTU
@@ -36,13 +39,17 @@ func initTunnel(client *auth.Client, sess *session.Session) map[string]string {
 	// worker-vpn.c WSPCONFIG(ws)->udp_port != 0 && req->master_secret_set != 0 否则 disabling UDP (DTLS) connection
 	// 如果开启 dtls_psk（默认开启，见配置说明） 且 CipherSuite 包含 PSK-NEGOTIATE（仅限ocserv），worker-http.c 自动设置 req->master_secret_set = 1
 	// 此时无需手动设置 Secret，会自动协商建立 dtls 链接，AnyConnect 客户端不支持
-	sess.PreMasterSecret, _ = utils.MakeMasterSecret()
+	masterSecret, err := utils.MakeMasterSecret()
+	if err != nil {
+		return nil, fmt.Errorf("generate DTLS master secret: %w", err)
+	}
+	sess.PreMasterSecret = masterSecret
 	headers["X-DTLS-Master-Secret"] = hex.EncodeToString(sess.PreMasterSecret) // Hex-encoded pre-master secret used in DTLS negotiation.
 
 	// https://gitlab.com/openconnect/ocserv/-/blob/master/src/worker-http.c#L150
 	// https://github.com/openconnect/openconnect/blob/master/gnutls-dtls.c#L75
 	headers["X-DTLS12-CipherSuite"] = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:AES128-GCM-SHA256"
-	return headers
+	return headers, nil
 }
 
 // SetupTunnelWithClient establishes a tunnel using only the supplied
@@ -54,7 +61,10 @@ func SetupTunnelWithClient(client *auth.Client, sess *session.Session) error {
 	if sess == nil {
 		return fmt.Errorf("nil VPN session")
 	}
-	headers := initTunnel(client, sess)
+	headers, err := initTunnel(client, sess)
+	if err != nil {
+		return err
+	}
 	base.Info("start tunnel negotiation", "server", client.Prof.HostWithPort)
 
 	// https://github.com/golang/go/commit/da6c168378b4c1deb2a731356f1f438e4723b8a7
@@ -105,6 +115,11 @@ func SetupTunnelWithClient(client *auth.Client, sess *session.Session) error {
 	}
 
 	cSess := sess.NewConnSession(&resp.Header)
+	cSess.TLSServerName, err = tlsServerName(client.Prof.HostWithPort)
+	if err != nil {
+		_ = client.Close()
+		return err
+	}
 	mtu, err := effectiveMTU(cSess.MTU, client.Prof.MTU)
 	if err != nil {
 		_ = client.Close()
@@ -113,7 +128,13 @@ func SetupTunnelWithClient(client *auth.Client, sess *session.Session) error {
 		return err
 	}
 	cSess.MTU = mtu
-	cSess.ServerAddress = strings.Split(client.Conn.RemoteAddr().String(), ":")[0]
+	serverAddress, _, err := net.SplitHostPort(client.Conn.RemoteAddr().String())
+	if err != nil {
+		_ = client.Close()
+		cSess.Close()
+		return fmt.Errorf("parse VPN server socket: %w", err)
+	}
+	cSess.ServerAddress = serverAddress
 	cSess.LocalSocketAddress = client.Conn.LocalAddr().String()
 	cSess.RemoteSocketAddress = client.Conn.RemoteAddr().String()
 	cSess.Hostname = client.Prof.Host
@@ -186,12 +207,35 @@ func SetupTunnelWithClient(client *auth.Client, sess *session.Session) error {
 		base.Info("start dtls channel", "address", cSess.ServerAddress, "port", cSess.DTLSPort)
 		// https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-03#section-2.1.5
 		go dtlsChannel(cSess)
+		timer := time.NewTimer(25 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-cSess.DtlsSetupChan:
+			if !cSess.DtlsConnected.Load() {
+				return errors.New("DTLS was offered but negotiation failed")
+			}
+		case <-cSess.CloseChan:
+			return errors.New("VPN session closed during DTLS negotiation")
+		case <-timer.C:
+			return errors.New("DTLS negotiation exceeded 25 seconds")
+		}
 	}
 
 	cSess.DPDTimer()
 	cSess.ReadDeadTimer()
 
 	return nil
+}
+
+func tlsServerName(hostPort string) (string, error) {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(hostPort))
+	if err != nil {
+		return "", fmt.Errorf("invalid VPN server address %q: %w", hostPort, err)
+	}
+	if host == "" {
+		return "", fmt.Errorf("VPN server hostname is empty")
+	}
+	return host, nil
 }
 
 func applyProfileOverridesWithProfile(cSess *session.ConnSession, profile *auth.Profile) {
@@ -231,13 +275,13 @@ func effectiveMTU(serverMTU, profileMTU int) (int, error) {
 	if profileMTU <= 0 {
 		profileMTU = defaultMTU
 	}
-	if profileMTU < 576 || profileMTU > 65535 {
+	if profileMTU < 576 || profileMTU > 9000 {
 		return 0, fmt.Errorf("invalid profile MTU %d", profileMTU)
 	}
 	if serverMTU <= 0 {
 		return profileMTU, nil
 	}
-	if serverMTU < 576 || serverMTU > 65535 {
+	if serverMTU < 576 || serverMTU > 9000 {
 		return 0, fmt.Errorf("invalid server MTU %d", serverMTU)
 	}
 	if serverMTU < profileMTU {

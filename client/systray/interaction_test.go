@@ -35,8 +35,8 @@ func (fakeFailingClient) SwitchProfile(context.Context, string) error {
 }
 func (fakeFailingClient) Connect(context.Context, string) error { return nil }
 func (fakeFailingClient) ConnectCurrent(context.Context) error  { return nil }
-func (fakeFailingClient) UpdateProfile(context.Context, string, types.ProfileUpdateRequest) (*types.Profile, error) {
-	return nil, nil
+func (fakeFailingClient) UpdateProfile(context.Context, string, types.ProfileUpdateRequest) (types.ProfileMutationResult, error) {
+	return types.ProfileMutationResult{}, nil
 }
 func (fakeFailingClient) DiagnosticsText(context.Context) (string, error) { return "", nil }
 func (fakeFailingClient) Watch(context.Context) (*local.Watcher, error)   { return nil, nil }

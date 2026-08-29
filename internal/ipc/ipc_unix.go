@@ -64,7 +64,7 @@ func Listen(path string) (net.Listener, error) {
 		_ = ln.Close()
 		return nil, fmt.Errorf("inspect created unix socket %s: %w", path, err)
 	}
-	return &cleanupListener{Listener: ln, path: path, created: created}, nil
+	return &cleanupListener{Listener: identityListener{Listener: ln}, path: path, created: created}, nil
 }
 
 type cleanupListener struct {

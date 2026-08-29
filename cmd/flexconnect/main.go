@@ -99,7 +99,7 @@ func runWithTimeouts(parent context.Context, client *local.Client, args []string
 		return err
 	}
 	if commandNeedsDaemon(args) {
-		if err := checkDaemonConnectivity(parent, client, timeout); err != nil {
+		if err := checkDaemonConnectivity(parent, client, timeout, commandAllowsUnready(args)); err != nil {
 			return err
 		}
 	}
@@ -133,7 +133,7 @@ func commandNeedsDaemon(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "status", "login", "up", "down", "logs", "diag", "traffic", "watch", "update":
+	case "status", "login", "up", "down", "logs", "diag", "traffic", "watch", "update", "control-mode":
 		return true
 	case "profile", "route", "proxy":
 		return len(args) > 1
@@ -142,15 +142,40 @@ func commandNeedsDaemon(args []string) bool {
 	}
 }
 
-func checkDaemonConnectivity(parent context.Context, client *local.Client, timeout time.Duration) error {
+func commandAllowsUnready(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "status", "logs", "diag", "traffic", "watch", "down", "control-mode":
+		return true
+	case "profile":
+		return len(args) > 1 && (args[1] == "list" || args[1] == "current")
+	case "route":
+		return len(args) > 1 && args[1] == "show"
+	case "proxy":
+		return len(args) > 1 && args[1] == "status"
+	default:
+		return false
+	}
+}
+
+func checkDaemonConnectivity(parent context.Context, client *local.Client, timeout time.Duration, allowUnready bool) error {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	debugf("checking daemon connectivity")
-	health, err := client.Health(ctx)
+	live, err := client.Live(ctx)
 	if err != nil {
 		return daemonConnectivityError(err)
 	}
-	debugf("daemon connectivity check passed version=%s api_version=%s", health.Version, health.APIVersion)
+	ready, err := client.Ready(ctx)
+	if err != nil {
+		return daemonConnectivityError(err)
+	}
+	if !ready.Ready && !allowUnready {
+		return daemonConnectivityError(&local.NotReadyError{Status: *ready})
+	}
+	debugf("daemon connectivity check passed version=%s api_version=%d ready=%t", live.Version, live.APIMajor, ready.Ready)
 	return nil
 }
 
@@ -182,7 +207,7 @@ func runCommand(ctx context.Context, client *local.Client, args []string) error 
 		if err != nil {
 			return err
 		}
-		debugf("status result state=%q current=%q", status.State, status.CurrentProfileID)
+		debugf("status result state=%q selected=%q", status.State, status.SelectedProfileID)
 		if hasJSONFlag(args[1:]) {
 			return printJSON(status)
 		}
@@ -245,7 +270,7 @@ func runCommand(ctx context.Context, client *local.Client, args []string) error 
 			return err
 		}
 		debugf("diagnostics status=%q current=%q connected=%q profiles=%d logs=%d routes=%d",
-			diag.Status.State, diag.Status.CurrentProfileID, diag.Status.ConnectedProfileID,
+			diag.Status.State, diag.Status.SelectedProfileID, diag.Status.ConnectedProfileID,
 			len(diag.Profiles), len(diag.Logs), len(diag.Status.EffectiveRoutes))
 		return printJSON(diag)
 	case "traffic":
@@ -277,6 +302,12 @@ func runCommand(ctx context.Context, client *local.Client, args []string) error 
 	case "proxy":
 		debugf("handling proxy")
 		return runProxy(ctx, client, args[1:])
+	case "control-mode":
+		debugf("handling control mode")
+		if wantCommandHelp(args[1:]) {
+			return printNamedHelp("control-mode")
+		}
+		return runControlMode(ctx, client, args[1:])
 	case "watch":
 		debugf("handling watch")
 		if wantCommandHelp(args[1:]) {
@@ -601,6 +632,51 @@ func findProfileIDByName(ctx context.Context, client *local.Client, name string)
 	return match, nil
 }
 
+func runControlMode(ctx context.Context, client *local.Client, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: flexconnect control-mode user | flexconnect control-mode machine [-p <profile-name>] [profile-id]")
+	}
+	mode := strings.ToLower(strings.TrimSpace(args[0]))
+	switch mode {
+	case "user":
+		if len(args) != 1 {
+			return errors.New("usage: flexconnect control-mode user")
+		}
+		operation, err := client.SetControlMode(ctx, "user", "")
+		if err != nil {
+			return err
+		}
+		return printJSON(operation)
+	case "machine":
+		fs := flag.NewFlagSet("control-mode machine", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		profileName := fs.String("p", "", "machine profile name")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *profileName != "" && fs.NArg() != 0 || *profileName == "" && fs.NArg() != 1 {
+			return errors.New("usage: flexconnect control-mode machine [-p <profile-name>] [profile-id]")
+		}
+		profileID := ""
+		if *profileName != "" {
+			id, err := findProfileIDByName(ctx, client, *profileName)
+			if err != nil {
+				return err
+			}
+			profileID = id
+		} else {
+			profileID = fs.Arg(0)
+		}
+		operation, err := client.SetControlMode(ctx, "machine", profileID)
+		if err != nil {
+			return err
+		}
+		return printJSON(operation)
+	default:
+		return errors.New("control mode must be user or machine")
+	}
+}
+
 func runProfile(ctx context.Context, client *local.Client, args []string) error {
 	if len(args) == 0 || isHelpArg(args[0]) {
 		return printNamedHelp("profile")
@@ -625,6 +701,7 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 		unsafePassword := fs.String("password", "", "unsupported plaintext password")
 		passwordFile := fs.String("password-file", "", "read password from a file")
 		passwordStdin := fs.Bool("password-stdin", false, "read password from standard input")
+		scope := fs.String("scope", string(types.ProfileScopeUser), "profile scope: user or machine")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -633,9 +710,16 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 		}
 		positionals := fs.Args()
 		if len(positionals) < 2 || len(positionals) > 3 {
-			return fmt.Errorf("usage: profile add [--password-file <path> | --password-stdin] <name> <server_url> [username]")
+			return fmt.Errorf("usage: profile add [--scope user|machine] [--password-file <path> | --password-stdin] <name> <server_url> [username]")
 		}
-		profile := types.NewProfile(positionals[0])
+		profile, err := types.NewProfile(positionals[0])
+		if err != nil {
+			return fmt.Errorf("generate profile ID: %w", err)
+		}
+		profile.Scope = types.ProfileScope(strings.ToLower(strings.TrimSpace(*scope)))
+		if profile.Scope != types.ProfileScopeUser && profile.Scope != types.ProfileScopeMachine {
+			return errors.New("--scope must be user or machine")
+		}
 		profile.ServerURL = positionals[1]
 		if len(positionals) > 2 {
 			profile.Username = positionals[2]
@@ -778,11 +862,11 @@ func runProfile(ctx context.Context, client *local.Client, args []string) error 
 		if *socks5Listen != "" {
 			req.SOCKS5Listen = socks5Listen
 		}
-		profile, err := client.UpdateProfile(ctx, targetID, req)
+		result, err := client.UpdateProfile(ctx, targetID, req)
 		if err != nil {
 			return err
 		}
-		return printJSON(profile)
+		return printProfileMutation(result)
 	case "switch":
 		if wantCommandHelp(args[1:]) {
 			return printNamedHelp("profile switch")
@@ -925,12 +1009,12 @@ func runProxy(ctx context.Context, client *local.Client, args []string) error {
 			listen := args[1]
 			req.SOCKS5Listen = &listen
 		}
-		profile, err := client.UpdateProfile(ctx, current.ID, req)
+		result, err := client.UpdateProfile(ctx, current.ID, req)
 		if err != nil {
 			return err
 		}
 		debugf("proxy enable profile=%q", current.ID)
-		return printJSON(profile)
+		return printProfileMutation(result)
 	case "disable":
 		debugf("proxy disable")
 		if wantCommandHelp(args[1:]) {
@@ -941,15 +1025,25 @@ func runProxy(ctx context.Context, client *local.Client, args []string) error {
 			return err
 		}
 		enabled := false
-		profile, err := client.UpdateProfile(ctx, current.ID, types.ProfileUpdateRequest{SOCKS5Enabled: &enabled})
+		result, err := client.UpdateProfile(ctx, current.ID, types.ProfileUpdateRequest{SOCKS5Enabled: &enabled})
 		if err != nil {
 			return err
 		}
 		debugf("proxy disabled profile=%q", current.ID)
-		return printJSON(profile)
+		return printProfileMutation(result)
 	default:
 		return fmt.Errorf("unknown proxy command: %s", args[0])
 	}
+}
+
+func printProfileMutation(result types.ProfileMutationResult) error {
+	if result.Profile != nil {
+		return printJSON(result.Profile)
+	}
+	if result.Operation != nil {
+		return printJSON(types.OperationRef{Operation: *result.Operation})
+	}
+	return errors.New("local API returned an empty profile mutation result")
 }
 
 func splitCSV(v string) []string {
@@ -1033,8 +1127,8 @@ func formatStatusWithProfiles(status *types.Status, profiles []types.Profile) st
 	}
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "State: %s\n", status.State)
-	if status.CurrentProfileID != "" {
-		fmt.Fprintf(&buf, "Current Profile: %s\n", profileName(status.CurrentProfileID))
+	if status.SelectedProfileID != "" {
+		fmt.Fprintf(&buf, "Selected Profile: %s\n", profileName(status.SelectedProfileID))
 	}
 	if status.ConnectedProfileID != "" {
 		fmt.Fprintf(&buf, "Connected Profile: %s\n", profileName(status.ConnectedProfileID))
@@ -1056,7 +1150,7 @@ func formatStatusWithProfiles(status *types.Status, profiles []types.Profile) st
 	if status.LastError != "" {
 		fmt.Fprintf(&buf, "Last Error: %s\n", status.LastError)
 	}
-	if status.State == types.StateDisconnected && status.CurrentProfileID == "" {
+	if status.State == types.StateDisconnected && status.SelectedProfileID == "" {
 		buf.WriteString("Next Step: run `flexconnect login` to add a connection.\n")
 	} else if status.State == types.StateError {
 		buf.WriteString("Next Step: run `flexconnect up` to retry or `flexconnect diag diag.json` for diagnostics.\n")
@@ -1243,6 +1337,7 @@ func rootHelpTopic() helpTopic {
 			{Name: "profile", Summary: "List, edit, and switch profiles"},
 			{Name: "route", Summary: "Show or update per-profile route rules"},
 			{Name: "proxy", Summary: "Control the built-in local SOCKS5 proxy"},
+			{Name: "control-mode", Summary: "Enter or exit administrator-owned machine mode"},
 			{Name: "logs", Summary: "Show recent daemon logs"},
 			{Name: "diag", Summary: "Export diagnostics as JSON"},
 			{Name: "traffic", Summary: "Show traffic totals and speeds"},
@@ -1261,6 +1356,7 @@ func rootHelpTopic() helpTopic {
 			"flexconnect netcheck --env-file .env",
 			"flexconnect profile update -p corp --user alice --server vpn.example.com --password-file ./secrets/flexconnect_password --auto-reconnect true --apply-dns true --socks5-listen 127.0.0.1:1080",
 			"flexconnect proxy enable 127.0.0.1:1080",
+			"flexconnect control-mode user",
 		},
 	}
 }
@@ -1352,8 +1448,8 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 		},
 		"profile add": {
 			Name:        "profile add",
-			Usage:       "flexconnect profile add [--password-file <path> | --password-stdin] <name> <server_url> [username]",
-			Description: "Create a new profile and optionally seed a password from a protected file or standard input.",
+			Usage:       "flexconnect profile add [--scope user|machine] [--password-file <path> | --password-stdin] <name> <server_url> [username]",
+			Description: "Create a user profile by default. Elevated administrators may create machine profiles with --scope machine.",
 		},
 		"profile switch": {
 			Name:        "profile switch",
@@ -1414,6 +1510,16 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 			Name:        "proxy disable",
 			Usage:       "flexconnect proxy disable",
 			Description: "Disable the built-in SOCKS5 proxy on the current profile.",
+		},
+		"control-mode": {
+			Name:        "control-mode",
+			Usage:       "flexconnect control-mode user | flexconnect control-mode machine [-p <profile-name>] [profile-id]",
+			Description: "Elevated administrators enter unattended machine mode with a machine profile or explicitly exit it. Machine mode remains locked after connection failure until this command exits it.",
+			Examples: []string{
+				"flexconnect profile add --scope machine --password-file ./secrets/flexconnect_password unattended https://vpn.example.com machine-user",
+				"flexconnect control-mode machine -p unattended",
+				"flexconnect control-mode user",
+			},
 		},
 	}
 	topic, ok := topics[name]

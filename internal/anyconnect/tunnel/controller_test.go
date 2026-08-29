@@ -92,8 +92,8 @@ func TestTunnelControllerCloseIsIdempotent(t *testing.T) {
 	if first == nil {
 		t.Fatal("first close should surface the manager error")
 	}
-	if second := controller.Close(context.Background()); second != nil {
-		t.Fatalf("second close returned %v, want nil", second)
+	if second := controller.Close(context.Background()); second == nil || second.Error() != first.Error() {
+		t.Fatalf("second close returned %v, want preserved %v", second, first)
 	}
 	if manager.closeCount() != 1 {
 		t.Fatalf("manager closed %d times, want exactly 1", manager.closeCount())

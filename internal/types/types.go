@@ -3,10 +3,18 @@ package types
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"io"
 	"time"
 )
 
 type State string
+
+type ProfileScope string
+
+const (
+	ProfileScopeUser    ProfileScope = "user"
+	ProfileScopeMachine ProfileScope = "machine"
+)
 
 const (
 	StateDisconnected State = "Disconnected"
@@ -25,28 +33,43 @@ type RouteSpec struct {
 }
 
 type Profile struct {
-	ID                 string   `json:"id"`
-	Name               string   `json:"name"`
-	ServerURL          string   `json:"server_url"`
-	Username           string   `json:"username"`
-	SecretRef          string   `json:"secret_ref"`
-	Group              string   `json:"group"`
-	AcceptServerRoutes bool     `json:"accept_server_routes"`
-	AutoReconnect      *bool    `json:"auto_reconnect"`
-	ApplyDNS           *bool    `json:"apply_dns"`
-	CustomInclude      []string `json:"custom_include_routes"`
-	CustomExclude      []string `json:"custom_exclude_routes"`
-	DNSOverrides       []string `json:"dns_overrides"`
-	SOCKS5Enabled      bool     `json:"socks5_enabled"`
-	SOCKS5Listen       string   `json:"socks5_listen"`
-	MTU                int      `json:"mtu"`
-	CreatedAt          string   `json:"created_at"`
-	UpdatedAt          string   `json:"updated_at"`
+	ID                 string       `json:"id"`
+	Name               string       `json:"name"`
+	ServerURL          string       `json:"server_url"`
+	Username           string       `json:"username"`
+	SecretRef          string       `json:"-"`
+	Scope              ProfileScope `json:"scope"`
+	OwnerID            string       `json:"-"`
+	Group              string       `json:"group"`
+	AcceptServerRoutes bool         `json:"accept_server_routes"`
+	AutoReconnect      *bool        `json:"auto_reconnect"`
+	ApplyDNS           *bool        `json:"apply_dns"`
+	CustomInclude      []string     `json:"custom_include_routes"`
+	CustomExclude      []string     `json:"custom_exclude_routes"`
+	DNSOverrides       []string     `json:"dns_overrides"`
+	SOCKS5Enabled      bool         `json:"socks5_enabled"`
+	SOCKS5Listen       string       `json:"socks5_listen"`
+	MTU                int          `json:"mtu"`
+	CreatedAt          string       `json:"created_at"`
+	UpdatedAt          string       `json:"updated_at"`
 }
 
-type ProfileUpsertRequest struct {
-	Profile  Profile `json:"profile"`
-	Password string  `json:"password,omitempty"`
+type ProfileCreateRequest struct {
+	Name               string       `json:"name"`
+	ServerURL          string       `json:"server_url"`
+	Username           string       `json:"username"`
+	Password           string       `json:"password,omitempty"`
+	Group              string       `json:"group,omitempty"`
+	Scope              ProfileScope `json:"scope"`
+	AcceptServerRoutes *bool        `json:"accept_server_routes,omitempty"`
+	AutoReconnect      *bool        `json:"auto_reconnect,omitempty"`
+	ApplyDNS           *bool        `json:"apply_dns,omitempty"`
+	CustomInclude      []string     `json:"custom_include_routes,omitempty"`
+	CustomExclude      []string     `json:"custom_exclude_routes,omitempty"`
+	DNSOverrides       []string     `json:"dns_overrides,omitempty"`
+	SOCKS5Enabled      bool         `json:"socks5_enabled,omitempty"`
+	SOCKS5Listen       string       `json:"socks5_listen,omitempty"`
+	MTU                int          `json:"mtu,omitempty"`
 }
 
 type ProfileUpdateRequest struct {
@@ -174,8 +197,12 @@ type TrafficSnapshot struct {
 
 type Status struct {
 	State              State        `json:"state"`
-	CurrentProfileID   string       `json:"current_profile_id"`
+	CurrentProfileID   string       `json:"-"`
+	SelectedProfileID  string       `json:"selected_profile_id,omitempty"`
 	ConnectedProfileID string       `json:"connected_profile_id"`
+	ControlMode        string       `json:"control_mode"`
+	AttemptID          string       `json:"attempt_id,omitempty"`
+	Operation          *Operation   `json:"operation,omitempty"`
 	Session            *SessionInfo `json:"session,omitempty"`
 	EffectiveRoutes    []RouteSpec  `json:"effective_routes,omitempty"`
 	LastError          string       `json:"last_error,omitempty"`
@@ -188,6 +215,65 @@ type Health struct {
 	Status     string `json:"status"`
 	Version    string `json:"version"`
 	APIVersion string `json:"api_version"`
+}
+
+type LiveStatus struct {
+	Status       string   `json:"status"`
+	Version      string   `json:"version"`
+	APIMajor     int      `json:"api_major"`
+	Capabilities []string `json:"capabilities"`
+}
+
+type ComponentStatus struct {
+	Name    string `json:"name"`
+	Ready   bool   `json:"ready"`
+	Message string `json:"message,omitempty"`
+}
+
+type ReadyStatus struct {
+	Ready      bool              `json:"ready"`
+	Components []ComponentStatus `json:"components"`
+}
+
+type OperationState string
+
+const (
+	OperationRunning   OperationState = "running"
+	OperationSucceeded OperationState = "succeeded"
+	OperationFailed    OperationState = "failed"
+)
+
+type Operation struct {
+	ID        string         `json:"id"`
+	Kind      string         `json:"kind"`
+	ProfileID string         `json:"profile_id,omitempty"`
+	AttemptID string         `json:"attempt_id,omitempty"`
+	State     OperationState `json:"state"`
+	ErrorCode string         `json:"error_code,omitempty"`
+	Error     string         `json:"error,omitempty"`
+	StartedAt string         `json:"started_at"`
+	EndedAt   string         `json:"ended_at,omitempty"`
+	OwnerID   string         `json:"-"`
+}
+
+type OperationRef struct {
+	Operation Operation `json:"operation"`
+}
+
+// ProfileMutationResult represents the two valid PATCH /v2/profiles outcomes:
+// a completed static update or an asynchronous active-profile transaction.
+type ProfileMutationResult struct {
+	Profile   *Profile
+	Operation *Operation
+}
+
+type ConnectionRequest struct {
+	ProfileID string `json:"profile_id"`
+}
+
+type ControlModeRequest struct {
+	Mode      string `json:"mode"`
+	ProfileID string `json:"profile_id,omitempty"`
 }
 
 type RouteUpdateRequest struct {
@@ -212,6 +298,8 @@ type LogEntry struct {
 }
 
 type Notify struct {
+	Epoch      string           `json:"epoch"`
+	Revision   uint64           `json:"revision"`
 	Version    string           `json:"version"`
 	Event      string           `json:"event"`
 	Status     *Status          `json:"status,omitempty"`
@@ -223,6 +311,7 @@ type Notify struct {
 	Error      string           `json:"error,omitempty"`
 	Connection *ConnectionEvent `json:"connection,omitempty"`
 	Network    *NetworkChange   `json:"network,omitempty"`
+	Operation  *Operation       `json:"operation,omitempty"`
 	Time       string           `json:"time"`
 }
 
@@ -259,6 +348,7 @@ type Diagnostics struct {
 	ConnectionHistory []ConnectionEvent   `json:"connection_history"`
 	Reconnect         ReconnectSnapshot   `json:"reconnect"`
 	Runtime           *RuntimeDiagnostics `json:"runtime,omitempty"`
+	Health            []ComponentStatus   `json:"health"`
 }
 
 func BoolPtr(v bool) *bool {
@@ -272,11 +362,17 @@ func BoolValue(v *bool, defaultValue bool) bool {
 	return *v
 }
 
-func NewProfile(name string) Profile {
+func NewProfile(name string) (Profile, error) {
+	id, err := NewID()
+	if err != nil {
+		return Profile{}, err
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	return Profile{
-		ID:                 randomID(),
+		ID:                 id,
 		Name:               name,
+		Scope:              ProfileScopeMachine,
+		OwnerID:            "system",
 		AcceptServerRoutes: true,
 		AutoReconnect:      BoolPtr(false),
 		ApplyDNS:           BoolPtr(true),
@@ -284,11 +380,17 @@ func NewProfile(name string) Profile {
 		MTU:                1399,
 		CreatedAt:          now,
 		UpdatedAt:          now,
-	}
+	}, nil
 }
 
-func randomID() string {
-	var buf [8]byte
-	_, _ = rand.Read(buf[:])
-	return hex.EncodeToString(buf[:])
+func NewID() (string, error) {
+	return newIDFrom(rand.Reader)
+}
+
+func newIDFrom(reader io.Reader) (string, error) {
+	var buf [16]byte
+	if _, err := io.ReadFull(reader, buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
 }

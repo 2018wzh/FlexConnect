@@ -8,7 +8,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "1080:1080"
+      - "127.0.0.1:1080:1080"
     volumes:
       - flexconnect-state:/var/lib/flexconnect
     environment:

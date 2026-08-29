@@ -1,7 +1,7 @@
 # Project Overview
 FlexConnect is a Go-based, cross-platform AnyConnect client modeled after the
 Tailscale client shape: a privileged local daemon owns VPN state, while a CLI,
-desktop tray, typed local API client, and browser console provide user control.
+desktop tray and typed local API client provide user control.
 Its pitch is a single local control plane for profiles, routing, diagnostics,
 SOCKS5 proxying, and real AnyConnect password-auth sessions.
 
@@ -23,19 +23,19 @@ SOCKS5 proxying, and real AnyConnect password-auth sessions.
   - `anyconnect/` is the embedded AnyConnect protocol, tunnel, TUN, and auth stack.
   - `netcheck/` owns the CLI connection probe: CSTP/DTLS authentication, user-space traffic
     probing without an OS TUN, bounded download measurement, and sanitized results.
-  - `apiserver/` exposes the local `/v1` control API.
-  - `appd/` owns profiles, connection state, notifications, local UI, and proxy state.
+  - `apiserver/` exposes the local `/v2` control API.
+  - `appd/` owns profiles, connection state, notifications, health, operations, and proxy state.
   - `ipc/` abstracts Unix sockets and Windows named pipes.
   - `router/` plans effective routes from server routes and profile overrides.
   - `secret/` stores passwords through the OS keyring or an in-memory test store.
   - `store/file/` persists non-secret profile state as JSON.
   - `vpn/` defines the backend interface and the AnyConnect adapter.
 - `release/` contains packaging metadata, lifecycle scripts, and release target assets.
-- `scripts/` contains build, packaging, install, smoke-test, and live-test scripts.
+- `scripts/` contains build, packaging, and install scripts.
   - `launchd/` contains the macOS daemon plist.
   - `systemd/` contains the Linux daemon service unit.
 - `tmp/` is local temporary output and should not be treated as source.
-- `.env` is a local live-test secrets file and is ignored by Git.
+- `.env` is a local netcheck credential file and is ignored by Git.
 - `Dockerfile` builds the Linux container image for `flexconnectd` and `flexconnect`.
 - `docker-compose.example.yml` documents Linux TUN, SOCKS5 port, state volume, and Docker secret wiring.
 - `.dockerignore` excludes local secrets, build outputs, runtime state, caches, and local worktrees from Docker build context.
@@ -62,7 +62,7 @@ Run the CLI from source:
 ```powershell
 go run .\cmd\flexconnect status
 go run .\cmd\flexconnect login
-go run .\cmd\flexconnect web
+go run .\cmd\flexconnect control-mode user
 ```
 
 Build all Go packages:
@@ -71,7 +71,7 @@ Build all Go packages:
 go build ./...
 ```
 
-Build and smoke-check the Linux Docker image:
+Build and verify the Linux Docker image:
 
 ```bash
 docker build -t flexconnect:local .
@@ -102,20 +102,20 @@ docker push "${IMAGE}:latest"
 Manual workflow dispatch (optional):
 
 ```bash
-gh workflow run docker-release.yml -f image-tag=1.2.4
+gh workflow run docker-release.yml -f image-tag=1.3.0
 ```
 
 Build distribution artifacts through the unified dist entrypoint:
 
 ```powershell
 go run .\cmd\dist list
-go run .\cmd\dist build --version 1.2.4 linux/amd64/tgz
-go run .\cmd\dist build --version 1.2.4 linux/amd64/deb
-go run .\cmd\dist build --version 1.2.4 linux/amd64/rpm
-go run .\cmd\dist build --version 1.2.4 windows/amd64/zip
-go run .\cmd\dist build --version 1.2.4 windows/amd64/msi
-go run .\cmd\dist build --version 1.2.4 darwin/amd64/pkg
-go run .\cmd\dist build --version 1.2.4 darwin/arm64/pkg
+go run .\cmd\dist build --version 1.3.0 linux/amd64/tgz
+go run .\cmd\dist build --version 1.3.0 linux/amd64/deb
+go run .\cmd\dist build --version 1.3.0 linux/amd64/rpm
+go run .\cmd\dist build --version 1.3.0 windows/amd64/zip
+go run .\cmd\dist build --version 1.3.0 windows/amd64/msi
+go run .\cmd\dist build --version 1.3.0 darwin/amd64/pkg
+go run .\cmd\dist build --version 1.3.0 darwin/arm64/pkg
 ```
 
 Install or remove the Windows service:
@@ -138,22 +138,6 @@ Run unit and integration tests:
 go test ./...
 ```
 
-Run local control-plane smoke tests:
-
-```powershell
-.\scripts\smoke-test.ps1
-```
-
-```bash
-./scripts/smoke-test.sh
-```
-
-Run the live AnyConnect acceptance test with a local `.env` file:
-
-```powershell
-.\scripts\live-connect-test.ps1 -EnvFile .env
-```
-
 Format only touched Go files:
 
 ```powershell
@@ -162,8 +146,9 @@ gofmt -w .\path\to\touched_file.go
 
 Lint:
 
-> TODO: Add a repository-owned lint command and config. `go vet ./...` currently
-> reports an existing unkeyed Windows GUID literal in `internal/anyconnect/tun`.
+```powershell
+go vet ./...
+```
 
 Type-check:
 
@@ -199,10 +184,7 @@ Container deployment can be done via GitHub Container Registry when pushing `v*`
 - Use fake VPN backends, memory secret stores, and temp state paths in tests.
 - Existing logging is component-based through `internal/logging`; keep new logs concise and
   avoid passwords, tokens, and full credential-bearing URLs.
-- No repo-owned `golangci-lint`, Staticcheck, Makefile, Taskfile, or CI lint config was found.
-- Commit-message template:
-
-> TODO: Add the repository's commit-message convention before enforcing one.
+- CI uses `go vet ./...`; no additional repo-owned linter is configured.
 
 ## Architecture Notes
 ```mermaid
@@ -210,7 +192,7 @@ flowchart TD
   Tray["flextray / client/systray"] --> LocalClient["client/local typed client"]
   CLI["flexconnect CLI"] --> LocalClient
   LocalClient --> IPC["Unix socket or Windows named pipe"]
-  IPC --> API["internal/apiserver /v1 local API"]
+  IPC --> API["internal/apiserver /v2 local API"]
   API --> Daemon["internal/appd service"]
   Daemon --> Store["internal/store/file state.json"]
   Daemon --> Secrets["internal/secret OS keyring"]
@@ -218,7 +200,7 @@ flowchart TD
   Daemon --> Socks["internal/socks5 proxy"]
   Daemon --> Backend["internal/vpn/anyconnect"]
   Backend --> AC["internal/anyconnect auth, TLS/DTLS, TUN"]
-  Daemon --> Watch["/v1/watch NDJSON events"]
+  Daemon --> Watch["/v2/watch NDJSON events"]
   Watch --> Tray
   Watch --> CLI
 ```
@@ -228,7 +210,7 @@ The daemon `flexconnectd` listens on a platform-specific local IPC endpoint and 
 `client/local`, so control commands, profile edits, status reads, diagnostics, and event watches
 share one typed client path. `internal/appd` is the stateful coordinator: it loads and persists
 profiles, stores password references in the OS keyring, starts and stops the VPN backend, computes
-effective routes, manages the optional SOCKS5 listener, serves the local browser console, and emits
+effective routes, manages the optional SOCKS5 listener, and emits
 watch notifications. The AnyConnect adapter configures the embedded protocol stack, performs
 password auth, establishes TLS/DTLS and TUN state, then reports session details back to the daemon.
 
@@ -241,7 +223,7 @@ reintroduced.
 Connection lifecycle observability is owned by the daemon: AnyConnect records
 the first terminal close reason on each session and emits it with the stable
 connection ID. The daemon publishes bounded in-memory lifecycle history through
-`/v1/watch` and `/v1/diagnostics`; the tray consumes these events for
+`/v2/watch` and `/v2/diagnostics`; the tray consumes these events for
 cross-platform desktop notifications. Manual disconnects are explicitly
 classified and do not enter the unexpected-disconnect notification path. Automatic
 reconnect uses exponential backoff and stops after 3 failed attempts with a
@@ -254,8 +236,9 @@ On Linux the packaged daemon runs as `root:flexconnect`; systemd owns `/run/flex
 `/var/lib/flexconnect`, and the control socket is `0660`. Only users explicitly added to the
 `flexconnect` group may use the CLI or tray control plane.
 
-Daemon-backed CLI commands perform a bounded `/v1/health` readiness and API-version handshake
-before their command request. Interactive input is collected outside request deadlines; ordinary
+Daemon-backed CLI commands perform bounded `/v2/live` and `/v2/ready` API/capability handshakes
+before their command request. Read-only diagnostics, disconnect, and administrator `control-mode`
+recovery remain available while readiness is false. Interactive input is collected outside request deadlines; ordinary
 commands and VPN connection commands use separate configurable timeouts.
 
 ## Testing Strategy
@@ -263,50 +246,25 @@ commands and VPN connection commands use separate configurable timeouts.
   backend adapter.
 - Integration tests in `internal/apiserver` and `internal/appd` exercise the local API, daemon
   state transitions, diagnostics, profile CRUD, route replay, and fake backend events.
-- The live test in `internal/liveenv` is skipped unless `FLEXCONNECT_RUN_LIVE=1` is set by
-  `scripts/live-connect-test.ps1`.
-- Smoke tests start a real daemon with an isolated socket and state file, then run CLI status,
-  profile list, diagnostics, and disconnect commands.
 - Docker verification builds the Linux image and runs `flexconnectd -h` with
-  `FLEXCONNECT_CONNECT_ON_START=false`; live Docker VPN acceptance additionally requires
-  Linux TUN access with `NET_ADMIN` and `/dev/net/tun`.
+  `FLEXCONNECT_CONNECT_ON_START=false`.
 - Local default:
 
 ```powershell
 go test ./...
 ```
 
-- Windows smoke:
-
-```powershell
-.\scripts\smoke-test.ps1
-```
-
-- Linux/macOS smoke:
-
-```bash
-./scripts/smoke-test.sh
-```
-
-- Live AnyConnect acceptance, only with explicit credentials in `.env`:
-
-```powershell
-.\scripts\live-connect-test.ps1 -EnvFile .env
-```
-
-> TODO: No CI workflow was found. Add CI that runs `go test ./...`, an OS-appropriate
-> smoke test, packaging checks, and dependency scanning.
+- CI runs tests, race-sensitive package matrices, vet, builds, packaging, and Docker builds on
+  the supported operating systems. It does not perform a real VPN or independent security scan.
 
 ## Security & Compliance
 - `.env`, `.env.*`, generated diagnostics, state files, logs, binaries, installers, and temp
   outputs are ignored by `.gitignore`; do not commit them.
 - Passwords are stored through `internal/secret` using the OS keyring in production and a memory
   store in tests.
-- `FLEXCONNECT_SECRET_STORE=keyring` (the default) probes the OS keyring at startup and, when no
-  keyring is available (e.g. headless Linux without a Secret Service), automatically falls back to
-  `file`: a `0600` JSON file (`secrets.json` next to the state file) holding plaintext secrets
-  protected only by file permissions. Prefer `keyring` or `memory` where the OS keyring is not
-  needed; `file` is a degraded but functional mode.
+- `FLEXCONNECT_SECRET_STORE=keyring` (the default) fails startup when the OS keyring is unavailable.
+  An administrator may explicitly select `file`, which stores a `0600` plaintext JSON file with
+  platform-appropriate restrictive permissions; `memory` is for tests and explicit containers.
 - Docker defaults `FLEXCONNECT_SECRET_STORE=memory`; secrets are injected from
   `FLEXCONNECT_PASSWORD` or `FLEXCONNECT_PASSWORD_FILE`, and both set together must fail fast.
 - Profile state persists only metadata and `secret_ref` values, not raw passwords.
@@ -315,15 +273,8 @@ go test ./...
 - Docker exposes only the SOCKS5 listener by default. Do not expose the local control socket over
   TCP as part of Docker work.
 - Windows daemon startup may request elevation; service install scripts modify system services.
-- Live tests use real AnyConnect credentials and may alter local VPN, route, DNS, and TUN state.
 - Dependency scanning is not configured in the repository.
-
-> TODO: Add a dependency-vulnerability workflow such as `govulncheck` and document the expected
-> remediation process.
-
-- `cmd/dist` marks Linux package metadata as `Proprietary`; no root `LICENSE` file was found.
-
-> TODO: Add or link the authoritative project license before external distribution.
+- `cmd/dist` package metadata and the root `LICENSE` identify the project as proprietary.
 
 ## Agent Guardrails
 - Do not read, print, commit, or modify `.env`, `.env.*`, generated diagnostics, or user state
@@ -333,20 +284,21 @@ go test ./...
 - Do not replace `assets/windows/wintun.dll` without a reviewed upstream provenance note.
 - Do not run service install or uninstall scripts without explicit user approval; they require
   administrator or root privileges and modify host services.
-- Do not run live AnyConnect tests unless the user explicitly requests them and provides or confirms
-  a valid local `.env`.
 - Do not print Docker secret contents, password environment values, generated state files, or
   credential-bearing Compose overrides.
 - Changes to auth, secret storage, diagnostics, routing, TUN, service scripts, installers, and
   package metadata require human review.
 - Keep new daemon, tray, and CLI operations bounded with contexts or cancellation paths.
-- Prefer `/v1/watch` for UI updates instead of adding tight polling loops.
+- Prefer `/v2/watch` for UI updates instead of adding tight polling loops.
 - Only change `go.mod` or `go.sum` when intentionally adding, removing, or upgrading dependencies.
 - Preserve existing build and packaging commands unless the user asks to change them.
 - If adding nested `AGENTS.md` files, make their scope explicit and keep overrides narrower than
   this root guide.
 
-> TODO: Define formal retry, polling, and rate-limit policy for new clients and background loops.
+Automatic VPN reconnect is limited to 3 classified transient failures with exponential backoff.
+Watch clients reconnect through epoch/revision replay rather than polling. Update checks run no more
+often than the configured interval (6 hours by default). New background clients must define a
+bounded timeout, cancellation path, maximum retries, and observable terminal failure before merge.
 
 ## Extensibility Hooks
 - Add VPN providers by implementing `internal/vpn.Backend` and wiring the backend in
@@ -368,31 +320,29 @@ go test ./...
   - `FLEXCONNECT_SOCKET` selects the daemon Unix socket or named pipe through environment.
   - `FLEXCONNECT_STATE` selects the daemon state file through environment.
   - `FLEXCONNECT_VERBOSE=true` enables debug logging through environment.
-  - `FLEXCONNECT_SECRET_STORE=keyring|file|memory` selects password persistence; `keyring` (default)
-    falls back to `file` automatically when no OS keyring is available.
+  - `FLEXCONNECT_SECRET_STORE=keyring|file|memory` selects password persistence; `keyring` is the
+    default and daemon startup fails if it is unavailable. `file` must be selected explicitly.
   - `FLEXCONNECT_CONNECT_ON_START=true` creates or updates the startup profile and connects during daemon startup.
   - `FLEXCONNECT_CONNECT_TIMEOUT` bounds startup connection attempts, for example `45s`.
-  - `FLEXCONNECT_PROFILE_ID` and `FLEXCONNECT_PROFILE_NAME` identify the env-managed profile.
+  - `FLEXCONNECT_PROFILE_NAME` identifies the env-managed machine profile; the daemon generates its ID.
   - `FLEXCONNECT_SERVER`, `FLEXCONNECT_USERNAME`, and optional `FLEXCONNECT_GROUP` configure AnyConnect login.
   - `FLEXCONNECT_PASSWORD` and `FLEXCONNECT_PASSWORD_FILE` are mutually exclusive password inputs.
   - `FLEXCONNECT_ACCEPT_SERVER_ROUTES`, `FLEXCONNECT_AUTO_RECONNECT`, `FLEXCONNECT_APPLY_DNS`, and `FLEXCONNECT_MTU` configure profile runtime behavior.
   - `FLEXCONNECT_DNS`, `FLEXCONNECT_INCLUDE_ROUTES`, and `FLEXCONNECT_EXCLUDE_ROUTES` are comma-separated profile lists.
   - `FLEXCONNECT_SOCKS5_ENABLED` and `FLEXCONNECT_SOCKS5_LISTEN` configure the built-in VPN-only SOCKS5 listener.
-  - `FLEXCONNECT_RUN_LIVE=1` enables the live AnyConnect test.
-  - `FLEXCONNECT_ENV_FILE` points the live test at an env file.
-  - `FLEXCONNECT_LIVE_ELEVATED` is used by the live-test elevation wrapper.
-  - `SOCKET_PATH` and `STATE_PATH` customize Unix smoke-test paths.
   - `--version` and `--out` customize `cmd/dist build` output.
   - `SYSTEMD_DIR` and `PLIST_TARGET` customize install locations.
 
-> TODO: No feature-flag system was found. Add one before introducing runtime feature toggles.
+No generic feature-flag system exists; add runtime toggles only with a concrete product requirement
+and an explicit default, owner, removal condition, and test matrix.
 
 ## Further Reading
 - [README.md](README.md)
-- [docs/completion-audit.md](docs/completion-audit.md)
+- [Architecture](docs/ARCH.md)
+- [Tailscale comparison audit](docs/tailscale-comparison-audit-2026-08-29.md)
 - [assets/icons/README.md](assets/icons/README.md)
 - [scripts/systemd/flexconnectd.service](scripts/systemd/flexconnectd.service)
 - [launchd plist](scripts/launchd/com.flexconnect.flexconnectd.plist)
 
-> TODO: Add deeper architecture docs such as `docs/ARCH.md` and ADRs when design decisions need
-> durable explanation.
+Add an ADR under `docs/` when a future change alters the v2 API contract, state schema, identity
+model, network ownership transaction, or supported platform integration.

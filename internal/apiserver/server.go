@@ -7,13 +7,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
 
 	"flexconnect/internal/appd"
 	"flexconnect/internal/buildinfo"
+	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
+	"flexconnect/internal/profileio"
 	"flexconnect/internal/types"
 )
 
@@ -22,14 +25,41 @@ var apiserverLog = logging.WithComponent("apiserver")
 const maxRequestBodyBytes = 1 << 20
 
 type requestIDContextKey struct{}
+type actorContextKey struct{}
+
+type Daemon interface {
+	StatusFor(appd.Actor) (types.Status, error)
+	TrafficFor(appd.Actor) (types.TrafficSnapshot, error)
+	LogsFor(appd.Actor) ([]types.LogEntry, error)
+	DiagnosticsFor(appd.Actor) (types.Diagnostics, error)
+	ListProfilesFor(appd.Actor) ([]types.Profile, error)
+	CreateProfileFor(appd.Actor, types.ProfileCreateRequest) (types.Profile, error)
+	UpdateProfileFor(appd.Actor, string, types.ProfileUpdateRequest) (types.Profile, error)
+	UpdateActiveProfileFor(appd.Actor, string, types.ProfileUpdateRequest) (types.Operation, error)
+	DeleteProfileFor(appd.Actor, string) error
+	ProfileIsActive(string) bool
+	ConnectionActive() bool
+	ConnectFor(context.Context, appd.Actor, string) error
+	DisconnectFor(context.Context, appd.Actor) error
+	SetControlMode(context.Context, appd.Actor, types.ControlModeRequest) error
+	StartOperation(appd.Actor, string, string, func(context.Context) error) (types.Operation, error)
+	OperationFor(appd.Actor, string) (types.Operation, error)
+	Ready() types.ReadyStatus
+	WatchSince(context.Context, appd.Actor, string, uint64) <-chan types.Notify
+	UpdateCheck(context.Context) (types.UpdateInfo, error)
+}
 
 type Server struct {
-	daemon appd.Daemon
+	daemon Daemon
 	mux    *http.ServeMux
 	nextID atomic.Uint64
 }
 
-func New(daemon appd.Daemon) *Server {
+func WithActor(ctx context.Context, actor appd.Actor) context.Context {
+	return context.WithValue(ctx, actorContextKey{}, actor)
+}
+
+func New(daemon Daemon) *Server {
 	s := &Server{daemon: daemon, mux: http.NewServeMux()}
 	s.routes()
 	return s
@@ -39,313 +69,460 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := strconv.FormatUint(s.nextID.Add(1), 10)
 		w.Header().Set("X-FlexConnect-Request-ID", requestID)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Cache-Control", "no-store")
+		r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, requestID))
+		if r.Host != ipc.LocalAPIHost {
+			s.writeError(w, r, http.StatusBadRequest, "invalid_host", "invalid Local API host", false)
+			return
+		}
+		if !allowedBrowserSource(r.Header.Get("Origin")) || !allowedBrowserSource(r.Header.Get("Referer")) {
+			s.writeError(w, r, http.StatusForbidden, "browser_source_rejected", "browser source is not allowed", false)
+			return
+		}
 		if r.ContentLength > maxRequestBodyBytes {
-			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			s.writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the Local API limit", false)
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
-		ctx := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
-		s.mux.ServeHTTP(w, r.WithContext(ctx))
+		s.mux.ServeHTTP(w, r)
 	})
 }
 
+func allowedBrowserSource(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return true
+	}
+	u, err := url.Parse(value)
+	return err == nil && u.Scheme == "http" && u.Host == ipc.LocalAPIHost
+}
+
 func (s *Server) routes() {
-	s.mux.HandleFunc("/v1/health", s.handleHealth)
-	s.mux.HandleFunc("/v1/status", s.handleStatus)
-	s.mux.HandleFunc("/v1/profiles", s.handleProfiles)
-	s.mux.HandleFunc("/v1/profiles/", s.handleProfilesSub)
-	s.mux.HandleFunc("/v1/login", s.handleLogin)
-	s.mux.HandleFunc("/v1/connect", s.handleConnectCurrent)
-	s.mux.HandleFunc("/v1/connect/", s.handleConnect)
-	s.mux.HandleFunc("/v1/disconnect", s.handleDisconnect)
-	s.mux.HandleFunc("/v1/routes/", s.handleRoutes)
-	s.mux.HandleFunc("/v1/logs", s.handleLogs)
-	s.mux.HandleFunc("/v1/traffic", s.handleTraffic)
-	s.mux.HandleFunc("/v1/diagnostics", s.handleDiagnostics)
-	s.mux.HandleFunc("/v1/watch", s.handleWatch)
-	s.mux.HandleFunc("/v1/update/check", s.handleUpdateCheck)
+	s.mux.HandleFunc("/v2/live", s.handleLive)
+	s.mux.HandleFunc("/v2/ready", s.handleReady)
+	s.mux.HandleFunc("/v2/status", s.handleStatus)
+	s.mux.HandleFunc("/v2/profiles", s.handleProfiles)
+	s.mux.HandleFunc("/v2/profiles/", s.handleProfile)
+	s.mux.HandleFunc("/v2/connection", s.handleConnection)
+	s.mux.HandleFunc("/v2/control-mode", s.handleControlMode)
+	s.mux.HandleFunc("/v2/operations/", s.handleOperation)
+	s.mux.HandleFunc("/v2/watch", s.handleWatch)
+	s.mux.HandleFunc("/v2/logs", s.handleLogs)
+	s.mux.HandleFunc("/v2/traffic", s.handleTraffic)
+	s.mux.HandleFunc("/v2/diagnostics", s.handleDiagnostics)
+	s.mux.HandleFunc("/v2/update/check", s.handleUpdateCheck)
+	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		s.writeError(w, r, http.StatusNotFound, "endpoint_not_found", "Local API endpoint not found", false)
+	})
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodGet {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func (s *Server) actor(r *http.Request) (appd.Actor, error) {
+	actor, ok := r.Context().Value(actorContextKey{}).(appd.Actor)
+	if !ok || actor.ID == "" {
+		return appd.Actor{}, &appd.CodedError{Code: "identity_unavailable", Message: "local client identity is unavailable"}
 	}
-	apiserverLog.Printf("method=%s path=%s status=%d api_version=%s", r.Method, r.URL.Path, http.StatusOK, buildinfo.LocalAPIVersion)
-	writeJSON(w, types.Health{Status: "ok", Version: buildinfo.Version, APIVersion: buildinfo.LocalAPIVersion})
+	return actor, nil
 }
 
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodPost {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func (s *Server) requireMethod(w http.ResponseWriter, r *http.Request, methods ...string) bool {
+	for _, method := range methods {
+		if r.Method == method {
+			return true
+		}
+	}
+	s.writeError(w, r, http.StatusBadRequest, "method_not_allowed", "method not allowed", false)
+	return false
+}
+
+func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	var req types.LoginRequest
-	if err := decodeJSON(r, &req); err != nil {
-		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	s.writeJSON(w, http.StatusOK, types.LiveStatus{Status: "ok", Version: buildinfo.Version, APIMajor: buildinfo.LocalAPIMajor, Capabilities: append([]string(nil), buildinfo.LocalAPICapabilities...)})
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	if err := s.daemon.Login(r.Context(), req); err != nil {
-		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	ready := s.daemon.Ready()
+	status := http.StatusOK
+	if !ready.Ready {
+		status = http.StatusServiceUnavailable
 	}
-	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusNoContent)
-	w.WriteHeader(http.StatusNoContent)
+	s.writeJSON(w, status, ready)
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodGet {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !s.requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusOK)
-	writeJSON(w, s.daemon.Status())
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	value, err := s.daemon.StatusFor(actor)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, value)
 }
 
 func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusOK)
-		writeJSON(w, s.daemon.ListProfiles())
-	case http.MethodPut:
-		var req types.ProfileUpsertRequest
-		if err := decodeJSON(r, &req); err != nil {
-			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		profile, err := s.daemon.CreateProfile(req.Profile, req.Password)
+		profiles, err := s.daemon.ListProfilesFor(actor)
 		if err != nil {
-			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			s.handleError(w, r, err)
 			return
 		}
-		w.WriteHeader(http.StatusCreated)
-		apiserverLog.Printf("method=%s path=%s status=%d profile=%q", r.Method, r.URL.Path, http.StatusCreated, profile.ID)
-		writeJSON(w, profile)
+		s.writeJSON(w, http.StatusOK, profiles)
+	case http.MethodPost:
+		var req types.ProfileCreateRequest
+		if err := decodeJSON(r, &req); err != nil {
+			s.handleDecodeError(w, r, err)
+			return
+		}
+		profile, err := s.daemon.CreateProfileFor(actor, req)
+		if err != nil {
+			s.handleError(w, r, err)
+			return
+		}
+		s.writeJSON(w, http.StatusCreated, profile)
 	default:
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		s.writeError(w, r, http.StatusBadRequest, "method_not_allowed", "method not allowed", false)
 	}
 }
 
-func (s *Server) handleProfilesSub(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	trimmed := strings.TrimPrefix(r.URL.Path, "/v1/profiles/")
-	if trimmed == "current" && r.Method == http.MethodGet {
-		profile, err := s.daemon.CurrentProfile()
-		if err != nil {
-			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusNotFound, err)
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-		apiserverLog.Printf("method=%s path=%s status=%d profile=%q", r.Method, r.URL.Path, http.StatusOK, profile.ID)
-		writeJSON(w, profile)
+func pathID(path, prefix string) (string, error) {
+	raw := strings.TrimPrefix(path, prefix)
+	if raw == "" || strings.Contains(raw, "/") {
+		return "", errors.New("invalid resource ID")
+	}
+	id, err := url.PathUnescape(raw)
+	if err != nil || id == "" || strings.ContainsAny(id, "/\\") {
+		return "", errors.New("invalid resource ID")
+	}
+	return id, nil
+}
+
+func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
 		return
 	}
-	if strings.HasSuffix(trimmed, "/switch") && r.Method == http.MethodPost {
-		id := strings.TrimSuffix(trimmed, "/switch")
-		if err := s.daemon.SwitchProfile(r.Context(), id); err != nil {
-			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		apiserverLog.Printf("method=%s path=%s status=%d id=%q", r.Method, r.URL.Path, http.StatusNoContent, id)
-		w.WriteHeader(http.StatusNoContent)
+	id, err := pathID(r.URL.EscapedPath(), "/v2/profiles/")
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "invalid_profile_id", err.Error(), false)
 		return
 	}
-	if r.Method == http.MethodPut {
+	switch r.Method {
+	case http.MethodPatch:
 		var req types.ProfileUpdateRequest
 		if err := decodeJSON(r, &req); err != nil {
-			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			s.handleDecodeError(w, r, err)
 			return
 		}
-		profile, err := s.daemon.UpdateProfile(trimmed, req)
+		if s.daemon.ProfileIsActive(id) {
+			op, err := s.daemon.UpdateActiveProfileFor(actor, id, req)
+			if err != nil {
+				s.handleError(w, r, err)
+				return
+			}
+			s.writeJSON(w, http.StatusAccepted, types.OperationRef{Operation: op})
+			return
+		}
+		profile, err := s.daemon.UpdateProfileFor(actor, id, req)
 		if err != nil {
-			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			s.handleError(w, r, err)
 			return
 		}
-		apiserverLog.Printf("method=%s path=%s status=%d profile=%q", r.Method, r.URL.Path, http.StatusOK, profile.ID)
-		writeJSON(w, profile)
-		return
-	}
-	if r.Method == http.MethodDelete {
-		if err := s.daemon.DeleteProfile(trimmed); err != nil {
-			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		s.writeJSON(w, http.StatusOK, profile)
+	case http.MethodDelete:
+		if s.daemon.ProfileIsActive(id) {
+			op, err := s.daemon.StartOperation(actor, "profile-delete", id, func(context.Context) error {
+				return s.daemon.DeleteProfileFor(actor, id)
+			})
+			if err != nil {
+				s.handleError(w, r, err)
+				return
+			}
+			s.writeJSON(w, http.StatusAccepted, types.OperationRef{Operation: op})
 			return
 		}
-		apiserverLog.Printf("method=%s path=%s status=%d id=%q", r.Method, r.URL.Path, http.StatusNoContent, trimmed)
+		if err := s.daemon.DeleteProfileFor(actor, id); err != nil {
+			s.handleError(w, r, err)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
-		return
+	default:
+		s.writeError(w, r, http.StatusBadRequest, "method_not_allowed", "method not allowed", false)
 	}
-	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusNotFound)
-	http.NotFound(w, r)
 }
 
-func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodGet {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusOK)
-	writeJSON(w, s.daemon.Logs())
-}
-
-func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodGet {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusOK)
-	writeJSON(w, s.daemon.Diagnostics())
-}
-
-func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodGet {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusOK)
-	writeJSON(w, s.daemon.Traffic())
-}
-
-func (s *Server) handleConnectCurrent(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodPost {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if err := s.daemon.ConnectCurrent(r.Context()); err != nil {
-		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusNoContent)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodPost {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	id := strings.TrimPrefix(r.URL.Path, "/v1/connect/")
-	if err := s.daemon.Connect(r.Context(), id); err != nil {
-		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	apiserverLog.Printf("method=%s path=%s status=%d id=%q", r.Method, r.URL.Path, http.StatusNoContent, id)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodPost {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if err := s.daemon.Disconnect(r.Context()); err != nil {
-		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusNoContent)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodPut {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	id := strings.TrimPrefix(r.URL.Path, "/v1/routes/")
-	var req types.RouteUpdateRequest
-	if err := decodeJSON(r, &req); err != nil {
-		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	profile, err := s.daemon.UpdateRoutes(id, req)
+func (s *Server) handleConnection(w http.ResponseWriter, r *http.Request) {
+	actor, err := s.actor(r)
 	if err != nil {
-		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusBadRequest, err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.handleError(w, r, err)
 		return
 	}
-	apiserverLog.Printf("method=%s path=%s status=%d profile=%q", r.Method, r.URL.Path, http.StatusOK, profile.ID)
-	writeJSON(w, profile)
+	switch r.Method {
+	case http.MethodPut:
+		var req types.ConnectionRequest
+		if err := decodeJSON(r, &req); err != nil {
+			s.handleDecodeError(w, r, err)
+			return
+		}
+		if strings.TrimSpace(req.ProfileID) == "" {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "profile_id_required", "profile_id is required", false)
+			return
+		}
+		op, err := s.daemon.StartOperation(actor, "connect", req.ProfileID, func(ctx context.Context) error {
+			return s.daemon.ConnectFor(ctx, actor, req.ProfileID)
+		})
+		if err != nil {
+			s.handleError(w, r, err)
+			return
+		}
+		s.writeJSON(w, http.StatusAccepted, types.OperationRef{Operation: op})
+	case http.MethodDelete:
+		if !s.daemon.ConnectionActive() {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		op, err := s.daemon.StartOperation(actor, "disconnect", "", func(ctx context.Context) error {
+			return s.daemon.DisconnectFor(ctx, actor)
+		})
+		if err != nil {
+			s.handleError(w, r, err)
+			return
+		}
+		s.writeJSON(w, http.StatusAccepted, types.OperationRef{Operation: op})
+	default:
+		s.writeError(w, r, http.StatusBadRequest, "method_not_allowed", "method not allowed", false)
+	}
+}
+
+func (s *Server) handleControlMode(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodPut) {
+		return
+	}
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	var req types.ControlModeRequest
+	if err := decodeJSON(r, &req); err != nil {
+		s.handleDecodeError(w, r, err)
+		return
+	}
+	op, err := s.daemon.StartOperation(actor, "control-mode", req.ProfileID, func(ctx context.Context) error {
+		return s.daemon.SetControlMode(ctx, actor, req)
+	})
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, types.OperationRef{Operation: op})
+}
+
+func (s *Server) handleOperation(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	id, err := pathID(r.URL.EscapedPath(), "/v2/operations/")
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "invalid_operation_id", err.Error(), false)
+		return
+	}
+	op, err := s.daemon.OperationFor(actor, id)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, types.OperationRef{Operation: op})
 }
 
 func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodGet {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !s.requireMethod(w, r, http.MethodGet) {
 		return
+	}
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	since := uint64(0)
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		since, err = strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "invalid_revision", "since must be an unsigned integer", false)
+			return
+		}
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		apiserverLog.Printf("method=%s path=%s status=%d reason=missing_flusher", r.Method, r.URL.Path, http.StatusInternalServerError)
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		s.writeError(w, r, http.StatusInternalServerError, "streaming_unsupported", "streaming is unsupported", false)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	apiserverLog.Printf("method=%s path=%s status=%d stream=start", r.Method, r.URL.Path, http.StatusOK)
+	w.WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(w)
-	for notify := range s.daemon.Watch(r.Context()) {
+	for notify := range s.daemon.WatchSince(r.Context(), actor, r.URL.Query().Get("epoch"), since) {
 		if err := enc.Encode(notify); err != nil {
-			apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusOK, err)
 			return
 		}
 		flusher.Flush()
 	}
-	apiserverLog.Printf("method=%s path=%s status=%d stream=end", r.Method, r.URL.Path, http.StatusOK)
+}
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	value, err := s.daemon.LogsFor(actor)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	value, err := s.daemon.TrafficFor(actor)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	actor, err := s.actor(r)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	value, err := s.daemon.DiagnosticsFor(actor)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, value)
 }
 
 func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
-	logfRequest(r)
-	if r.Method != http.MethodGet {
-		apiserverLog.Printf("method=%s path=%s status=%d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !s.requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	info, err := s.daemon.UpdateCheck(r.Context())
+	value, err := s.daemon.UpdateCheck(r.Context())
 	if err != nil {
-		apiserverLog.Printf("method=%s path=%s status=%d err=%v", r.Method, r.URL.Path, http.StatusInternalServerError, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.handleError(w, r, err)
 		return
 	}
-	apiserverLog.Printf("method=%s path=%s status=%d update_available=%v", r.Method, r.URL.Path, http.StatusOK, info.UpdateAvailable)
-	writeJSON(w, info)
+	s.writeJSON(w, http.StatusOK, value)
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(v); err != nil {
+type errorEnvelope struct {
+	Error struct {
+		Code      string `json:"code"`
+		Message   string `json:"message"`
+		RequestID string `json:"request_id"`
+		Retryable bool   `json:"retryable"`
+	} `json:"error"`
+}
+
+func (s *Server) handleDecodeError(w http.ResponseWriter, r *http.Request, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		s.writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the Local API limit", false)
+		return
+	}
+	s.writeError(w, r, http.StatusBadRequest, "invalid_json", "request body is not valid for this endpoint", false)
+}
+
+func (s *Server) handleError(w http.ResponseWriter, r *http.Request, err error) {
+	status, code, retryable := http.StatusInternalServerError, "internal_error", false
+	message := "internal Local API error"
+	var coded *appd.CodedError
+	if errors.As(err, &coded) {
+		code, message, retryable = coded.Code, coded.Message, coded.Retryable
+		switch code {
+		case "identity_unavailable":
+			status = http.StatusUnauthorized
+		case "admin_required", "machine_mode_locked":
+			status = http.StatusForbidden
+		case "profile_not_found", "operation_not_found":
+			status = http.StatusNotFound
+		case "daemon_in_use":
+			status = http.StatusConflict
+		case "service_closing", "cleanup_failed", "profile_transaction_pending", "component_unavailable":
+			status = http.StatusServiceUnavailable
+		case "random_source_failed":
+			status = http.StatusInternalServerError
+		default:
+			status = http.StatusUnprocessableEntity
+		}
+	} else {
+		var validation *profileio.ValidationError
+		if errors.As(err, &validation) {
+			status, code, message = http.StatusUnprocessableEntity, "invalid_profile", validation.Error()
+		}
+	}
+	if errors.Is(err, context.Canceled) {
+		status, code, message = http.StatusConflict, "operation_canceled", "operation was canceled"
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		status, code, message, retryable = http.StatusGatewayTimeout, "operation_timeout", "operation timed out", true
+	}
+	s.writeError(w, r, status, code, message, retryable)
+}
+
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, code, message string, retryable bool) {
+	var envelope errorEnvelope
+	envelope.Error.Code = code
+	envelope.Error.Message = message
+	envelope.Error.RequestID, _ = r.Context().Value(requestIDContextKey{}).(string)
+	envelope.Error.Retryable = retryable
+	s.writeJSON(w, status, envelope)
+}
+
+func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
 		apiserverLog.Printf("response encode failed err=%v", err)
 	}
 }
@@ -354,10 +531,6 @@ func decodeJSON(r *http.Request, out any) error {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(out); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			return fmt.Errorf("request body exceeds %d bytes: %w", maxRequestBodyBytes, err)
-		}
 		return err
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
@@ -367,9 +540,4 @@ func decodeJSON(r *http.Request, out any) error {
 		return fmt.Errorf("invalid trailing JSON data: %w", err)
 	}
 	return nil
-}
-
-func logfRequest(r *http.Request) {
-	requestID, _ := r.Context().Value(requestIDContextKey{}).(string)
-	apiserverLog.Printf("request_id=%s request=%s path=%s remote=%s", requestID, r.Method, r.URL.Path, r.RemoteAddr)
 }

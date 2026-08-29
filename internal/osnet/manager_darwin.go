@@ -9,11 +9,13 @@ import (
 	"net/netip"
 	"os/exec"
 	"strings"
+	"sync"
 
 	wgtun "github.com/tailscale/wireguard-go/tun"
 )
 
 type platformManager struct {
+	mu             sync.Mutex
 	name           string
 	gateway        netip.Addr
 	vpnAddr        netip.Addr
@@ -22,6 +24,7 @@ type platformManager struct {
 	excludeRoutes  map[netip.Prefix]bool
 	dynamicInclude map[netip.Prefix]bool
 	dynamicExclude map[netip.Prefix]bool
+	dnsSet         bool
 }
 
 func newPlatformManager(_ wgtun.Device, name string) (Manager, error) {
@@ -41,8 +44,13 @@ func (m *platformManager) Set(ctx context.Context, cfg *Config) error {
 	if cfg == nil || !cfg.VPNAddress.IsValid() {
 		return m.Close(ctx)
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.vpnAddr = cfg.VPNAddress.Addr()
 	m.gateway = cfg.Gateway
+	if cfg.ServerAddress.IsValid() && !cfg.Gateway.IsValid() {
+		return fmt.Errorf("missing physical underlay gateway for VPN server route")
+	}
 	if err := run(ctx, "ifconfig", m.name, "inet", m.vpnAddr.String(), m.vpnAddr.String(), "netmask", "255.255.255.255", "up"); err != nil {
 		return err
 	}
@@ -60,13 +68,22 @@ func (m *platformManager) Set(ctx context.Context, cfg *Config) error {
 		return err
 	}
 	if len(cfg.DNSServers) > 0 {
-		servers := AddrStrings(cfg.DNSServers)
-		_ = runShell(ctx, fmt.Sprintf("networksetup -setdnsservers %s %s", shellQuote(m.name), strings.Join(servers, " ")))
+		if err := setDarwinDNS(ctx, cfg.DNSServers); err != nil {
+			return err
+		}
+		m.dnsSet = true
+	} else if m.dnsSet {
+		if err := clearDarwinDNS(ctx); err != nil {
+			return err
+		}
+		m.dnsSet = false
 	}
 	return nil
 }
 
 func (m *platformManager) SetDynamicRoutes(ctx context.Context, routes DynamicRoutes) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.syncRoutes(ctx, &m.dynamicInclude, addrsToHostPrefixes(routes.Include), m.vpnAddr); err != nil {
 		return err
 	}
@@ -74,14 +91,31 @@ func (m *platformManager) SetDynamicRoutes(ctx context.Context, routes DynamicRo
 }
 
 func (m *platformManager) Close(ctx context.Context) error {
-	for _, routes := range []*map[netip.Prefix]bool{&m.serverRoutes, &m.includeRoutes, &m.excludeRoutes, &m.dynamicInclude, &m.dynamicExclude} {
-		for prefix := range *routes {
-			_ = run(ctx, "route", "delete", "-net", prefix.String())
-		}
-		*routes = map[netip.Prefix]bool{}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var firstErr error
+	groups := []struct {
+		routes  *map[netip.Prefix]bool
+		gateway netip.Addr
+	}{
+		{&m.serverRoutes, m.gateway}, {&m.includeRoutes, m.vpnAddr}, {&m.excludeRoutes, m.gateway},
+		{&m.dynamicInclude, m.vpnAddr}, {&m.dynamicExclude, m.gateway},
 	}
-	_ = runShell(ctx, fmt.Sprintf("networksetup -setdnsservers %s empty", shellQuote(m.name)))
-	return nil
+	for _, group := range groups {
+		for prefix := range *group.routes {
+			if err := deleteDarwinOwnedRoute(ctx, prefix.String(), group.gateway.String()); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		*group.routes = map[netip.Prefix]bool{}
+	}
+	if m.dnsSet {
+		if err := clearDarwinDNS(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		m.dnsSet = false
+	}
+	return firstErr
 }
 
 func (m *platformManager) syncRoutes(ctx context.Context, old *map[netip.Prefix]bool, next []netip.Prefix, gateway netip.Addr) error {
@@ -89,20 +123,30 @@ func (m *platformManager) syncRoutes(ctx context.Context, old *map[netip.Prefix]
 		return nil
 	}
 	add, del, state := DiffPrefixes(*old, next)
-	for _, prefix := range del {
-		_ = run(ctx, "route", "delete", "-net", prefix.String())
+	owned := make(map[netip.Prefix]bool, len(*old))
+	for prefix := range *old {
+		owned[prefix] = true
 	}
 	for _, prefix := range add {
 		if err := run(ctx, "route", "add", "-net", prefix.String(), gateway.String()); err != nil {
+			*old = owned
 			return err
 		}
+		owned[prefix] = true
+	}
+	for _, prefix := range del {
+		if err := deleteDarwinOwnedRoute(ctx, prefix.String(), gateway.String()); err != nil {
+			*old = owned
+			return err
+		}
+		delete(owned, prefix)
 	}
 	*old = state
 	return nil
 }
 
 func GetLocalInterface(context.Context) (LocalInterface, error) {
-	out, err := exec.Command("route", "-n", "get", "8.8.8.8").CombinedOutput()
+	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
 	if err != nil {
 		return LocalInterface{}, fmt.Errorf("%w: %s", err, string(out))
 	}
@@ -145,17 +189,27 @@ func run(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
-func runShell(ctx context.Context, script string) error {
-	cmd := exec.CommandContext(ctx, "sh", "-c", script)
+func setDarwinDNS(ctx context.Context, servers []netip.Addr) error {
+	if len(servers) == 0 {
+		return clearDarwinDNS(ctx)
+	}
+	cmd := exec.CommandContext(ctx, "scutil")
+	cmd.Stdin = strings.NewReader(darwinDNSSetScript(servers))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%w: %s", err, string(out))
+		return fmt.Errorf("scutil DNS set failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+func clearDarwinDNS(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "scutil")
+	cmd.Stdin = strings.NewReader(darwinDNSClearScript())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("scutil DNS clear failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func addrsToHostPrefixes(addrs []netip.Addr) []netip.Prefix {

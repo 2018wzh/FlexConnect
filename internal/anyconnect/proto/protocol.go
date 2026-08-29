@@ -73,4 +73,3 @@ type Payload struct {
 */
 
 // Security https://datatracker.ietf.org/doc/html/draft-mavrogiannopoulos-openconnect-04#name-security-considerations
-

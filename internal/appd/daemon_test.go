@@ -26,6 +26,11 @@ type memoryStore struct {
 func (s *memoryStore) Load() (storefile.Data, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.data.SchemaVersion == 0 {
+		s.data.SchemaVersion = storefile.CurrentSchemaVersion
+		s.data.ControlMode = "user"
+		s.data.SelectedProfiles = map[string]string{}
+	}
 	return s.data, nil
 }
 
@@ -37,20 +42,22 @@ func (s *memoryStore) Save(data storefile.Data) error {
 }
 
 type fakeBackend struct {
-	mu        sync.Mutex
-	events    chan vpn.Event
-	connects  int
-	failures  []error
-	traffic   *types.TrafficStats
-	tunnel    vpn.TunnelDialer
-	tunnelErr error
+	mu            sync.Mutex
+	events        chan vpn.Event
+	connects      int
+	disconnects   int
+	failures      []error
+	traffic       *types.TrafficStats
+	tunnel        vpn.TunnelDialer
+	tunnelErr     error
+	disconnectErr error
 }
 
 func newFakeBackend(failures ...error) *fakeBackend {
 	return &fakeBackend{events: make(chan vpn.Event, 16), failures: failures}
 }
 
-func (b *fakeBackend) Connect(context.Context, types.Profile, string) (*types.SessionInfo, error) {
+func (b *fakeBackend) Connect(context.Context, vpn.ConnectRequest) (*types.SessionInfo, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.connects++
@@ -64,8 +71,42 @@ func (b *fakeBackend) Connect(context.Context, types.Profile, string) (*types.Se
 	return &types.SessionInfo{ServerAddress: "vpn.example.test", VPNAddress: "10.0.0.2"}, nil
 }
 
-func (b *fakeBackend) Disconnect(context.Context) error { return nil }
-func (b *fakeBackend) SessionInfo() *types.SessionInfo  { return nil }
+func (b *fakeBackend) Disconnect(context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.disconnects++
+	return b.disconnectErr
+}
+
+func TestDisconnectCleanupFailureBlocksWritesAndSignalsFatal(t *testing.T) {
+	backend := newFakeBackend()
+	service := newTestService(t, backend, testProfile("p1", false))
+	if err := service.Connect(context.Background(), "p1"); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	backend.disconnectErr = errors.New("route cleanup failed")
+	backend.mu.Unlock()
+	if err := service.Disconnect(context.Background()); err == nil {
+		t.Fatal("Disconnect succeeded despite cleanup failure")
+	}
+	select {
+	case err := <-service.FatalErrors():
+		if !strings.Contains(err.Error(), "route cleanup failed") {
+			t.Fatalf("fatal error = %v", err)
+		}
+	default:
+		t.Fatal("cleanup failure was not signaled")
+	}
+	if service.Ready().Ready {
+		t.Fatal("service remained ready after cleanup failure")
+	}
+	if err := service.DisconnectFor(context.Background(), SystemActor()); err == nil {
+		t.Fatal("write was accepted after cleanup failure")
+	}
+}
+func (b *fakeBackend) Close(context.Context) error     { return nil }
+func (b *fakeBackend) SessionInfo() *types.SessionInfo { return nil }
 func (b *fakeBackend) Traffic() *types.TrafficStats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -133,6 +174,23 @@ func TestTrafficSamplesTotalsAndSpeed(t *testing.T) {
 	}
 }
 
+func TestTrafficCounterResetDoesNotUnderflow(t *testing.T) {
+	profile := testProfile("p1", false)
+	backend := newFakeBackend()
+	service := newTestService(t, backend, profile)
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatal(err)
+	}
+	backend.setTraffic(10_000, 20_000)
+	service.sampleTrafficAt(time.Unix(10, 0).UTC())
+	backend.setTraffic(100, 200)
+	service.sampleTrafficAt(time.Unix(11, 0).UTC())
+	traffic := service.Traffic()
+	if traffic.BytesSent != 100 || traffic.BytesReceived != 200 || traffic.BytesSentPerSecond != 0 || traffic.BytesReceivedPerSecond != 0 {
+		t.Fatalf("counter reset sample = %+v", traffic)
+	}
+}
+
 func TestTrafficClearsOnDisconnect(t *testing.T) {
 	profile := testProfile("p1", false)
 	backend := newFakeBackend()
@@ -159,13 +217,13 @@ func TestTrafficClearsOnDisconnect(t *testing.T) {
 func TestAutoReconnectRetriesWithBackoff(t *testing.T) {
 	restoreReconnectPolicy(t, 5*time.Millisecond, 10*time.Millisecond, 10)
 	profile := testProfile("p1", true)
-	backend := newFakeBackend(nil, errors.New("temporary dial failure"), nil)
+	backend := newFakeBackend(nil, vpn.WrapConnectError("network", true, errors.New("temporary dial failure")), nil)
 	service := newTestService(t, backend, profile)
 
 	if err := service.Connect(context.Background(), profile.ID); err != nil {
 		t.Fatalf("initial connect: %v", err)
 	}
-	backend.emit(vpn.Event{Type: "disconnected", Err: errors.New("link lost")})
+	backend.emit(vpn.Event{Type: "disconnected", Err: vpn.WrapConnectError("network", true, errors.New("link lost"))})
 
 	waitUntil(t, 500*time.Millisecond, func() bool {
 		return backend.connectCount() >= 3 && service.Status().State == types.StateConnected
@@ -175,13 +233,13 @@ func TestAutoReconnectRetriesWithBackoff(t *testing.T) {
 func TestAutoReconnectStopsAfterRetryLimit(t *testing.T) {
 	restoreReconnectPolicy(t, time.Millisecond, time.Millisecond, 2)
 	profile := testProfile("p1", true)
-	backend := newFakeBackend(nil, errors.New("permanent dial failure"), errors.New("permanent dial failure"), nil)
+	backend := newFakeBackend(nil, vpn.WrapConnectError("network", true, errors.New("permanent dial failure")), vpn.WrapConnectError("network", true, errors.New("permanent dial failure")), nil)
 	service := newTestService(t, backend, profile)
 
 	if err := service.Connect(context.Background(), profile.ID); err != nil {
 		t.Fatalf("initial connect: %v", err)
 	}
-	backend.emit(vpn.Event{Type: "disconnected", Err: errors.New("link lost")})
+	backend.emit(vpn.Event{Type: "disconnected", Err: vpn.WrapConnectError("network", true, errors.New("link lost"))})
 
 	waitUntil(t, 500*time.Millisecond, func() bool {
 		history := service.Diagnostics().ConnectionHistory
@@ -193,7 +251,7 @@ func TestAutoReconnectStopsAfterRetryLimit(t *testing.T) {
 		t.Fatalf("connect count = %d, want initial connection plus 2 retries", got)
 	}
 	status := service.Status()
-	if status.State != types.StateError || status.LastError != "permanent dial failure" {
+	if status.State != types.StateError || status.LastError != "network: permanent dial failure" {
 		t.Fatalf("status after retry exhaustion = %+v", status)
 	}
 	diagnostics := service.Diagnostics()
@@ -209,6 +267,28 @@ func TestAutoReconnectStopsAfterRetryLimit(t *testing.T) {
 func TestAutoReconnectDefaultRetryLimit(t *testing.T) {
 	if autoReconnectMaxTries != 3 {
 		t.Fatalf("default retry limit = %d, want 3", autoReconnectMaxTries)
+	}
+}
+
+func TestAutoReconnectStopsImmediatelyForNonRetryableFailure(t *testing.T) {
+	restoreReconnectPolicy(t, time.Millisecond, time.Millisecond, 3)
+	profile := testProfile("p1", true)
+	backend := newFakeBackend(nil, vpn.WrapConnectError("authentication", false, errors.New("credentials rejected")), nil)
+	service := newTestService(t, backend, profile)
+	if err := service.Connect(context.Background(), profile.ID); err != nil {
+		t.Fatal(err)
+	}
+	backend.emit(vpn.Event{Type: "disconnected", Err: vpn.WrapConnectError("network", true, errors.New("link lost"))})
+	waitUntil(t, 500*time.Millisecond, func() bool {
+		history := service.Diagnostics().ConnectionHistory
+		return len(history) > 0 && history[len(history)-1].Kind == "reconnect_exhausted"
+	})
+	if got := backend.connectCount(); got != 2 {
+		t.Fatalf("connect count = %d, want initial plus one classified failure", got)
+	}
+	history := service.Diagnostics().ConnectionHistory
+	if got := history[len(history)-1].ReasonCode; got != "non_retryable_error" {
+		t.Fatalf("reason = %q", got)
 	}
 }
 
@@ -263,7 +343,7 @@ func TestManualDisconnectCancelsScheduledAutoReconnect(t *testing.T) {
 	if err := service.Connect(context.Background(), profile.ID); err != nil {
 		t.Fatalf("initial connect: %v", err)
 	}
-	backend.emit(vpn.Event{Type: "disconnected", Err: errors.New("link lost")})
+	backend.emit(vpn.Event{Type: "disconnected", Err: vpn.WrapConnectError("network", true, errors.New("link lost"))})
 
 	waitUntil(t, 500*time.Millisecond, func() bool {
 		service.mu.Lock()
@@ -363,7 +443,7 @@ func TestProxyStartsOnlyWithTunnelDialer(t *testing.T) {
 	}
 }
 
-func TestProxyDoesNotFallbackWhenTunnelDialerUnavailable(t *testing.T) {
+func TestProxyFailureRollsBackRequiredVPNSession(t *testing.T) {
 	profile := testProfile("p1", false)
 	profile.SOCKS5Enabled = true
 	profile.SOCKS5Listen = "127.0.0.1:0"
@@ -371,15 +451,21 @@ func TestProxyDoesNotFallbackWhenTunnelDialerUnavailable(t *testing.T) {
 	backend.tunnelErr = errors.New("vpn tunnel unavailable")
 	service := newTestService(t, backend, profile)
 
-	if err := service.Connect(context.Background(), profile.ID); err != nil {
-		t.Fatalf("connect should not fail the VPN session when proxy cannot start: %v", err)
+	if err := service.Connect(context.Background(), profile.ID); err == nil {
+		t.Fatal("connect succeeded without its required SOCKS5 component")
 	}
 	status := service.Status()
 	if status.SOCKS5Enabled || status.SOCKS5Listen != "" {
 		t.Fatalf("SOCKS5 status = enabled %v listen %q, want disabled", status.SOCKS5Enabled, status.SOCKS5Listen)
 	}
 	if status.LastError == "" {
-		t.Fatal("LastError should explain why the VPN-only proxy was not started")
+		t.Fatal("LastError should explain why the transaction was rolled back")
+	}
+	backend.mu.Lock()
+	disconnects := backend.disconnects
+	backend.mu.Unlock()
+	if disconnects != 1 {
+		t.Fatalf("backend disconnects = %d, want 1", disconnects)
 	}
 }
 
@@ -390,7 +476,10 @@ func TestCreateProfileReturnsSecretStoreError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile := types.NewProfile("corp")
+	profile, err := types.NewProfile("corp")
+	if err != nil {
+		t.Fatalf("NewProfile: %v", err)
+	}
 	profile.ServerURL = "https://vpn.example.test"
 	profile.Username = "alice"
 
@@ -424,7 +513,7 @@ func TestConnectReturnsSecretStoreError(t *testing.T) {
 	}
 }
 
-func TestDeleteProfileReturnsSecretStoreErrorWithoutMutatingProfiles(t *testing.T) {
+func TestDeleteProfileSecretFailureLeavesRecoverableIntent(t *testing.T) {
 	profile := testProfile("p1", false)
 	store := &memoryStore{data: storefile.Data{Profiles: []types.Profile{profile}, CurrentProfileID: profile.ID}}
 	service, err := New(store, failingSecretStore{err: errors.New("keyring unavailable")}, newFakeBackend(), router.DefaultPlanner{})
@@ -436,8 +525,14 @@ func TestDeleteProfileReturnsSecretStoreErrorWithoutMutatingProfiles(t *testing.
 	if err == nil || !strings.Contains(err.Error(), "delete secret for profile p1: keyring unavailable") {
 		t.Fatalf("DeleteProfile error = %v", err)
 	}
-	if got := service.ListProfiles(); len(got) != 1 || got[0].ID != profile.ID {
+	if got := service.ListProfiles(); len(got) != 0 {
 		t.Fatalf("profiles after failed delete = %+v", got)
+	}
+	store.mu.Lock()
+	intent := store.data.Intent
+	store.mu.Unlock()
+	if intent == nil || intent.Kind != "delete" || intent.ProfileID != profile.ID {
+		t.Fatalf("persisted intent = %+v", intent)
 	}
 }
 
@@ -474,6 +569,8 @@ func testProfile(id string, autoReconnect bool) types.Profile {
 		ServerURL:          "https://vpn.example.test",
 		Username:           "alice",
 		SecretRef:          "profile/" + id,
+		Scope:              types.ProfileScopeMachine,
+		OwnerID:            "system",
 		AcceptServerRoutes: true,
 		AutoReconnect:      types.BoolPtr(autoReconnect),
 		ApplyDNS:           types.BoolPtr(true),

@@ -8,9 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
+
+	semver "github.com/Masterminds/semver/v3"
 
 	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/types"
@@ -127,49 +128,13 @@ func nowString(c *Checker) string {
 	return c.now().UTC().Format(time.RFC3339)
 }
 
-// compareVersions compares two dotted numeric version strings (e.g. "1.0.10"
-// vs "1.0.9"). It strips a leading "v" and truncates at the first "-" (pre-
-// release suffixes are ignored for the main comparison). Missing segments
-// are treated as 0. Returns -1, 0, or 1 in the usual way.
 func compareVersions(a, b string) int {
-	a = strings.TrimPrefix(a, "v")
-	b = strings.TrimPrefix(b, "v")
-	if i := strings.IndexByte(a, '-'); i >= 0 {
-		a = a[:i]
-	}
-	if i := strings.IndexByte(b, '-'); i >= 0 {
-		b = b[:i]
-	}
-	pa := strings.Split(a, ".")
-	pb := strings.Split(b, ".")
-	n := len(pa)
-	if len(pb) > n {
-		n = len(pb)
-	}
-	for i := 0; i < n; i++ {
-		xa := segment(pa, i)
-		xb := segment(pb, i)
-		if xa < xb {
-			return -1
-		}
-		if xa > xb {
-			return 1
-		}
-	}
-	return 0
-}
-
-// segment returns the integer value of the i-th dot-separated part, or 0 if
-// it is missing or non-numeric.
-func segment(parts []string, i int) int {
-	if i >= len(parts) {
+	left, leftErr := semver.StrictNewVersion(strings.TrimPrefix(strings.TrimSpace(a), "v"))
+	right, rightErr := semver.StrictNewVersion(strings.TrimPrefix(strings.TrimSpace(b), "v"))
+	if leftErr != nil || rightErr != nil {
 		return 0
 	}
-	v, err := strconv.Atoi(strings.TrimSpace(parts[i]))
-	if err != nil {
-		return 0
-	}
-	return v
+	return left.Compare(right)
 }
 
 // ToTypes converts the check result into the wire type exposed by the local

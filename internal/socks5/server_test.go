@@ -62,6 +62,55 @@ func TestListenRequiresTunnelDialer(t *testing.T) {
 	}
 }
 
+func TestNegotiationRejectsWhenNoAuthWasNotOffered(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() { done <- (&Server{dialer: &fakeTunnelDialer{}}).handleConn(server) }()
+	if _, err := client.Write([]byte{0x05, 0x01, 0x02}); err != nil {
+		t.Fatal(err)
+	}
+	var reply [2]byte
+	if _, err := io.ReadFull(client, reply[:]); err != nil {
+		t.Fatal(err)
+	}
+	if reply != [2]byte{0x05, 0xff} {
+		t.Fatalf("reply = %v", reply)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("protocol rejection was not observable")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler did not exit")
+	}
+}
+
+func TestCloseCancelsAcceptedConnections(t *testing.T) {
+	server, err := Listen("127.0.0.1:0", &fakeTunnelDialer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := net.Dial("tcp", server.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte{0x05}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.CloseContext(ctx); err != nil {
+		t.Fatalf("CloseContext: %v", err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Fatal("accepted connection remained open")
+	}
+}
+
 func TestDomainTargetsResolveThroughTunnelBeforeDial(t *testing.T) {
 	dialer := &fakeTunnelDialer{lookup: map[string][]string{"example.test": {"10.64.0.7"}}}
 	client, server := net.Pipe()

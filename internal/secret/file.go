@@ -9,11 +9,8 @@ import (
 	"sync"
 )
 
-// FileStore persists secrets as a 0600 JSON file on disk. It is the automatic
-// fallback when no OS keyring is available (for example a headless Linux host
-// without a Secret Service / DBus session). Secrets are stored in plaintext
-// and protected only by file permissions, so prefer the OS keyring whenever it
-// is reachable.
+// FileStore persists plaintext secrets only when an administrator explicitly
+// selects the file backend. The file and its parent directory are restricted.
 type FileStore struct {
 	path string
 	mu   sync.Mutex
@@ -63,10 +60,20 @@ func (s *FileStore) Delete(ref string) error {
 }
 
 func (s *FileStore) loadLocked() (map[string]string, error) {
-	b, err := os.ReadFile(s.path)
+	_, err := os.Stat(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]string{}, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	if err := secureDir(filepath.Dir(s.path)); err != nil {
+		return nil, fmt.Errorf("secure secret directory: %w", err)
+	}
+	if err := secureFile(s.path); err != nil {
+		return nil, fmt.Errorf("secure secret file: %w", err)
+	}
+	b, err := os.ReadFile(s.path)
 	if err != nil {
 		return nil, err
 	}
@@ -87,6 +94,9 @@ func (s *FileStore) saveLocked(data map[string]string) error {
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
+	}
+	if err := secureDir(dir); err != nil {
+		return fmt.Errorf("secure secret directory: %w", err)
 	}
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
@@ -115,8 +125,11 @@ func (s *FileStore) saveLocked(data map[string]string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := replaceAtomic(tmp, s.path); err != nil {
 		return err
+	}
+	if err := secureFile(s.path); err != nil {
+		return fmt.Errorf("secure secret file: %w", err)
 	}
 	// Flush the directory entry so the rename itself survives a crash.
 	return syncDir(dir)

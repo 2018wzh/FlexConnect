@@ -58,6 +58,9 @@ flexconnect netcheck --env-file .env
 flexconnect proxy status
 flexconnect proxy enable 127.0.0.1:1080
 flexconnect proxy disable
+flexconnect profile add --scope machine --password-file ./secrets/flexconnect_password unattended https://vpn.example.com machine-user
+flexconnect control-mode machine -p unattended
+flexconnect control-mode user
 flexconnect logs
 ```
 
@@ -79,7 +82,7 @@ flexconnect netcheck --env-file .env --no-speedtest --json
 守护进程只在运行期间保留有界的近期连接历史。`flexconnect watch` 以
 NDJSON 输出 `connection_lost`、`reconnect_scheduled`、`reconnect_attempt`、
 `reconnected`、`reconnect_failed` 和 `reconnect_exhausted` 等生命周期事件；自动重连
-最多尝试 10 次，用尽后进入可观测的 `Error` 状态，需要用户手动重试。`flexconnect diag`
+最多尝试 3 次，用尽后进入可观测的 `Error` 状态，需要用户手动重试。`flexconnect diag`
 会同时包含这些事件、最后一次传输/关闭原因以及当前重连快照。
 
 主动断开会被记录为人为操作，不会触发异常断线重连通知。非主动断开及重连进度会由托盘
@@ -95,14 +98,14 @@ SOCKS5 代理是 VPN-only：启用后只支持 TCP CONNECT 和 IPv4 目标，域
 
 ## Docker 部署
 
-Docker 镜像运行 `flexconnectd`，通过环境变量创建一个固定 ID 的 Profile 并立即连接。容器内需要 Linux TUN 能力，SOCKS5 默认监听 `0.0.0.0:1080` 并通过端口映射暴露给宿主机。
+Docker 镜像运行 `flexconnectd`，通过环境变量按名称创建或更新 machine Profile，ID 由 daemon 随机生成。容器内需要 Linux TUN 能力；容器内 SOCKS5 可监听 `0.0.0.0:1080`，Compose 默认只映射到宿主机 `127.0.0.1:1080`。
 
 ```bash
 docker build -t flexconnect:local .
 docker run --rm \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
-  -p 1080:1080 \
+  -p 127.0.0.1:1080:1080 \
   -e FLEXCONNECT_SERVER=https://vpn.example.com \
   -e FLEXCONNECT_USERNAME=alice \
   -e FLEXCONNECT_PASSWORD='<password>' \
@@ -117,11 +120,16 @@ printf '%s\n' '<password>' > secrets/flexconnect_password
 FLEXCONNECT_SERVER=https://vpn.example.com FLEXCONNECT_USERNAME=alice docker compose -f docker-compose.example.yml up --build
 ```
 
-容器启动失败会直接非零退出，包括缺少必填环境变量、密码文件不可读、VPN 连接失败、请求启用 SOCKS5 但代理未实际监听。让 Docker/Compose 的重启策略负责重试，不在应用启动流程里吞掉错误。
+缺少必填环境变量、密码文件不可读或 machine Profile 持久化失败会直接非零退出。连接失败会保留 machine 锁并通过 `/v2/ready`、status、diagnostics 和 watch 暴露；只有明确分类为瞬态的错误才执行最多 3 次重连。管理员必须显式退出 machine 模式才能解除锁定。
+
+管理员手动管理 unattended 模式时，先用 `profile add --scope machine` 创建 machine Profile，
+再执行 `control-mode machine`。`control-mode` 会返回异步 operation；终态通过 watch 发布并在
+发布后从 operation 查询表移除。即使 daemon 因 machine 连接失败而 not ready，`status`、`diag`、
+`watch`、`down` 和 `control-mode user` 仍可用于诊断或恢复。
 
 ### 发布到 GitHub Packages
 
-仓库中的 `Docker Release` 工作流会在推送 `v*` tag 时将镜像发布到 `ghcr.io`，并自动打上 `v` 去掉前缀后的版本标签（如 `1.2.4`）以及 `<major>`、`<major>.<minor>`。
+仓库中的 `Docker Release` 工作流会在推送 `v*` tag 时将镜像发布到 `ghcr.io`，并自动打上 `v` 去掉前缀后的版本标签（如 `1.3.0`）以及 `<major>`、`<major>.<minor>`。
 
 从 GHCR 发布镜像（可选）：
 
@@ -149,11 +157,10 @@ docker pull ghcr.io/<OWNER>/flexconnect:<VERSION>
 | `FLEXCONNECT_SOCKET` | daemon 本地 Unix socket，镜像默认 `/run/flexconnect/flexconnect.sock` |
 | `FLEXCONNECT_STATE` | 状态文件路径，镜像默认 `/var/lib/flexconnect/state.json` |
 | `FLEXCONNECT_VERBOSE` | `true` 时启用 debug 日志 |
-| `FLEXCONNECT_SECRET_STORE` | `keyring`（默认，OS keyring 不可用时自动回退到 `file`）、`file`、`memory`；镜像默认 `memory` |
+| `FLEXCONNECT_SECRET_STORE` | `keyring`（默认且不可用时启动失败）、管理员显式选择的 `file`、或测试/容器使用的 `memory`；镜像默认 `memory` |
 | `FLEXCONNECT_CONNECT_ON_START` | `true` 时启动即 upsert Profile 并连接；镜像默认 `true` |
 | `FLEXCONNECT_CONNECT_TIMEOUT` | 启动连接超时，例如 `45s`、`2m` |
-| `FLEXCONNECT_PROFILE_ID` | 启动 Profile 的固定 ID，镜像默认 `docker` |
-| `FLEXCONNECT_PROFILE_NAME` | 启动 Profile 名称，镜像默认 `docker` |
+| `FLEXCONNECT_PROFILE_NAME` | 启动 machine Profile 的稳定名称，镜像默认 `docker`；ID 由 daemon 生成 |
 | `FLEXCONNECT_SERVER` | AnyConnect 服务器 URL，启动连接时必填 |
 | `FLEXCONNECT_USERNAME` | 用户名，启动连接时必填 |
 | `FLEXCONNECT_GROUP` | VPN group，可选 |
@@ -197,16 +204,16 @@ sudo usermod -aG flexconnect "$USER"
 
 ```bash
 go run ./cmd/dist list
-go run ./cmd/dist build --version 1.2.4 linux/amd64/tgz
-go run ./cmd/dist build --version 1.2.4 linux/amd64/deb
-go run ./cmd/dist build --version 1.2.4 linux/amd64/rpm
-go run ./cmd/dist build --version 1.2.4 windows/amd64/zip
-go run ./cmd/dist build --version 1.2.4 windows/amd64/msi
-go run ./cmd/dist build --version 1.2.4 darwin/amd64/pkg
-go run ./cmd/dist build --version 1.2.4 darwin/arm64/pkg
+go run ./cmd/dist build --version 1.3.0 linux/amd64/tgz
+go run ./cmd/dist build --version 1.3.0 linux/amd64/deb
+go run ./cmd/dist build --version 1.3.0 linux/amd64/rpm
+go run ./cmd/dist build --version 1.3.0 windows/amd64/zip
+go run ./cmd/dist build --version 1.3.0 windows/amd64/msi
+go run ./cmd/dist build --version 1.3.0 darwin/amd64/pkg
+go run ./cmd/dist build --version 1.3.0 darwin/arm64/pkg
 ```
 
-推送形如 `v1.2.4` 的 Git tag 后，GitHub Actions 会自动构建这些产物并创建对应的 GitHub Release。
+推送形如 `v1.3.0` 的 Git tag 后，GitHub Actions 会自动构建这些产物并创建对应的 GitHub Release。
 
 ## 运行与配置
 
@@ -217,7 +224,7 @@ go run ./cmd/dist build --version 1.2.4 darwin/arm64/pkg
 - `-v` 或 `--verbose` 启用更详细日志
 - Windows 上直接启动 `flexconnectd` 时会自动请求管理员权限
 - 密码通过系统密钥库保存，状态文件只保存非敏感元数据
-- CLI 在执行 daemon 命令前通过 `/v1/health` 校验 readiness 和本地 API 版本
+- CLI 在执行 daemon 命令前通过 `/v2/live` 和 `/v2/ready` 校验 API major、capabilities 与组件 readiness
 - Linux 本地控制接口通过 `0660 root:flexconnect` Unix socket 提供；Windows 使用受保护的 named pipe，不暴露公网 TCP 端口
 
 ## 项目结构
@@ -233,3 +240,7 @@ go run ./cmd/dist build --version 1.2.4 darwin/arm64/pkg
 ## Credits
 * [Tailscale](https://tailscale.com/) - 架构参考与实现参考
 * [sslcon](https://github.com/tlslink/sslcon) - AnyConnect 协议实现参考
+
+## 验证边界
+
+版本 1.3.0 的发布门禁覆盖 Windows、Linux 和 macOS 自动测试、race/vet/build、安装包构建和 Docker 构建。这些结果不代表真实 AnyConnect 服务器、真实主机网络变更或独立安全扫描已经验收。

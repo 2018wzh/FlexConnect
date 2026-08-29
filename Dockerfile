@@ -2,7 +2,7 @@
 
 FROM golang:1.26.2-bookworm AS build
 
-ARG VERSION=1.2.4
+ARG VERSION=1.3.0
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -29,7 +29,6 @@ ENV FLEXCONNECT_SOCKET=/run/flexconnect/flexconnect.sock \
     FLEXCONNECT_STATE=/var/lib/flexconnect/state.json \
     FLEXCONNECT_SECRET_STORE=memory \
     FLEXCONNECT_CONNECT_ON_START=true \
-    FLEXCONNECT_PROFILE_ID=docker \
     FLEXCONNECT_PROFILE_NAME=docker \
     FLEXCONNECT_AUTO_RECONNECT=true \
     FLEXCONNECT_SOCKS5_ENABLED=true \

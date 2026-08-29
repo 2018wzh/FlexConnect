@@ -43,6 +43,7 @@ type ConnSession struct {
 	ConnectionID string
 
 	ServerAddress            string
+	TLSServerName            string
 	LocalAddress             string
 	LocalSocketAddress       string
 	RemoteSocketAddress      string
@@ -75,11 +76,13 @@ type ConnSession struct {
 	DTLSCipherSuite   string
 	Stat              *stat
 
-	closeOnce      sync.Once           `json:"-"`
-	CloseChan      chan struct{}       `json:"-"`
-	PayloadIn      chan *proto.Payload `json:"-"`
-	PayloadOutTLS  chan *proto.Payload `json:"-"`
-	PayloadOutDTLS chan *proto.Payload `json:"-"`
+	closeOnce           sync.Once           `json:"-"`
+	CloseChan           chan struct{}       `json:"-"`
+	PayloadIn           chan *proto.Payload `json:"-"`
+	PayloadOutTLS       chan *proto.Payload `json:"-"`
+	PayloadOutDTLS      chan *proto.Payload `json:"-"`
+	DynamicRoutePackets chan []byte         `json:"-"`
+	NetworkErrors       chan error          `json:"-"`
 
 	DtlsConnected *atomic.Bool
 	DtlsSetupChan chan struct{} `json:"-"`
@@ -99,6 +102,26 @@ type ConnSession struct {
 	closeHookMu     sync.Mutex
 	closeHook       func()
 	tunnelDone      chan struct{}
+	tunnelErrMu     sync.Mutex
+	tunnelErr       error
+}
+
+func (cSess *ConnSession) SetTunnelError(err error) {
+	if cSess == nil {
+		return
+	}
+	cSess.tunnelErrMu.Lock()
+	cSess.tunnelErr = err
+	cSess.tunnelErrMu.Unlock()
+}
+
+func (cSess *ConnSession) TunnelError() error {
+	if cSess == nil {
+		return nil
+	}
+	cSess.tunnelErrMu.Lock()
+	defer cSess.tunnelErrMu.Unlock()
+	return cSess.tunnelErr
 }
 
 // defaultDPDSeconds substitutes for a dead-peer interval the server did not
@@ -162,18 +185,20 @@ func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
 			DPDResponses:   atomic.NewUint64(0),
 			QueueDrops:     atomic.NewUint64(0),
 		},
-		closeOnce:         sync.Once{},
-		CloseChan:         make(chan struct{}),
-		DtlsSetupChan:     make(chan struct{}),
-		PayloadIn:         make(chan *proto.Payload, 64),
-		PayloadOutTLS:     make(chan *proto.Payload, 64),
-		PayloadOutDTLS:    make(chan *proto.Payload, 64),
-		DtlsConnected:     atomic.NewBool(false),
-		ResetTLSReadDead:  atomic.NewBool(true),
-		ResetDTLSReadDead: atomic.NewBool(true),
-		LifecycleState:    atomic.NewString("Created"),
-		TLSState:          atomic.NewString("Starting"),
-		DTLSState:         atomic.NewString("Disabled"),
+		closeOnce:           sync.Once{},
+		CloseChan:           make(chan struct{}),
+		DtlsSetupChan:       make(chan struct{}),
+		PayloadIn:           make(chan *proto.Payload, 64),
+		PayloadOutTLS:       make(chan *proto.Payload, 64),
+		PayloadOutDTLS:      make(chan *proto.Payload, 64),
+		DynamicRoutePackets: make(chan []byte, 64),
+		NetworkErrors:       make(chan error, 8),
+		DtlsConnected:       atomic.NewBool(false),
+		ResetTLSReadDead:    atomic.NewBool(true),
+		ResetDTLSReadDead:   atomic.NewBool(true),
+		LifecycleState:      atomic.NewString("Created"),
+		TLSState:            atomic.NewString("Starting"),
+		DTLSState:           atomic.NewString("Disabled"),
 		DSess: &DtlsSession{
 			closeOnce: sync.Once{},
 			CloseChan: make(chan struct{}),
@@ -225,7 +250,8 @@ func (sess *Session) NewConnSession(header *http.Header) *ConnSession {
 			if dtd.Config.Opaque.CustomAttr.DynamicSplitIncludeDomains != "" {
 				cSess.DynamicSplitIncludeDomains = strings.Split(dtd.Config.Opaque.CustomAttr.DynamicSplitIncludeDomains, ",")
 				cSess.DynamicSplitTunneling = true
-			} else if dtd.Config.Opaque.CustomAttr.DynamicSplitExcludeDomains != "" {
+			}
+			if dtd.Config.Opaque.CustomAttr.DynamicSplitExcludeDomains != "" {
 				// 字符串最后多一个逗号，导致数组最后一个元素为 ""，不排除配置错误其它元素也为空的可能，go 没有直接删除容器元素的方法，这里不处理
 				cSess.DynamicSplitExcludeDomains = strings.Split(dtd.Config.Opaque.CustomAttr.DynamicSplitExcludeDomains, ",")
 				cSess.DynamicSplitTunneling = true

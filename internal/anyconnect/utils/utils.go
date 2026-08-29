@@ -3,6 +3,7 @@ package utils
 import (
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -25,8 +26,10 @@ func InArray(arr []string, str string) bool {
 }
 
 func InArrayGeneric(arr []string, str string) bool {
+	str = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(str)), ".")
 	for _, d := range arr {
-		if d != "" && strings.HasSuffix(str, d) {
+		d = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(d)), ".")
+		if d != "" && (str == d || strings.HasSuffix(str, "."+d)) {
 			return true
 		}
 	}
@@ -64,11 +67,17 @@ func ResolvePacket(packet []byte) (string, uint16, string, uint16) {
 }
 
 func MakeMasterSecret() ([]byte, error) {
+	return makeMasterSecretFrom(rand.Reader)
+}
+
+func makeMasterSecretFrom(reader io.Reader) ([]byte, error) {
 	masterSecret := make([]byte, 48)
 	masterSecret[0] = protocol.Version1_2.Major
 	masterSecret[1] = protocol.Version1_2.Minor
-	_, err := rand.Read(masterSecret[2:])
-	return masterSecret, err
+	if _, err := io.ReadFull(reader, masterSecret[2:]); err != nil {
+		return nil, err
+	}
+	return masterSecret, nil
 }
 
 func Min(init int, other ...int) int {

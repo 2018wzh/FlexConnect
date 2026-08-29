@@ -6,36 +6,48 @@ import (
 	"flexconnect/internal/anyconnect/proto"
 )
 
-const BufferSize = 2048
+const (
+	minimumPacketMTU = 576
+	maximumPacketMTU = 9000
+	packetHeadroom   = 256
+)
 
-// pool 实际数据缓冲区，缓冲区的容量由 golang 自动控制，PayloadIn 等通道只是个内存地址列表
-var pool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, BufferSize)
-		pl := proto.Payload{
-			Type: 0x00,
-			Data: b,
-		}
-		return &pl
-	},
+var payloadPools sync.Map
+
+func payloadBufferSize(mtu int) int {
+	if mtu < minimumPacketMTU {
+		mtu = 1399
+	}
+	if mtu > maximumPacketMTU {
+		mtu = maximumPacketMTU
+	}
+	return mtu + packetHeadroom
 }
 
-func getPayloadBuffer() *proto.Payload {
-	pl := pool.Get().(*proto.Payload)
+func poolForSize(size int) *sync.Pool {
+	value, _ := payloadPools.LoadOrStore(size, &sync.Pool{New: func() any {
+		return &proto.Payload{Data: make([]byte, size)}
+	}})
+	return value.(*sync.Pool)
+}
+
+func getPayloadBuffer(mtu ...int) *proto.Payload {
+	value := 0
+	if len(mtu) > 0 {
+		value = mtu[0]
+	}
+	size := payloadBufferSize(value)
+	pl := poolForSize(size).Get().(*proto.Payload)
+	pl.Data = pl.Data[:size]
 	return pl
 }
 
 func putPayloadBuffer(pl *proto.Payload) {
-	if pl == nil {
+	if pl == nil || cap(pl.Data) < minimumPacketMTU+packetHeadroom || cap(pl.Data) > maximumPacketMTU+packetHeadroom {
 		return
 	}
-	// DPD-REQ、KEEPALIVE 等数据
-	if cap(pl.Data) != BufferSize {
-		// base.Debug("payload is:", pl.Data)
-		return
-	}
-
-	pl.Type = 0x00
-	pl.Data = pl.Data[:BufferSize]
-	pool.Put(pl)
+	size := cap(pl.Data)
+	pl.Type = 0
+	pl.Data = pl.Data[:size]
+	poolForSize(size).Put(pl)
 }
