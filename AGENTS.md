@@ -244,7 +244,7 @@ connection ID. The daemon publishes bounded in-memory lifecycle history through
 `/v1/watch` and `/v1/diagnostics`; the tray consumes these events for
 cross-platform desktop notifications. Manual disconnects are explicitly
 classified and do not enter the unexpected-disconnect notification path. Automatic
-reconnect uses exponential backoff and stops after 10 failed attempts with a
+reconnect uses exponential backoff and stops after 3 failed attempts with a
 `reconnect_exhausted` lifecycle event; a manual connect starts a fresh attempt cycle.
 
 On Linux the packaged daemon runs as `root:flexconnect`; systemd owns `/run/flexconnect` and

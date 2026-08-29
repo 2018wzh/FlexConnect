@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 
 	wgtun "github.com/tailscale/wireguard-go/tun"
@@ -187,48 +186,17 @@ func (m *platformManager) setDNS(servers []netip.Addr) error {
 }
 
 func GetLocalInterface(context.Context) (LocalInterface, error) {
-	routes, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	selected, err := getWindowsDefaultRoute("")
 	if err != nil {
 		return LocalInterface{}, err
 	}
-	var best *winipcfg.MibIPforwardRow2
-	for i := range routes {
-		route := &routes[i]
-		if route.DestinationPrefix.PrefixLength != 0 {
-			continue
-		}
-		if best == nil || route.Metric < best.Metric {
-			best = route
-		}
-	}
-	if best == nil {
-		return LocalInterface{}, errors.New("no default IPv4 route")
-	}
-	adapters, err := winipcfg.GetAdaptersAddresses(windows.AF_INET, winipcfg.GAAFlagIncludeAllInterfaces)
-	if err != nil {
-		return LocalInterface{}, err
-	}
-	for _, adapter := range adapters {
-		if adapter.LUID != best.InterfaceLUID {
-			continue
-		}
-		info := LocalInterface{
-			Name:           adapter.FriendlyName(),
-			Gateway:        best.NextHop.Addr().Unmap().String(),
-			InterfaceIndex: int(adapter.IfIndex),
-		}
-		if len(adapter.PhysicalAddress()) > 0 {
-			info.MAC = net.HardwareAddr(adapter.PhysicalAddress()).String()
-		}
-		for addr := adapter.FirstUnicastAddress; addr != nil; addr = addr.Next {
-			if ip := addr.Address.IP(); ip != nil && ip.To4() != nil {
-				info.IP4 = ip.String()
-				break
-			}
-		}
-		return info, nil
-	}
-	return LocalInterface{}, errors.New("default route interface not found")
+	return LocalInterface{
+		Name:           selected.interfaceName,
+		IP4:            selected.localIPv4.String(),
+		MAC:            selected.mac,
+		Gateway:        selected.gateway.String(),
+		InterfaceIndex: selected.interfaceIndex,
+	}, nil
 }
 
 func isNotFoundOrExists(err error) bool {

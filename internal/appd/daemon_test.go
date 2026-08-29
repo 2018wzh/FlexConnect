@@ -206,6 +206,12 @@ func TestAutoReconnectStopsAfterRetryLimit(t *testing.T) {
 	}
 }
 
+func TestAutoReconnectDefaultRetryLimit(t *testing.T) {
+	if autoReconnectMaxTries != 3 {
+		t.Fatalf("default retry limit = %d, want 3", autoReconnectMaxTries)
+	}
+}
+
 func TestUnexpectedDisconnectIsRecordedInDiagnostics(t *testing.T) {
 	profile := testProfile("p1", false)
 	backend := newFakeBackend()

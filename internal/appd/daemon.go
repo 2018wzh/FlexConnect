@@ -25,7 +25,7 @@ import (
 var (
 	autoReconnectMinDelay = 2 * time.Second
 	autoReconnectMaxDelay = 1 * time.Minute
-	autoReconnectMaxTries = 10
+	autoReconnectMaxTries = 3
 )
 
 var appdDebug bool
