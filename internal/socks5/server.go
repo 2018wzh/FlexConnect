@@ -10,7 +10,11 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"flexconnect/internal/logging"
 )
+
+var socks5Log = logging.WithComponent("socks5")
 
 type TunnelDialer interface {
 	DialContext(context.Context, string, string) (net.Conn, error)
@@ -18,10 +22,16 @@ type TunnelDialer interface {
 }
 
 type Server struct {
-	listener net.Listener
-	dialer   TunnelDialer
-	addr     string
-	wg       sync.WaitGroup
+	listener  net.Listener
+	dialer    TunnelDialer
+	addr      string
+	wg        sync.WaitGroup
+	mu        sync.Mutex
+	conns     map[net.Conn]struct{}
+	closed    bool
+	closeErr  error
+	closeOnce sync.Once
+	errors    chan error
 }
 
 func Listen(addr string, dialer TunnelDialer) (*Server, error) {
@@ -39,11 +49,15 @@ func Listen(addr string, dialer TunnelDialer) (*Server, error) {
 		listener: ln,
 		addr:     ln.Addr().String(),
 		dialer:   dialer,
+		conns:    make(map[net.Conn]struct{}),
+		errors:   make(chan error, 1),
 	}
 	server.wg.Add(1)
 	go server.serve()
 	return server, nil
 }
+
+func (s *Server) Errors() <-chan error { return s.errors }
 
 func (s *Server) Addr() string {
 	if s == nil {
@@ -53,29 +67,81 @@ func (s *Server) Addr() string {
 }
 
 func (s *Server) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.CloseContext(ctx)
+}
+
+func (s *Server) CloseContext(ctx context.Context) error {
 	if s == nil || s.listener == nil {
 		return nil
 	}
-	err := s.listener.Close()
-	s.wg.Wait()
-	return err
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.closeErr = s.listener.Close()
+		if errors.Is(s.closeErr, net.ErrClosed) {
+			s.closeErr = nil
+		}
+		for conn := range s.conns {
+			if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && s.closeErr == nil {
+				s.closeErr = err
+			}
+		}
+		s.mu.Unlock()
+	})
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		s.mu.Lock()
+		err := s.closeErr
+		s.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("close SOCKS5 server: %w", ctx.Err())
+	}
 }
 
 func (s *Server) serve() {
 	defer s.wg.Done()
+	defer close(s.errors)
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			continue
+			socks5Log.Printf("accept failed err=%q", err.Error())
+			select {
+			case s.errors <- fmt.Errorf("SOCKS5 accept failed: %w", err):
+			default:
+			}
+			return
 		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		s.conns[conn] = struct{}{}
+		s.mu.Unlock()
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			defer conn.Close()
-			_ = s.handleConn(conn)
+			defer func() {
+				s.mu.Lock()
+				delete(s.conns, conn)
+				s.mu.Unlock()
+				_ = conn.Close()
+			}()
+			if err := s.handleConn(conn); err != nil && !errors.Is(err, net.ErrClosed) {
+				socks5Log.Printf("client session failed remote=%s err=%q", conn.RemoteAddr(), err.Error())
+			}
 		}()
 	}
 }
@@ -94,6 +160,17 @@ func (s *Server) handleConn(conn net.Conn) error {
 	methods := make([]byte, hdr[1])
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return err
+	}
+	noAuth := false
+	for _, method := range methods {
+		if method == 0x00 {
+			noAuth = true
+			break
+		}
+	}
+	if !noAuth {
+		_, _ = conn.Write([]byte{0x05, 0xff})
+		return errors.New("SOCKS5 client did not offer no-authentication method")
 	}
 	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
 		return err

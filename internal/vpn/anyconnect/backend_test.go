@@ -83,10 +83,16 @@ func newMonitorTestSession(t *testing.T) *acSession.ConnSession {
 	return cSess
 }
 
+func monitorRequest(connectionID string) vpn.ConnectRequest {
+	profile := typesProfileStub()
+	profile.ID = "profile-1"
+	return vpn.ConnectRequest{Profile: profile, AttemptID: "attempt-1", ConnectionID: connectionID, OwnerID: "owner-1"}
+}
+
 func TestStartUnderlayMonitorReplacesStaleMonitor(t *testing.T) {
 	backend, recorder := newTestBackend()
 	first := newMonitorTestSession(t)
-	if err := backend.startUnderlayMonitor(first, "vpn-1"); err != nil {
+	if err := backend.startUnderlayMonitor(first, "vpn-1", monitorRequest("vpn-1")); err != nil {
 		t.Fatalf("first startUnderlayMonitor: %v", err)
 	}
 	backend.stopMonitorFor("vpn-x")
@@ -95,7 +101,7 @@ func TestStartUnderlayMonitorReplacesStaleMonitor(t *testing.T) {
 	}
 
 	second := newMonitorTestSession(t)
-	if err := backend.startUnderlayMonitor(second, "vpn-2"); err != nil {
+	if err := backend.startUnderlayMonitor(second, "vpn-2", monitorRequest("vpn-2")); err != nil {
 		t.Fatalf("second startUnderlayMonitor: %v", err)
 	}
 	monitors := recorder.all()
@@ -119,10 +125,10 @@ func TestMonitorCloseReleasesMonitorOnUnexpectedSessionEnd(t *testing.T) {
 	connection := acRPC.NewConnection(buildAuthProfile(typesProfileStub(), "ignored"))
 	cSess := connection.Session.NewConnSession(&http.Header{})
 	cSess.TunName = "FlexConnect"
-	if err := backend.startUnderlayMonitor(cSess, "vpn-1"); err != nil {
+	if err := backend.startUnderlayMonitor(cSess, "vpn-1", monitorRequest("vpn-1")); err != nil {
 		t.Fatalf("startUnderlayMonitor: %v", err)
 	}
-	go backend.monitorClose(cSess, "vpn-1")
+	go backend.monitorClose(cSess, "vpn-1", monitorRequest("vpn-1"))
 
 	// The session ends without Backend.Disconnect ever running, for example
 	// because the server dropped the tunnel.
@@ -144,7 +150,7 @@ func TestMonitorCloseReleasesMonitorOnUnexpectedSessionEnd(t *testing.T) {
 	// Reconnect after the unexpected drop: this used to fail with
 	// "underlay monitor already active".
 	second := newMonitorTestSession(t)
-	if err := backend.startUnderlayMonitor(second, "vpn-2"); err != nil {
+	if err := backend.startUnderlayMonitor(second, "vpn-2", monitorRequest("vpn-2")); err != nil {
 		t.Fatalf("reconnect startUnderlayMonitor: %v", err)
 	}
 	if monitors := recorder.all(); len(monitors) != 2 {
@@ -158,17 +164,17 @@ func TestMonitorCloseDoesNotReleaseReplacementMonitor(t *testing.T) {
 	connection := acRPC.NewConnection(buildAuthProfile(typesProfileStub(), "ignored"))
 	oldSession := connection.Session.NewConnSession(&http.Header{})
 	oldSession.TunName = "FlexConnect"
-	if err := backend.startUnderlayMonitor(oldSession, "vpn-1"); err != nil {
+	if err := backend.startUnderlayMonitor(oldSession, "vpn-1", monitorRequest("vpn-1")); err != nil {
 		t.Fatalf("startUnderlayMonitor: %v", err)
 	}
 
 	// A replacement connection takes over before the old teardown runs.
 	backend.stopUnderlayMonitor()
 	newSession := newMonitorTestSession(t)
-	if err := backend.startUnderlayMonitor(newSession, "vpn-2"); err != nil {
+	if err := backend.startUnderlayMonitor(newSession, "vpn-2", monitorRequest("vpn-2")); err != nil {
 		t.Fatalf("replacement startUnderlayMonitor: %v", err)
 	}
-	go backend.monitorClose(oldSession, "vpn-1")
+	go backend.monitorClose(oldSession, "vpn-1", monitorRequest("vpn-1"))
 	oldSession.Close()
 
 	select {

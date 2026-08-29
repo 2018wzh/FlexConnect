@@ -29,12 +29,14 @@ func TestInteractiveLoginStartsTimeoutAfterInput(t *testing.T) {
 
 		status := http.StatusOK
 		body := "{}"
-		if req.URL.Path == "/v1/health" {
-			body = `{"status":"ok","version":"1.0.6","api_version":"1"}`
-		} else if req.URL.Path == "/v1/login" {
-			status = http.StatusNoContent
-			body = ""
-		} else if req.URL.Path == "/v1/profiles" {
+		if req.URL.Path == "/v2/live" {
+			body = `{"status":"ok","version":"1.3.0","api_major":2,"capabilities":["component-health","machine-mode","operations","profile-scope","structured-errors","watch-replay"]}`
+		} else if req.URL.Path == "/v2/ready" {
+			body = `{"ready":true,"components":[]}`
+		} else if req.URL.Path == "/v2/profiles" && req.Method == http.MethodPost {
+			status = http.StatusCreated
+			body = `{"id":"created","name":"corp","scope":"user"}`
+		} else if req.URL.Path == "/v2/profiles" {
 			body = "[]"
 		}
 		return &http.Response{
@@ -59,7 +61,7 @@ func TestInteractiveLoginStartsTimeoutAfterInput(t *testing.T) {
 		t.Fatalf("interactive login failed after slow input: %v", err)
 	}
 
-	want := []string{"/v1/login", "/v1/status", "/v1/profiles"}
+	want := []string{"/v2/profiles", "/v2/status", "/v2/profiles"}
 	if strings.Join(paths, ",") != strings.Join(want, ",") {
 		t.Fatalf("request paths = %v, want %v", paths, want)
 	}
@@ -74,12 +76,14 @@ func TestRunChecksDaemonBeforeInteractiveLogin(t *testing.T) {
 		paths = append(paths, req.URL.Path)
 		status := http.StatusOK
 		body := "{}"
-		if req.URL.Path == "/v1/health" {
-			body = `{"status":"ok","version":"1.0.6","api_version":"1"}`
-		} else if req.URL.Path == "/v1/login" {
-			status = http.StatusNoContent
-			body = ""
-		} else if req.URL.Path == "/v1/profiles" {
+		if req.URL.Path == "/v2/live" {
+			body = `{"status":"ok","version":"1.3.0","api_major":2,"capabilities":["component-health","machine-mode","operations","profile-scope","structured-errors","watch-replay"]}`
+		} else if req.URL.Path == "/v2/ready" {
+			body = `{"ready":true,"components":[]}`
+		} else if req.URL.Path == "/v2/profiles" && req.Method == http.MethodPost {
+			status = http.StatusCreated
+			body = `{"id":"created","name":"corp","scope":"user"}`
+		} else if req.URL.Path == "/v2/profiles" {
 			body = "[]"
 		}
 		return &http.Response{
@@ -103,7 +107,7 @@ func TestRunChecksDaemonBeforeInteractiveLogin(t *testing.T) {
 		t.Fatalf("run interactive login: %v", err)
 	}
 
-	want := []string{"/v1/health", "/v1/login", "/v1/status", "/v1/profiles"}
+	want := []string{"/v2/live", "/v2/ready", "/v2/profiles", "/v2/status", "/v2/profiles"}
 	if strings.Join(paths, ",") != strings.Join(want, ",") {
 		t.Fatalf("request paths = %v, want %v", paths, want)
 	}

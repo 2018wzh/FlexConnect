@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
@@ -14,6 +15,20 @@ import (
 type fakeManager struct {
 	mu     sync.Mutex
 	closed int
+}
+
+func TestDisconnectReturnsTunnelCleanupFailure(t *testing.T) {
+	sess := &session.Session{}
+	cSess := sess.NewConnSession(&http.Header{})
+	done := make(chan struct{})
+	cSess.SetTunnelDone(done)
+	cleanupErr := errors.New("route cleanup failed")
+	cSess.SetTunnelError(cleanupErr)
+	close(done)
+	connection := &Connection{Session: sess}
+	if err := connection.Disconnect(context.Background()); !errors.Is(err, cleanupErr) {
+		t.Fatalf("Disconnect error = %v", err)
+	}
 }
 
 func (m *fakeManager) Up(context.Context) error { return nil }

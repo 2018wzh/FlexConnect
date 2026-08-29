@@ -41,13 +41,32 @@ func dtlsChannel(cSess *session.ConnSession) {
 		cSess.SignalDTLSSetup()
 	}()
 
-	port, _ := strconv.Atoi(cSess.DTLSPort)
+	port, err := strconv.Atoi(cSess.DTLSPort)
+	if err != nil || port < 1 || port > 65535 {
+		if err == nil {
+			err = errors.New("DTLS port is outside the valid range")
+		}
+		cSess.RecordTransportFault("dtls_config_error", "dtls", err)
+		return
+	}
 	addr := &net.UDPAddr{IP: net.ParseIP(cSess.ServerAddress), Port: port}
+	if addr.IP == nil {
+		err = errors.New("invalid DTLS server address")
+		cSess.RecordTransportFault("dtls_config_error", "dtls", err)
+		return
+	}
 
-	id, _ := hex.DecodeString(cSess.DTLSId)
+	id, err := hex.DecodeString(cSess.DTLSId)
+	if err != nil || len(id) == 0 {
+		if err == nil {
+			err = errors.New("missing DTLS session ID")
+		}
+		cSess.RecordTransportFault("dtls_config_error", "dtls", err)
+		return
+	}
 
 	config := &dtls.Config{
-		InsecureSkipVerify:   true,
+		ServerName:           cSess.TLSServerName,
 		ExtendedMasterSecret: dtls.DisableExtendedMasterSecret,
 		CipherSuites: func() []dtls.CipherSuiteID {
 			switch cSess.DTLSCipherSuite {
@@ -113,7 +132,7 @@ func dtlsChannel(cSess *session.ConnSession) {
 			cSess.ResetDTLSReadDead.Store(false)
 		}
 
-		pl := getPayloadBuffer()                // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
+		pl := getPayloadBuffer(cSess.MTU)       // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
 		bytesReceived, err = conn.Read(pl.Data) // 服务器没有数据返回时，会阻塞
 		if err != nil {
 			putPayloadBuffer(pl)

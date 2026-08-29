@@ -45,7 +45,7 @@ func tlsChannel(conn *tls.Conn, bufR *bufio.Reader, cSess *session.ConnSession, 
 			cSess.ResetTLSReadDead.Store(false)
 		}
 
-		pl := getPayloadBuffer() // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
+		pl := getPayloadBuffer(cSess.MTU) // 从池子申请一块内存，存放去除头部的数据包到 PayloadIn，在 payloadInToTun 中释放
 		frameType, wireBytes, err := readCSTPFrame(bufR, pl)
 		if err != nil {
 			putPayloadBuffer(pl)

@@ -412,7 +412,7 @@ func negotiateDTLS(client *acAuth.Client, sess *session.Session, headers http.He
 		return nil, fmt.Errorf("invalid DTLS session identifier")
 	}
 	config := &dtls.Config{
-		InsecureSkipVerify:   true,
+		ServerName:           strings.TrimSpace(client.Prof.Host),
 		ExtendedMasterSecret: dtls.DisableExtendedMasterSecret,
 		CipherSuites:         dtlsCipherSuites(headers.Get("X-DTLS12-CipherSuite")),
 		SessionStore: &probeDTLSSessionStore{value: dtls.Session{

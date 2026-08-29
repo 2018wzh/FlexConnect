@@ -19,11 +19,14 @@ type TunnelController struct {
 	manager osnet.Manager
 	cSess   *session.ConnSession
 
-	stateMu sync.RWMutex
-	state   string
-	close   sync.Once
-	workers sync.WaitGroup
-	done    chan struct{}
+	stateMu     sync.RWMutex
+	state       string
+	closeErr    error
+	close       sync.Once
+	workers     sync.WaitGroup
+	done        chan struct{}
+	dynamicStop chan struct{}
+	dynamicDone chan struct{}
 }
 
 func newTunnelController(dev wgtun.Device, manager osnet.Manager, cSess *session.ConnSession) (*TunnelController, error) {
@@ -37,11 +40,13 @@ func newTunnelController(dev wgtun.Device, manager osnet.Manager, cSess *session
 		return nil, errors.New("nil connection session")
 	}
 	return &TunnelController{
-		dev:     dev,
-		manager: manager,
-		cSess:   cSess,
-		state:   "Configuring",
-		done:    make(chan struct{}),
+		dev:         dev,
+		manager:     manager,
+		cSess:       cSess,
+		state:       "Configuring",
+		done:        make(chan struct{}),
+		dynamicStop: make(chan struct{}),
+		dynamicDone: make(chan struct{}),
 	}, nil
 }
 
@@ -60,7 +65,12 @@ func (c *TunnelController) Start() error {
 	c.cSess.SetCloseHook(func() { _ = c.Close(context.Background()) })
 	c.cSess.SetTunnelDone(c.done)
 	c.cSess.SetLifecycleState("Running")
-	c.workers.Add(3)
+	c.workers.Add(4)
+	go func() {
+		defer c.workers.Done()
+		defer close(c.dynamicDone)
+		dynamicRouteWorker(c.cSess, c.dynamicStop)
+	}()
 	go func() {
 		defer c.workers.Done()
 		watchTunEvents(c.dev, c.cSess)
@@ -102,12 +112,18 @@ func (c *TunnelController) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
-	var firstErr error
 	c.close.Do(func() {
+		var firstErr error
 		c.stateMu.Lock()
 		c.state = "Draining"
 		c.stateMu.Unlock()
 		c.cSess.SetLifecycleState("Draining")
+		close(c.dynamicStop)
+		select {
+		case <-c.dynamicDone:
+		case <-ctx.Done():
+			firstErr = ctx.Err()
+		}
 		if c.manager != nil {
 			if err := c.manager.Close(ctx); err != nil {
 				firstErr = err
@@ -126,6 +142,13 @@ func (c *TunnelController) Close(ctx context.Context) error {
 			c.cSess.SetLifecycleState("Closed")
 			close(c.done)
 		}()
+		c.stateMu.Lock()
+		c.closeErr = firstErr
+		c.stateMu.Unlock()
+		c.cSess.SetTunnelError(firstErr)
 	})
-	return firstErr
+	c.stateMu.RLock()
+	err := c.closeErr
+	c.stateMu.RUnlock()
+	return err
 }

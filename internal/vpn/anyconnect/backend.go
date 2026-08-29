@@ -21,13 +21,13 @@ import (
 type Backend struct {
 	mu            sync.Mutex
 	events        chan vpn.Event
-	connectionSeq uint64
 	monitorMu     sync.Mutex
 	monitor       osnet.Monitor
 	monitorCancel context.CancelFunc
 	monitorID     string
 	newMonitor    func(ctx context.Context, opts osnet.MonitorOptions) (osnet.Monitor, error)
 	active        *acRPC.Connection
+	connecting    *acRPC.Connection
 }
 
 func New() *Backend {
@@ -36,22 +36,27 @@ func New() *Backend {
 	return &Backend{events: make(chan vpn.Event, 32), newMonitor: osnet.NewMonitor}
 }
 
-func (b *Backend) Connect(ctx context.Context, profile types.Profile, password string) (*types.SessionInfo, error) {
+func (b *Backend) Connect(ctx context.Context, request vpn.ConnectRequest) (*types.SessionInfo, error) {
+	profile, password := request.Profile, request.Password
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// A lingering connection means the previous teardown never completed; a
-	// new session would reuse the same TUN device name and fight the stale
-	// packet workers for routes. Drain it before dialing.
-	if stale := b.active; stale != nil {
-		acBase.Warn("tearing down lingering connection before new connect")
-		_ = stale.Disconnect(context.Background())
-		b.active = nil
+	if b.connecting != nil {
+		b.mu.Unlock()
+		return nil, fmt.Errorf("VPN connection attempt already in progress")
 	}
-
+	stale := b.active
+	b.active = nil
 	acBase.Info("vpn connect start", "host", profile.ServerURL, "username", profile.Username)
 	connection := acRPC.NewConnection(buildAuthProfile(profile, password))
-	b.active = connection
+	b.connecting = connection
+	b.mu.Unlock()
+
+	if stale != nil {
+		acBase.Warn("tearing down lingering connection before new connect")
+		if err := disconnectConnection(stale); err != nil {
+			b.clearConnecting(connection)
+			return nil, fmt.Errorf("disconnect lingering VPN connection: %w", err)
+		}
+	}
 
 	done := make(chan error, 1)
 	go func() {
@@ -61,7 +66,7 @@ func (b *Backend) Connect(ctx context.Context, profile types.Profile, password s
 	select {
 	case <-ctx.Done():
 		acBase.Warn("vpn connect canceled", "error", ctx.Err().Error())
-		_ = connection.Disconnect(context.Background())
+		_ = disconnectConnection(connection)
 		select {
 		case err := <-done:
 			if err != nil {
@@ -72,36 +77,82 @@ func (b *Backend) Connect(ctx context.Context, profile types.Profile, password s
 		case <-time.After(30 * time.Second):
 			acBase.Warn("vpn connect cleanup timed out")
 		}
+		b.clearConnecting(connection)
 		return nil, ctx.Err()
 	case err := <-done:
 		if err != nil {
-			_ = connection.Disconnect(context.Background())
-			b.active = nil
+			_ = disconnectConnection(connection)
+			b.clearConnecting(connection)
 			acBase.Warn("vpn connect failed", "error", err.Error())
 			return nil, err
 		}
 		cSess := connection.Session.CSess
 		if cSess == nil {
-			b.active = nil
+			b.clearConnecting(connection)
 			return nil, fmt.Errorf("vpn connect completed without a connection session")
 		}
-		b.connectionSeq++
-		cSess.ConnectionID = fmt.Sprintf("vpn-%d", b.connectionSeq)
+		b.mu.Lock()
+		if b.connecting != connection {
+			b.mu.Unlock()
+			_ = disconnectConnection(connection)
+			return nil, context.Canceled
+		}
+		cSess.ConnectionID = request.ConnectionID
+		b.mu.Unlock()
 		session := b.sessionInfo(cSess)
 		acBase.Info("vpn connect success", "server", session.ServerAddress, "tun", session.TUNName)
-		b.events <- vpn.Event{Type: "connected", ConnectionID: cSess.ConnectionID, Session: session}
-		if err := b.startUnderlayMonitor(cSess, cSess.ConnectionID); err != nil {
+		if err := b.startUnderlayMonitor(cSess, cSess.ConnectionID, request); err != nil {
 			acBase.Error("underlay monitor start failed:", err)
-			_ = connection.Disconnect(context.Background())
-			b.active = nil
+			_ = disconnectConnection(connection)
+			b.clearConnecting(connection)
 			return nil, fmt.Errorf("start underlay monitor: %w", err)
 		}
-		go b.monitorClose(cSess, cSess.ConnectionID)
+		b.mu.Lock()
+		if b.connecting != connection {
+			b.mu.Unlock()
+			b.stopMonitorFor(cSess.ConnectionID)
+			_ = disconnectConnection(connection)
+			return nil, context.Canceled
+		}
+		b.connecting = nil
+		b.active = connection
+		b.mu.Unlock()
+		b.events <- vpn.Event{Type: "connected", ConnectionID: cSess.ConnectionID, AttemptID: request.AttemptID, ProfileID: profile.ID, OwnerID: request.OwnerID, Session: session}
+		go b.monitorNetworkHealth(cSess, cSess.ConnectionID, request)
+		go b.monitorClose(cSess, cSess.ConnectionID, request)
 		return session, nil
 	}
 }
 
-func (b *Backend) monitorClose(cSess *acSession.ConnSession, connectionID string) {
+func (b *Backend) monitorNetworkHealth(cSess *acSession.ConnSession, connectionID string, request vpn.ConnectRequest) {
+	for {
+		select {
+		case <-cSess.CloseChan:
+			return
+		case err := <-cSess.NetworkErrors:
+			b.events <- vpn.Event{Type: "health", ConnectionID: connectionID, AttemptID: request.AttemptID, ProfileID: request.Profile.ID, OwnerID: request.OwnerID, Component: "route", Err: err}
+		}
+	}
+}
+
+func (b *Backend) clearConnecting(connection *acRPC.Connection) {
+	b.mu.Lock()
+	if b.connecting == connection {
+		b.connecting = nil
+	}
+	b.mu.Unlock()
+}
+
+func disconnectConnection(connection *acRPC.Connection) error {
+	if connection == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return connection.Disconnect(ctx)
+}
+
+func (b *Backend) monitorClose(cSess *acSession.ConnSession, connectionID string, request vpn.ConnectRequest) {
 	if cSess == nil || cSess.CloseChan == nil {
 		acBase.Warn("monitor close skipped: close channel missing")
 		return
@@ -119,22 +170,36 @@ func (b *Backend) monitorClose(cSess *acSession.ConnSession, connectionID string
 		faults = append(faults, vpn.TransportFault{Code: fault.Code, Transport: fault.Transport, Error: fault.Error, Time: fault.Time})
 	}
 	b.events <- vpn.Event{
-		Type: "disconnected", ConnectionID: connectionID,
+		Type: "disconnected", ConnectionID: connectionID, AttemptID: request.AttemptID, ProfileID: request.Profile.ID, OwnerID: request.OwnerID,
 		Close: &vpn.DisconnectInfo{Code: info.Code, Transport: info.Transport, Error: info.Error, Time: info.Time, TransportFaults: faults},
 	}
 }
 
 func (b *Backend) Disconnect(ctx context.Context) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	acBase.Info("vpn disconnect called")
-	b.stopUnderlayMonitor()
 	connection := b.active
+	connecting := b.connecting
 	b.active = nil
-	if connection != nil {
-		return connection.Disconnect(ctx)
+	b.connecting = nil
+	b.mu.Unlock()
+	b.stopUnderlayMonitor()
+	var firstErr error
+	if connecting != nil && connecting != connection {
+		if err := connecting.Disconnect(ctx); err != nil {
+			firstErr = err
+		}
 	}
-	return nil
+	if connection != nil {
+		if err := connection.Disconnect(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (b *Backend) Close(ctx context.Context) error {
+	return b.Disconnect(ctx)
 }
 
 func (b *Backend) SessionInfo() *types.SessionInfo {
@@ -228,7 +293,7 @@ func (b *Backend) runtimeDiagnostics(c *acSession.ConnSession) *types.RuntimeDia
 	return &types.RuntimeDiagnostics{Underlay: underlay, Tunnel: runtime}
 }
 
-func (b *Backend) startUnderlayMonitor(cSess *acSession.ConnSession, connectionID string) error {
+func (b *Backend) startUnderlayMonitor(cSess *acSession.ConnSession, connectionID string, request vpn.ConnectRequest) error {
 	b.monitorMu.Lock()
 	defer b.monitorMu.Unlock()
 	if b.monitor != nil {
@@ -252,14 +317,14 @@ func (b *Backend) startUnderlayMonitor(cSess *acSession.ConnSession, connectionI
 	b.monitor = monitor
 	b.monitorCancel = cancel
 	b.monitorID = connectionID
-	go b.watchUnderlay(ctx, monitor, connectionID)
+	go b.watchUnderlay(ctx, monitor, connectionID, request)
 	return nil
 }
 
-func (b *Backend) watchUnderlay(ctx context.Context, monitor osnet.Monitor, connectionID string) {
+func (b *Backend) watchUnderlay(ctx context.Context, monitor osnet.Monitor, connectionID string, request vpn.ConnectRequest) {
 	changes := monitor.Changes(ctx)
 	for change := range changes {
-		event := vpn.Event{Type: "network_change", ConnectionID: connectionID, Network: convertNetworkChange(change)}
+		event := vpn.Event{Type: "network_change", ConnectionID: connectionID, AttemptID: request.AttemptID, ProfileID: request.Profile.ID, OwnerID: request.OwnerID, Network: convertNetworkChange(change)}
 		select {
 		case b.events <- event:
 		case <-ctx.Done():
@@ -339,7 +404,12 @@ func (b *Backend) TunnelDialer(ctx context.Context) (vpn.TunnelDialer, error) {
 }
 
 func (b *Backend) activeSession() *acSession.ConnSession {
-	if b == nil || b.active == nil || b.active.Session == nil {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.active == nil || b.active.Session == nil {
 		return nil
 	}
 	return b.active.Session.CSess

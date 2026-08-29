@@ -7,9 +7,27 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 
 	wgtun "github.com/tailscale/wireguard-go/tun"
 )
+
+var networkJournalConfig struct {
+	sync.RWMutex
+	path string
+}
+
+func SetNetworkJournalPath(path string) {
+	networkJournalConfig.Lock()
+	networkJournalConfig.path = path
+	networkJournalConfig.Unlock()
+}
+
+func networkJournalPath() string {
+	networkJournalConfig.RLock()
+	defer networkJournalConfig.RUnlock()
+	return networkJournalConfig.path
+}
 
 type LocalInterface struct {
 	Name           string
@@ -53,7 +71,11 @@ func NewManager(dev wgtun.Device, fallbackName string) (Manager, error) {
 	if name == "" {
 		return nil, errors.New("missing TUN interface name")
 	}
-	return newPlatformManager(dev, name)
+	manager, err := newPlatformManager(dev, name)
+	if err != nil {
+		return nil, err
+	}
+	return wrapJournal(manager, networkJournalPath(), name), nil
 }
 
 func PrefixFromIPMask(ip, mask string) (netip.Prefix, error) {

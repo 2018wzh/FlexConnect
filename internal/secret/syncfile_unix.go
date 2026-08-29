@@ -2,27 +2,24 @@
 
 package secret
 
-import (
-	"errors"
-	"os"
-	"syscall"
-)
+import "os"
+
+func replaceAtomic(source, destination string) error { return os.Rename(source, destination) }
 
 // syncDir flushes directory metadata so a rename survives a crash on Unix.
-// Some filesystems (FUSE, network mounts) reject directory fsync with EINVAL;
-// the file-level fsync in saveLocked already covers the data, so those errors
-// are ignored to keep the fallback store usable everywhere.
+// Directory fsync errors are returned: the explicit plaintext store must not
+// claim a durable commit when the directory entry could still be lost.
 func syncDir(dir string) error {
 	f, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if err := f.Sync(); err != nil {
-		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return f.Sync()
 }
+
+func secureFile(path string) error {
+	return os.Chmod(path, 0o600)
+}
+
+func secureDir(path string) error { return os.Chmod(path, 0o700) }

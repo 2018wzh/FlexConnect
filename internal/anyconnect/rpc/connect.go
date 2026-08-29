@@ -2,7 +2,11 @@ package rpc
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -11,6 +15,7 @@ import (
 	"flexconnect/internal/anyconnect/session"
 	acvpn "flexconnect/internal/anyconnect/tunnel"
 	"flexconnect/internal/osnet"
+	"flexconnect/internal/vpn"
 )
 
 // disconnectDrainTimeout bounds how long a disconnect waits for the tunnel
@@ -38,7 +43,7 @@ func (c *Connection) Connect(ctx context.Context) error {
 		return fmt.Errorf("nil VPN connection context")
 	}
 	if err := refreshConnectionInterface(c, ctx); err != nil {
-		return err
+		return vpn.WrapConnectError("underlay", true, err)
 	}
 	if strings.Contains(c.Auth.Prof.Host, ":") {
 		c.Auth.Prof.HostWithPort = c.Auth.Prof.Host
@@ -46,17 +51,36 @@ func (c *Connection) Connect(ctx context.Context) error {
 		c.Auth.Prof.HostWithPort = c.Auth.Prof.Host + ":443"
 	}
 	if err := c.Auth.InitAuth(nil); err != nil {
-		return err
+		return vpn.WrapConnectError("tls", isTransientNetworkError(err), err)
 	}
 	if err := c.Auth.PasswordAuth(c.Session); err != nil {
 		_ = c.Auth.Close()
-		return err
+		return vpn.WrapConnectError("authentication", false, err)
 	}
 	if err := acvpn.SetupTunnelWithClient(c.Auth, c.Session); err != nil {
 		_ = c.Auth.Close()
-		return err
+		return vpn.WrapConnectError("tunnel", isTransientNetworkError(err), err)
 	}
 	return nil
+}
+
+func isTransientNetworkError(err error) bool {
+	var verificationErr *tls.CertificateVerificationError
+	var hostnameErr x509.HostnameError
+	var authorityErr x509.UnknownAuthorityError
+	var invalidErr x509.CertificateInvalidError
+	if errors.As(err, &verificationErr) || errors.As(err, &hostnameErr) || errors.As(err, &authorityErr) || errors.As(err, &invalidErr) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func (c *Connection) Disconnect(ctx context.Context) error {
@@ -86,6 +110,9 @@ func (c *Connection) Disconnect(ctx context.Context) error {
 			defer timer.Stop()
 			select {
 			case <-done:
+				if err := cSess.TunnelError(); err != nil && first == nil {
+					first = err
+				}
 			case <-ctx.Done():
 				if first == nil {
 					first = ctx.Err()

@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
+	"flexconnect/internal/osnet"
 	"flexconnect/internal/router"
 	storefile "flexconnect/internal/store/file"
 	"flexconnect/internal/updater"
@@ -90,11 +93,27 @@ func runDaemonReady(ctx context.Context, opts daemonOptions, ready chan<- error)
 	}
 	serverLog.Printf("elevation check passed")
 	serverLog.Printf("configuration backend=anyconnect custom_socket=%v custom_state=%v", opts.socket != ipc.DefaultSocketPath(), opts.state != defaultStatePath())
+	networkJournalPath := filepath.Join(filepath.Dir(opts.state), "network-ownership.json")
+	osnet.SetNetworkJournalPath(networkJournalPath)
+	if err := osnet.RecoverNetworkJournal(ctx, networkJournalPath); err != nil {
+		return err
+	}
 
 	service, err := newService(opts.state, opts.secretStore)
 	if err != nil {
 		return err
 	}
+	serviceClosed := false
+	defer func() {
+		if serviceClosed {
+			return
+		}
+		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if closeErr := service.Close(closeCtx); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 	serverLog.Printf("service initialized")
 	if err := bootstrapStartup(ctx, service, opts.startup); err != nil {
 		return err
@@ -114,7 +133,14 @@ func runDaemonReady(ctx context.Context, opts daemonOptions, ready chan<- error)
 	sendReady(nil)
 
 	server := &http.Server{
-		Handler:           apiserver.New(service).Handler(),
+		Handler: apiserver.New(service).Handler(),
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			identity, ok := ipc.IdentityFromConn(conn)
+			if !ok {
+				return ctx
+			}
+			return apiserver.WithActor(ctx, appd.Actor{ID: identity.ID, System: identity.System, Admin: identity.Elevated || identity.System})
+		},
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    32 * 1024,
@@ -130,15 +156,21 @@ func runDaemonReady(ctx context.Context, opts daemonOptions, ready chan<- error)
 	select {
 	case err := <-errCh:
 		return err
+	case fatalErr := <-service.FatalErrors():
+		return fatalErr
 	case <-ctx.Done():
 		serverLog.Printf("shutdown requested after %s", time.Since(startedAt))
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
+	if err := service.Close(shutdownCtx); err != nil {
+		return err
+	}
+	serviceClosed = true
 
 	select {
 	case err := <-errCh:

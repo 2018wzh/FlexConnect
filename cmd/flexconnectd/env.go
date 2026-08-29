@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"flexconnect/internal/appd"
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
 	"flexconnect/internal/secret"
@@ -38,11 +39,10 @@ type startupConfig struct {
 }
 
 type startupDaemon interface {
-	ListProfiles() []types.Profile
-	CreateProfile(types.Profile, string) (types.Profile, error)
-	UpdateProfile(string, types.ProfileUpdateRequest) (types.Profile, error)
-	SwitchProfile(context.Context, string) error
-	Connect(context.Context, string) error
+	ListProfilesFor(appd.Actor) ([]types.Profile, error)
+	CreateProfileFor(appd.Actor, types.ProfileCreateRequest) (types.Profile, error)
+	UpdateProfileFor(appd.Actor, string, types.ProfileUpdateRequest) (types.Profile, error)
+	SetControlMode(context.Context, appd.Actor, types.ControlModeRequest) error
 	Status() types.Status
 }
 
@@ -98,9 +98,10 @@ func parseStartupConfig(lookup envLookup) (*startupConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	profile := types.NewProfile(envStringDefault(lookup, "FLEXCONNECT_PROFILE_NAME", defaultStartupProfile))
-	profile.ID = envStringDefault(lookup, "FLEXCONNECT_PROFILE_ID", defaultStartupProfile)
-	profile.SecretRef = "profile/" + profile.ID
+	profile := types.Profile{
+		Name: envStringDefault(lookup, "FLEXCONNECT_PROFILE_NAME", defaultStartupProfile), Scope: types.ProfileScopeMachine, OwnerID: "system",
+		AcceptServerRoutes: true, AutoReconnect: types.BoolPtr(false), ApplyDNS: types.BoolPtr(true), SOCKS5Listen: "127.0.0.1:1080", MTU: 1399,
+	}
 	profile.ServerURL = envStringDefault(lookup, "FLEXCONNECT_SERVER", "")
 	profile.Username = envStringDefault(lookup, "FLEXCONNECT_USERNAME", "")
 	profile.Group = envStringDefault(lookup, "FLEXCONNECT_GROUP", "")
@@ -191,20 +192,23 @@ func bootstrapStartup(ctx context.Context, daemon startupDaemon, cfg *startupCon
 		return nil
 	}
 	profile := cfg.Profile
-	if profile.ID == "" {
-		return errors.New("startup profile id is required")
+	actor := appd.SystemActor()
+	profiles, err := daemon.ListProfilesFor(actor)
+	if err != nil {
+		return fmt.Errorf("list startup profiles: %w", err)
 	}
-	if profile.SecretRef == "" {
-		profile.SecretRef = "profile/" + profile.ID
-	}
-	existing := false
-	for _, p := range daemon.ListProfiles() {
-		if p.ID == profile.ID {
-			existing = true
-			break
+	var existing *types.Profile
+	for i := range profiles {
+		if profiles[i].Scope == types.ProfileScopeMachine && profiles[i].Name == profile.Name {
+			if existing != nil {
+				return fmt.Errorf("multiple machine profiles are named %q", profile.Name)
+			}
+			copy := profiles[i]
+			existing = &copy
 		}
 	}
-	if existing {
+	if existing != nil {
+		profile.ID = existing.ID
 		password := cfg.Password
 		req := types.ProfileUpdateRequest{
 			Name:               &profile.Name,
@@ -222,16 +226,20 @@ func bootstrapStartup(ctx context.Context, daemon startupDaemon, cfg *startupCon
 			MTU:                &profile.MTU,
 			Password:           &password,
 		}
-		if _, err := daemon.UpdateProfile(profile.ID, req); err != nil {
+		if _, err := daemon.UpdateProfileFor(actor, profile.ID, req); err != nil {
 			return fmt.Errorf("startup update profile %q: %w", profile.ID, err)
 		}
 	} else {
-		if _, err := daemon.CreateProfile(profile, cfg.Password); err != nil {
-			return fmt.Errorf("startup create profile %q: %w", profile.ID, err)
+		created, err := daemon.CreateProfileFor(actor, types.ProfileCreateRequest{
+			Name: profile.Name, ServerURL: profile.ServerURL, Username: profile.Username, Password: cfg.Password, Group: profile.Group,
+			Scope: types.ProfileScopeMachine, AcceptServerRoutes: &profile.AcceptServerRoutes, AutoReconnect: profile.AutoReconnect, ApplyDNS: profile.ApplyDNS,
+			CustomInclude: profile.CustomInclude, CustomExclude: profile.CustomExclude, DNSOverrides: profile.DNSOverrides,
+			SOCKS5Enabled: profile.SOCKS5Enabled, SOCKS5Listen: profile.SOCKS5Listen, MTU: profile.MTU,
+		})
+		if err != nil {
+			return fmt.Errorf("startup create machine profile: %w", err)
 		}
-	}
-	if err := daemon.SwitchProfile(ctx, profile.ID); err != nil {
-		return fmt.Errorf("startup switch profile %q: %w", profile.ID, err)
+		profile.ID = created.ID
 	}
 	connectCtx := ctx
 	cancel := func() {}
@@ -239,8 +247,12 @@ func bootstrapStartup(ctx context.Context, daemon startupDaemon, cfg *startupCon
 		connectCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
 	}
 	defer cancel()
-	if err := daemon.Connect(connectCtx, profile.ID); err != nil {
-		return fmt.Errorf("startup connect profile %q: %w", profile.ID, err)
+	if err := daemon.SetControlMode(connectCtx, actor, types.ControlModeRequest{Mode: "machine", ProfileID: profile.ID}); err != nil {
+		if daemon.Status().ControlMode != "machine" {
+			return fmt.Errorf("enter startup machine mode: %w", err)
+		}
+		logging.WithComponent("flexconnectd").Printf("startup machine connection failed and remains locked profile=%s err=%v", profile.ID, err)
+		return nil
 	}
 	if cfg.RequireSOCKS5 {
 		status := daemon.Status()
@@ -251,8 +263,8 @@ func bootstrapStartup(ctx context.Context, daemon startupDaemon, cfg *startupCon
 	return nil
 }
 
-// fileSecretPath derives the fallback secret file from the daemon state path,
-// so the secrets live next to state.json (for example
+// fileSecretPath derives an explicitly selected secret file from the daemon
+// state path, so the secrets live next to state.json (for example
 // /var/lib/flexconnect/secrets.json).
 func fileSecretPath(statePath string) string {
 	if strings.TrimSpace(statePath) == "" {
@@ -262,18 +274,14 @@ func fileSecretPath(statePath string) string {
 }
 
 // newSecretStore builds the secret.Store selected by kind. The default
-// "keyring" mode probes the OS keyring and automatically falls back to a file
-// secret store when no keyring is available, so the daemon still starts on
-// headless hosts.
+// "keyring" mode probes the OS keyring and fails fast if it is unavailable.
+// File storage is only enabled by an explicit FLEXCONNECT_SECRET_STORE=file.
 func newSecretStore(statePath, kind string) (secret.Store, error) {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "", "keyring":
 		ks := secret.NewKeyringStore(keyringService)
 		if err := ks.Probe(); err != nil {
-			path := fileSecretPath(statePath)
-			logging.WithComponent("flexconnectd").Warnf(
-				"OS keyring unavailable (%v); falling back to file secret store at %s", err, path)
-			return secret.NewFileStore(path), nil
+			return nil, fmt.Errorf("OS keyring unavailable: %w; explicitly set FLEXCONNECT_SECRET_STORE=file or memory if that storage mode is intended", err)
 		}
 		return ks, nil
 	case "file":

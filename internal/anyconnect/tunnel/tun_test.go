@@ -16,6 +16,8 @@ import (
 	"flexconnect/internal/anyconnect/proto"
 	"flexconnect/internal/anyconnect/session"
 	"flexconnect/internal/osnet"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	wgtun "github.com/tailscale/wireguard-go/tun"
 )
 
@@ -24,6 +26,103 @@ type testTUNDevice struct {
 	readErr   error
 	writeErr  error
 	closeOnce sync.Once
+}
+
+func dnsResponsePacket(t *testing.T, questions []layers.DNSQuestion, answers []layers.DNSResourceRecord) []byte {
+	t.Helper()
+	ip := &layers.IPv4{Version: 4, IHL: 5, TTL: 64, Protocol: layers.IPProtocolUDP, SrcIP: []byte{10, 0, 0, 53}, DstIP: []byte{10, 0, 0, 2}}
+	udp := &layers.UDP{SrcPort: 53, DstPort: 53000}
+	if err := udp.SetNetworkLayerForChecksum(ip); err != nil {
+		t.Fatal(err)
+	}
+	dns := &layers.DNS{ID: 1, QR: true, Questions: questions, Answers: answers, QDCount: uint16(len(questions)), ANCount: uint16(len(answers))}
+	buffer := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}, ip, udp, dns); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
+func TestDynamicRoutesValidateDomainBoundaryAndClampTTL(t *testing.T) {
+	cSess := (&session.Session{}).NewConnSession(&http.Header{})
+	cSess.DynamicSplitIncludeDomains = []string{"example.com"}
+	query := []byte("vpn.example.com")
+	packet := dnsResponsePacket(t, []layers.DNSQuestion{{Name: query, Type: layers.DNSTypeA, Class: layers.DNSClassIN}}, []layers.DNSResourceRecord{{Name: query, Type: layers.DNSTypeA, Class: layers.DNSClassIN, TTL: 1, IP: []byte{203, 0, 113, 10}}})
+	if !dynamicSplitRoutes(packet, cSess) {
+		t.Fatal("valid matching response was rejected")
+	}
+	value, ok := cSess.DynamicSplitIncludeResolved.Load("vpn.example.com")
+	if !ok {
+		t.Fatal("lease missing")
+	}
+	lease := value.(dynamicRouteLease)
+	remaining := time.Until(lease.ExpiresAt)
+	if remaining < minimumDynamicRouteTTL-time.Second || remaining > minimumDynamicRouteTTL+time.Second {
+		t.Fatalf("TTL = %s", remaining)
+	}
+
+	bad := []byte("notexample.com")
+	packet = dnsResponsePacket(t, []layers.DNSQuestion{{Name: bad, Type: layers.DNSTypeA, Class: layers.DNSClassIN}}, []layers.DNSResourceRecord{{Name: bad, Type: layers.DNSTypeA, Class: layers.DNSClassIN, TTL: 60, IP: []byte{198, 51, 100, 1}}})
+	if dynamicSplitRoutes(packet, cSess) {
+		t.Fatal("non-label suffix matched")
+	}
+}
+
+func TestDynamicRoutesRejectAnswerForUnrelatedNameAndZeroQuestion(t *testing.T) {
+	cSess := (&session.Session{}).NewConnSession(&http.Header{})
+	cSess.DynamicSplitIncludeDomains = []string{"example.com"}
+	query := []byte("vpn.example.com")
+	unrelated := []byte("attacker.example")
+	packet := dnsResponsePacket(t, []layers.DNSQuestion{{Name: query, Type: layers.DNSTypeA, Class: layers.DNSClassIN}}, []layers.DNSResourceRecord{{Name: unrelated, Type: layers.DNSTypeA, Class: layers.DNSClassIN, TTL: 60, IP: []byte{203, 0, 113, 10}}})
+	if dynamicSplitRoutes(packet, cSess) {
+		t.Fatal("unrelated answer was accepted")
+	}
+	if dynamicSplitRoutes(dnsResponsePacket(t, nil, nil), cSess) {
+		t.Fatal("zero-question response was accepted")
+	}
+}
+
+func TestDynamicRoutesRejectUnsupportedQuestionAndLimitOverflow(t *testing.T) {
+	cSess := (&session.Session{}).NewConnSession(&http.Header{})
+	cSess.DynamicSplitIncludeDomains = []string{"example.com"}
+	query := []byte("vpn.example.com")
+	packet := dnsResponsePacket(t, []layers.DNSQuestion{{Name: query, Type: layers.DNSTypeAAAA, Class: layers.DNSClassIN}}, nil)
+	if dynamicSplitRoutes(packet, cSess) {
+		t.Fatal("AAAA question was accepted by the IPv4 route reconciler")
+	}
+	for i := 0; i < maximumDynamicRoutes; i++ {
+		addr := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
+		cSess.DynamicSplitIncludeResolved.Store(addr.String(), dynamicRouteLease{Addresses: []string{addr.String()}, ExpiresAt: time.Now().Add(time.Minute)})
+	}
+	packet = dnsResponsePacket(t,
+		[]layers.DNSQuestion{{Name: query, Type: layers.DNSTypeA, Class: layers.DNSClassIN}},
+		[]layers.DNSResourceRecord{{Name: query, Type: layers.DNSTypeA, Class: layers.DNSClassIN, TTL: 60, IP: []byte{203, 0, 113, 10}}},
+	)
+	if dynamicSplitRoutes(packet, cSess) {
+		t.Fatal("route beyond the configured limit was accepted")
+	}
+	select {
+	case err := <-cSess.NetworkErrors:
+		if err == nil {
+			t.Fatal("route limit published healthy status")
+		}
+	default:
+		t.Fatal("route limit was not published to health")
+	}
+}
+
+func TestDynamicRouteExpiryPreservesSharedAddress(t *testing.T) {
+	cSess := (&session.Session{}).NewConnSession(&http.Header{})
+	shared := "203.0.113.10"
+	cSess.DynamicSplitIncludeResolved.Store("expired.example", dynamicRouteLease{Addresses: []string{shared}, ExpiresAt: time.Now().Add(-time.Second)})
+	cSess.DynamicSplitIncludeResolved.Store("active.example", dynamicRouteLease{Addresses: []string{shared}, ExpiresAt: time.Now().Add(time.Minute)})
+	if !expireDynamicRoutes(cSess, time.Now()) {
+		t.Fatal("expired lease was not removed")
+	}
+	routes := collectDynamicRoutes(cSess)
+	if len(routes.Include) != 1 || routes.Include[0].String() != shared {
+		t.Fatalf("shared active address was removed: %+v", routes.Include)
+	}
 }
 
 func newTestTUNDevice() *testTUNDevice {

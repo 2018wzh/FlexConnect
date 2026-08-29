@@ -82,10 +82,10 @@ func statusItems(status *types.Status, profiles []types.Profile) []menuItemModel
 	if status == nil {
 		return items
 	}
-	if status.CurrentProfileID != "" {
-		items = append(items, disabledItem("Current Profile: "+profileNameByID(profiles, status.CurrentProfileID)))
+	if status.SelectedProfileID != "" {
+		items = append(items, disabledItem("Selected Profile: "+profileNameByID(profiles, status.SelectedProfileID)))
 	}
-	if status.ConnectedProfileID != "" && status.ConnectedProfileID != status.CurrentProfileID {
+	if status.ConnectedProfileID != "" && status.ConnectedProfileID != status.SelectedProfileID {
 		items = append(items, disabledItem("Connected Profile: "+profileNameByID(profiles, status.ConnectedProfileID)))
 	}
 	if status.LastError != "" {

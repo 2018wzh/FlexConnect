@@ -2,18 +2,52 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"net"
 
 	"flexconnect/internal/types"
 )
 
+type ConnectError struct {
+	Stage     string
+	Retryable bool
+	Err       error
+}
+
+func (e *ConnectError) Error() string { return e.Stage + ": " + e.Err.Error() }
+func (e *ConnectError) Unwrap() error { return e.Err }
+
+func WrapConnectError(stage string, retryable bool, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ConnectError{Stage: stage, Retryable: retryable, Err: err}
+}
+
+func IsRetryable(err error) bool {
+	var connectErr *ConnectError
+	return errors.As(err, &connectErr) && connectErr.Retryable
+}
+
 type Event struct {
 	Type         string
 	ConnectionID string
+	AttemptID    string
+	ProfileID    string
+	OwnerID      string
 	Session      *types.SessionInfo
 	Err          error
 	Close        *DisconnectInfo
 	Network      *NetworkChange
+	Component    string
+}
+
+type ConnectRequest struct {
+	Profile      types.Profile
+	Password     string
+	AttemptID    string
+	ConnectionID string
+	OwnerID      string
 }
 
 type NetworkSnapshot struct {
@@ -50,8 +84,9 @@ type TransportFault struct {
 }
 
 type Backend interface {
-	Connect(context.Context, types.Profile, string) (*types.SessionInfo, error)
+	Connect(context.Context, ConnectRequest) (*types.SessionInfo, error)
 	Disconnect(context.Context) error
+	Close(context.Context) error
 	SessionInfo() *types.SessionInfo
 	Traffic() *types.TrafficStats
 	ReadServerConfig() map[string]any

@@ -67,4 +67,3 @@ func SetIPv4DestinationPort(packet []byte, port uint16) {
 	payload[2] = byte(port >> 8)
 	payload[3] = byte(port & 0xFF)
 }
-

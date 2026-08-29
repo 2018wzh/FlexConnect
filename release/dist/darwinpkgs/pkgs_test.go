@@ -3,6 +3,7 @@ package darwinpkgs
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -127,8 +128,8 @@ func TestPkgTargetBuildWithFakeTools(t *testing.T) {
 	if err := os.MkdirAll(toolsDir, 0o755); err != nil {
 		t.Fatalf("mkdir tools: %v", err)
 	}
-	writeBatch(t, filepath.Join(toolsDir, "pkgbuild.cmd"), "@echo off\r\nset out=\r\nfor %%I in (%*) do set out=%%~I\r\necho pkgbuild %*>\"%out%\"\r\n")
-	writeBatch(t, filepath.Join(toolsDir, "productbuild.cmd"), "@echo off\r\nset out=\r\nfor %%I in (%*) do set out=%%~I\r\necho productbuild %*>\"%out%\"\r\n")
+	writeFakePkgTool(t, toolsDir, "pkgbuild")
+	writeFakePkgTool(t, toolsDir, "productbuild")
 
 	oldPath := os.Getenv("PATH")
 	t.Setenv("PATH", toolsDir+string(os.PathListSeparator)+oldPath)
@@ -178,9 +179,15 @@ func writeTempFile(t *testing.T, dir, name, content string) string {
 	return path
 }
 
-func writeBatch(t *testing.T, path, content string) {
+func writeFakePkgTool(t *testing.T, dir, name string) {
 	t.Helper()
+	path := filepath.Join(dir, name)
+	content := "#!/bin/sh\nfor out do :; done\nprintf '%s\\n' \"$0 $*\" > \"$out\"\n"
+	if runtime.GOOS == "windows" {
+		path += ".cmd"
+		content = "@echo off\r\nset out=\r\nfor %%I in (%*) do set out=%%~I\r\necho " + name + " %*>\"%out%\"\r\n"
+	}
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
-		t.Fatalf("write batch %s: %v", path, err)
+		t.Fatalf("write fake %s tool: %v", name, err)
 	}
 }

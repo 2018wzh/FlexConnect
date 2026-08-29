@@ -48,19 +48,19 @@ type MonitorOptions struct {
 }
 
 type underlayMonitor struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	changes  chan UnderlayChange
-	trigger  chan struct{}
-	notifier io.Closer
-	snapshot func(context.Context) (UnderlaySnapshot, error)
-	interval time.Duration
-	debounce time.Duration
+	ctx         context.Context
+	cancel      context.CancelFunc
+	changes     chan UnderlayChange
+	trigger     chan struct{}
+	notifier    io.Closer
+	snapshot    func(context.Context) (UnderlaySnapshot, error)
+	interval    time.Duration
+	debounce    time.Duration
 	notifierErr error
-	mu       sync.RWMutex
-	current  UnderlaySnapshot
-	closed   bool
-	once     sync.Once
+	mu          sync.RWMutex
+	current     UnderlaySnapshot
+	closed      bool
+	once        sync.Once
 }
 
 func NewMonitor(ctx context.Context, opts MonitorOptions) (Monitor, error) {

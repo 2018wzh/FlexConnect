@@ -23,7 +23,7 @@ func TestCompareVersions(t *testing.T) {
 		{"1.0", "1.0.0", 0},
 		{"v1.0.6", "1.0.6", 0},
 		{"1.0.7-rc1", "1.0.6", 1},
-		{"1.0.6-rc1", "1.0.6", 0},
+		{"1.0.6-rc1", "1.0.6", -1},
 		{"2.0.0", "1.9.9", 1},
 	}
 	for _, tc := range cases {
@@ -87,7 +87,7 @@ func TestCheckParsesLatestRelease(t *testing.T) {
 	if info.CurrentVersion != buildinfo.Version {
 		t.Errorf("CurrentVersion = %q, want %q", info.CurrentVersion, buildinfo.Version)
 	}
-	// 9.9.9 is newer than the current build version (1.2.4).
+	// 9.9.9 is newer than the current build version.
 	if !info.UpdateAvailable {
 		t.Error("expected UpdateAvailable=true")
 	}

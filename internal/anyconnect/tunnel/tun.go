@@ -2,11 +2,13 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/netip"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"flexconnect/internal/anyconnect/base"
@@ -146,7 +148,7 @@ func tunToPayloadOut(dev wgtun.Device, cSess *session.ConnSession) {
 	for {
 		// 从池子申请一块内存，存放到 PayloadOutTLS 或 PayloadOutDTLS，在 payloadOutTLSToServer 或 payloadOutDTLSToServer 中释放
 		// 由 payloadOutTLSToServer 或 payloadOutDTLSToServer 添加 header 后发送出去
-		pl := getPayloadBuffer()
+		pl := getPayloadBuffer(cSess.MTU)
 		bufs := [][]byte{pl.Data}
 		sizes := []int{0}
 		readCount, err := dev.Read(bufs, sizes, offset) // 如果 tun 没有 up，会在这等待
@@ -240,11 +242,13 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 		if cSess.DynamicSplitTunneling {
 			_, srcPort, _, _ := utils.ResolvePacket(pl.Data)
 			if srcPort == 53 {
-				// The payload buffer returns to a sync.Pool immediately after the
-				// TUN write. Give the asynchronous DNS parser an owned snapshot so
-				// a later packet cannot overwrite the bytes it is still parsing.
 				data := append([]byte(nil), pl.Data...)
-				go dynamicSplitRoutes(data, cSess)
+				select {
+				case cSess.DynamicRoutePackets <- data:
+				case <-cSess.CloseChan:
+					putPayloadBuffer(pl)
+					return
+				}
 			}
 		}
 		// base.Debug("payloadInToTun")
@@ -286,54 +290,205 @@ func payloadInToTun(dev wgtun.Device, cSess *session.ConnSession) {
 	}
 }
 
-func dynamicSplitRoutes(data []byte, cSess *session.ConnSession) {
-	packet := gopacket.NewPacket(data, layers.LayerTypeIPv4, gopacket.Default)
-	dnsLayer := packet.Layer(layers.LayerTypeDNS)
-	if dnsLayer != nil {
-		dns, _ := dnsLayer.(*layers.DNS)
+const (
+	minimumDynamicRouteTTL = 30 * time.Second
+	maximumDynamicRouteTTL = time.Hour
+	maximumDynamicRoutes   = 4096
+)
 
-		query := string(dns.Questions[0].Name)
-		// base.Debug("Query:", query)
+type dynamicRouteLease struct {
+	Addresses []string
+	ExpiresAt time.Time
+}
 
-		if utils.InArrayGeneric(cSess.DynamicSplitIncludeDomains, query) {
-			// 分析流量后才知道请求的域名，即使已经设置路由，仍然需要分析流量，不可避免的 overhead
-			if _, ok := cSess.DynamicSplitIncludeResolved.Load(query); !ok && dns.ANCount > 0 {
-				var answers []string
-				for _, v := range dns.Answers {
-					// log.Printf("DNS Answer: %+v", v)
-					if v.Type == layers.DNSTypeA {
-						// fmt.Println("Name:", string(v.Name)) // cname, canonical name
-						// base.Debug("Address:", v.IP.String())
-						answers = append(answers, v.IP.String())
-					}
-				}
-				if len(answers) > 0 {
-					cSess.DynamicSplitIncludeResolved.Store(query, answers)
-					if cSess.NetworkManager != nil {
-						_ = cSess.NetworkManager.SetDynamicRoutes(context.Background(), collectDynamicRoutes(cSess))
-					}
-				}
+func dynamicRouteWorker(cSess *session.ConnSession, stop <-chan struct{}) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-cSess.CloseChan:
+			return
+		case data := <-cSess.DynamicRoutePackets:
+			if dynamicSplitRoutes(data, cSess) {
+				reconcileDynamicRoutes(cSess)
 			}
-		} else if utils.InArrayGeneric(cSess.DynamicSplitExcludeDomains, query) {
-			if _, ok := cSess.DynamicSplitExcludeResolved.Load(query); !ok && dns.ANCount > 0 {
-				var answers []string
-				for _, v := range dns.Answers {
-					// log.Printf("DNS Answer: %+v", v)
-					if v.Type == layers.DNSTypeA {
-						// fmt.Println("Name:", string(v.Name)) // cname, canonical name
-						// base.Debug("Address:", v.IP.String())
-						answers = append(answers, v.IP.String())
-					}
-				}
-				if len(answers) > 0 {
-					cSess.DynamicSplitExcludeResolved.Store(query, answers)
-					if cSess.NetworkManager != nil {
-						_ = cSess.NetworkManager.SetDynamicRoutes(context.Background(), collectDynamicRoutes(cSess))
-					}
-				}
+		case now := <-ticker.C:
+			if expireDynamicRoutes(cSess, now) {
+				reconcileDynamicRoutes(cSess)
 			}
 		}
 	}
+}
+
+func dynamicSplitRoutes(data []byte, cSess *session.ConnSession) bool {
+	packet := gopacket.NewPacket(data, layers.LayerTypeIPv4, gopacket.Default)
+	dnsLayer := packet.Layer(layers.LayerTypeDNS)
+	if dnsLayer == nil {
+		return false
+	}
+	dns, ok := dnsLayer.(*layers.DNS)
+	if !ok || !dns.QR || len(dns.Questions) != 1 {
+		return false
+	}
+	question := dns.Questions[0]
+	if question.Type != layers.DNSTypeA || question.Class != layers.DNSClassIN {
+		return false
+	}
+	query, ok := normalizeDNSName(question.Name)
+	if !ok {
+		cSess.RecordTransportFault("dynamic_route_dns_invalid", "network", errors.New("invalid DNS question name"))
+		return false
+	}
+	include := utils.InArrayGeneric(cSess.DynamicSplitIncludeDomains, query)
+	exclude := !include && utils.InArrayGeneric(cSess.DynamicSplitExcludeDomains, query)
+	if !include && !exclude {
+		return false
+	}
+	addresses := make([]string, 0, len(dns.Answers))
+	allowedNames := map[string]bool{query: true}
+	for _, answer := range dns.Answers {
+		if answer.Class != layers.DNSClassIN {
+			continue
+		}
+		name, valid := normalizeDNSName(answer.Name)
+		if !valid || !allowedNames[name] || answer.Type != layers.DNSTypeCNAME {
+			continue
+		}
+		target, valid := normalizeDNSName(answer.CNAME)
+		if valid {
+			allowedNames[target] = true
+		}
+	}
+	ttl := maximumDynamicRouteTTL
+	for _, answer := range dns.Answers {
+		if answer.Class != layers.DNSClassIN || answer.Type != layers.DNSTypeA || answer.IP == nil {
+			continue
+		}
+		name, valid := normalizeDNSName(answer.Name)
+		if !valid || !allowedNames[name] {
+			continue
+		}
+		addr, ok := netip.AddrFromSlice(answer.IP)
+		if !ok || !addr.Unmap().Is4() {
+			continue
+		}
+		addresses = append(addresses, addr.Unmap().String())
+		answerTTL := time.Duration(answer.TTL) * time.Second
+		if answerTTL < ttl {
+			ttl = answerTTL
+		}
+	}
+	if len(addresses) == 0 {
+		return false
+	}
+	if ttl < minimumDynamicRouteTTL {
+		ttl = minimumDynamicRouteTTL
+	}
+	if ttl > maximumDynamicRouteTTL {
+		ttl = maximumDynamicRouteTTL
+	}
+	if prospectiveDynamicRouteCount(cSess, query, addresses) > maximumDynamicRoutes {
+		err := fmt.Errorf("dynamic route limit %d exceeded", maximumDynamicRoutes)
+		cSess.RecordTransportFault("dynamic_route_limit", "network", err)
+		recordNetworkHealth(cSess, err)
+		return false
+	}
+	lease := dynamicRouteLease{Addresses: addresses, ExpiresAt: time.Now().Add(ttl)}
+	target := &cSess.DynamicSplitIncludeResolved
+	if exclude {
+		target = &cSess.DynamicSplitExcludeResolved
+	}
+	target.Store(query, lease)
+	return true
+}
+
+func normalizeDNSName(raw []byte) (string, bool) {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(string(raw))), ".")
+	if name == "" || len(name) > 253 {
+		return "", false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+				return "", false
+			}
+		}
+	}
+	return name, true
+}
+
+func prospectiveDynamicRouteCount(cSess *session.ConnSession, query string, addresses []string) int {
+	unique := map[string]bool{}
+	for _, table := range []*sync.Map{&cSess.DynamicSplitIncludeResolved, &cSess.DynamicSplitExcludeResolved} {
+		table.Range(func(key, value any) bool {
+			if keyString, _ := key.(string); keyString == query {
+				return true
+			}
+			for _, addr := range parseDynamicAddrs(value) {
+				unique[addr.String()] = true
+			}
+			return true
+		})
+	}
+	for _, addr := range addresses {
+		unique[addr] = true
+	}
+	return len(unique)
+}
+
+func reconcileDynamicRoutes(cSess *session.ConnSession) {
+	if cSess.NetworkManager == nil {
+		return
+	}
+	if err := cSess.NetworkManager.SetDynamicRoutes(context.Background(), collectDynamicRoutes(cSess)); err != nil {
+		cSess.RecordTransportFault("dynamic_route_reconcile", "network", err)
+		base.Error("dynamic route reconciliation failed:", err)
+		recordNetworkHealth(cSess, err)
+		return
+	}
+	recordNetworkHealth(cSess, nil)
+}
+
+func recordNetworkHealth(cSess *session.ConnSession, err error) {
+	if cSess == nil || cSess.NetworkErrors == nil {
+		return
+	}
+	for {
+		select {
+		case cSess.NetworkErrors <- err:
+			return
+		default:
+		}
+		select {
+		case <-cSess.NetworkErrors:
+		default:
+		}
+	}
+}
+
+func expireDynamicRoutes(cSess *session.ConnSession, now time.Time) bool {
+	changed := false
+	for _, table := range []*sync.Map{&cSess.DynamicSplitIncludeResolved, &cSess.DynamicSplitExcludeResolved} {
+		table.Range(func(key, value any) bool {
+			lease, ok := value.(dynamicRouteLease)
+			if ok && !lease.ExpiresAt.After(now) {
+				table.Delete(key)
+				changed = true
+			}
+			return true
+		})
+	}
+	return changed
+}
+
+func dynamicRouteAddressCount(cSess *session.ConnSession) int {
+	routes := collectDynamicRoutes(cSess)
+	return len(routes.Include) + len(routes.Exclude)
 }
 
 func buildOSNetConfig(cSess *session.ConnSession) (*osnet.Config, error) {
@@ -428,8 +583,13 @@ func collectDynamicRoutes(cSess *session.ConnSession) osnet.DynamicRoutes {
 }
 
 func parseDynamicAddrs(value any) []netip.Addr {
-	raw, ok := value.([]string)
-	if !ok {
+	var raw []string
+	switch value := value.(type) {
+	case []string:
+		raw = value
+	case dynamicRouteLease:
+		raw = value.Addresses
+	default:
 		return nil
 	}
 	addrs, _ := osnet.ParseAddrs(raw)

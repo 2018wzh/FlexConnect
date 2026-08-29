@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"flexconnect/internal/appd"
 	"github.com/zalando/go-keyring"
 
 	"flexconnect/internal/secret"
@@ -92,7 +93,6 @@ func TestParseStartupProfileFromEnv(t *testing.T) {
 	}
 	env := mapEnv{
 		"FLEXCONNECT_CONNECT_ON_START":     "true",
-		"FLEXCONNECT_PROFILE_ID":           "corp",
 		"FLEXCONNECT_PROFILE_NAME":         "Corp VPN",
 		"FLEXCONNECT_SERVER":               "vpn.example.test",
 		"FLEXCONNECT_USERNAME":             "alice",
@@ -132,7 +132,7 @@ func TestParseStartupProfileFromEnv(t *testing.T) {
 		t.Fatal("RequireSOCKS5 should be true")
 	}
 	profile := boot.Profile
-	if profile.ID != "corp" || profile.Name != "Corp VPN" || profile.ServerURL != "vpn.example.test" || profile.Username != "alice" || profile.Group != "employees" {
+	if profile.ID != "" || profile.Name != "Corp VPN" || profile.ServerURL != "vpn.example.test" || profile.Username != "alice" || profile.Group != "employees" || profile.Scope != types.ProfileScopeMachine {
 		t.Fatalf("profile identity = %+v", profile)
 	}
 	if profile.AcceptServerRoutes {
@@ -236,20 +236,17 @@ func TestBootstrapStartupCreatesAndConnectsProfile(t *testing.T) {
 	if len(daemon.created) != 1 {
 		t.Fatalf("created count = %d", len(daemon.created))
 	}
-	if daemon.created[0].ID != "docker" || daemon.createdPassword != "secret" {
+	if daemon.created[0].ID != "generated-profile" || daemon.createdPassword != "secret" {
 		t.Fatalf("created = %+v password=%q", daemon.created[0], daemon.createdPassword)
 	}
-	if daemon.switchedID != "docker" {
-		t.Fatalf("switchedID = %q", daemon.switchedID)
-	}
-	if daemon.connectedID != "docker" {
+	if daemon.connectedID != "generated-profile" {
 		t.Fatalf("connectedID = %q", daemon.connectedID)
 	}
 }
 
 func TestBootstrapStartupUpdatesExistingProfile(t *testing.T) {
 	daemon := &fakeStartupDaemon{
-		profiles: []types.Profile{{ID: "docker", Name: "old", SecretRef: "profile/docker"}},
+		profiles: []types.Profile{{ID: "docker", Name: "new", Scope: types.ProfileScopeMachine, SecretRef: "profile/docker"}},
 		status:   types.Status{SOCKS5Enabled: true, SOCKS5Listen: "0.0.0.0:1080"},
 	}
 	boot := &startupConfig{
@@ -289,7 +286,7 @@ func TestBootstrapStartupUpdatesExistingProfile(t *testing.T) {
 	}
 }
 
-func TestBootstrapStartupReturnsConnectError(t *testing.T) {
+func TestBootstrapStartupKeepsMachineModeLockedAfterConnectError(t *testing.T) {
 	daemon := &fakeStartupDaemon{connectErr: errors.New("vpn failed")}
 	boot := &startupConfig{
 		ConnectOnStart: true,
@@ -298,12 +295,11 @@ func TestBootstrapStartupReturnsConnectError(t *testing.T) {
 		ConnectTimeout: time.Second,
 	}
 
-	err := bootstrapStartup(context.Background(), daemon, boot)
-	if err == nil {
-		t.Fatal("bootstrapStartup succeeded")
+	if err := bootstrapStartup(context.Background(), daemon, boot); err != nil {
+		t.Fatalf("bootstrapStartup: %v", err)
 	}
-	if !strings.Contains(err.Error(), "vpn failed") {
-		t.Fatalf("error = %q", err)
+	if daemon.status.ControlMode != "machine" {
+		t.Fatalf("control mode = %q", daemon.status.ControlMode)
 	}
 }
 
@@ -339,25 +335,17 @@ func TestNewSecretStoreUsesKeyringWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestNewSecretStoreFallsBackToFileWhenKeyringUnavailable(t *testing.T) {
+func TestNewSecretStoreFailsWhenKeyringUnavailable(t *testing.T) {
 	keyring.MockInitWithError(errors.New("no secret service available"))
 	defer keyring.MockInit()
 
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	store, err := newSecretStore(statePath, "keyring")
-	if err != nil {
-		t.Fatalf("newSecretStore: %v", err)
+	if err == nil {
+		t.Fatalf("newSecretStore = %T, want keyring error", store)
 	}
-	fileStore, ok := store.(*secret.FileStore)
-	if !ok {
-		t.Fatalf("store = %T, want *secret.FileStore", store)
-	}
-	// The fallback store must be fully functional.
-	if err := fileStore.Put("profile/corp", "pw"); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if got, err := fileStore.Get("profile/corp"); err != nil || got != "pw" {
-		t.Fatalf("Get = %q, %v", got, err)
+	if !strings.Contains(err.Error(), "OS keyring unavailable") {
+		t.Fatalf("newSecretStore error = %v", err)
 	}
 }
 
@@ -408,23 +396,23 @@ type fakeStartupDaemon struct {
 	createdPassword string
 	updatedID       string
 	updatedReq      types.ProfileUpdateRequest
-	switchedID      string
 	connectedID     string
 	connectErr      error
 }
 
-func (d *fakeStartupDaemon) ListProfiles() []types.Profile {
-	return append([]types.Profile(nil), d.profiles...)
+func (d *fakeStartupDaemon) ListProfilesFor(appd.Actor) ([]types.Profile, error) {
+	return append([]types.Profile(nil), d.profiles...), nil
 }
 
-func (d *fakeStartupDaemon) CreateProfile(profile types.Profile, password string) (types.Profile, error) {
+func (d *fakeStartupDaemon) CreateProfileFor(_ appd.Actor, req types.ProfileCreateRequest) (types.Profile, error) {
+	profile := types.Profile{ID: "generated-profile", Name: req.Name, ServerURL: req.ServerURL, Username: req.Username, Group: req.Group, Scope: req.Scope, OwnerID: "system", AcceptServerRoutes: types.BoolValue(req.AcceptServerRoutes, true), AutoReconnect: req.AutoReconnect, ApplyDNS: req.ApplyDNS, CustomInclude: req.CustomInclude, CustomExclude: req.CustomExclude, DNSOverrides: req.DNSOverrides, SOCKS5Enabled: req.SOCKS5Enabled, SOCKS5Listen: req.SOCKS5Listen, MTU: req.MTU}
 	d.created = append(d.created, profile)
-	d.createdPassword = password
+	d.createdPassword = req.Password
 	d.profiles = append(d.profiles, profile)
 	return profile, nil
 }
 
-func (d *fakeStartupDaemon) UpdateProfile(id string, req types.ProfileUpdateRequest) (types.Profile, error) {
+func (d *fakeStartupDaemon) UpdateProfileFor(_ appd.Actor, id string, req types.ProfileUpdateRequest) (types.Profile, error) {
 	d.updatedID = id
 	d.updatedReq = req
 	for i := range d.profiles {
@@ -474,16 +462,12 @@ func (d *fakeStartupDaemon) UpdateProfile(id string, req types.ProfileUpdateRequ
 	return types.Profile{}, errors.New("profile not found")
 }
 
-func (d *fakeStartupDaemon) SwitchProfile(_ context.Context, id string) error {
-	d.switchedID = id
-	return nil
-}
-
-func (d *fakeStartupDaemon) Connect(ctx context.Context, id string) error {
+func (d *fakeStartupDaemon) SetControlMode(ctx context.Context, _ appd.Actor, req types.ControlModeRequest) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	d.connectedID = id
+	d.connectedID = req.ProfileID
+	d.status.ControlMode = req.Mode
 	return d.connectErr
 }
 

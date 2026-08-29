@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
 
 	wgtun "github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/sys/windows"
@@ -18,6 +19,7 @@ type luidProvider interface {
 }
 
 type platformManager struct {
+	mu           sync.Mutex
 	name         string
 	tunLUID      winipcfg.LUID
 	gatewayLUID  winipcfg.LUID
@@ -58,6 +60,8 @@ func (m *platformManager) Set(ctx context.Context, cfg *Config) error {
 	if cfg == nil || !cfg.VPNAddress.IsValid() {
 		return m.Close(ctx)
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if cfg.Gateway.IsValid() {
 		m.gateway = cfg.Gateway
 	}
@@ -103,6 +107,8 @@ func (m *platformManager) Set(ctx context.Context, cfg *Config) error {
 }
 
 func (m *platformManager) SetDynamicRoutes(_ context.Context, routes DynamicRoutes) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.syncRoutes(&m.dynamicIn, addrsToHostPrefixes(routes.Include), m.tunLUID, netip.IPv4Unspecified(), 6); err != nil {
 		return err
 	}
@@ -110,21 +116,24 @@ func (m *platformManager) SetDynamicRoutes(_ context.Context, routes DynamicRout
 }
 
 func (m *platformManager) Close(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var firstErr error
 	groups := []struct {
 		routes *map[netip.Prefix]bool
 		luid   winipcfg.LUID
 		next   netip.Addr
+		metric uint32
 	}{
-		{&m.serverRoutes, m.gatewayLUID, m.gateway},
-		{&m.routes, m.tunLUID, netip.IPv4Unspecified()},
-		{&m.exclude, m.gatewayLUID, m.gateway},
-		{&m.dynamicIn, m.tunLUID, netip.IPv4Unspecified()},
-		{&m.dynamicEx, m.gatewayLUID, m.gateway},
+		{&m.serverRoutes, m.gatewayLUID, m.gateway, 5},
+		{&m.routes, m.tunLUID, netip.IPv4Unspecified(), 6},
+		{&m.exclude, m.gatewayLUID, m.gateway, 5},
+		{&m.dynamicIn, m.tunLUID, netip.IPv4Unspecified(), 6},
+		{&m.dynamicEx, m.gatewayLUID, m.gateway, 5},
 	}
 	for _, group := range groups {
 		for prefix := range *group.routes {
-			if err := deleteRoute(group.luid, prefix, group.next); err != nil && firstErr == nil {
+			if err := deleteRoute(group.luid, prefix, group.next, group.metric); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
@@ -145,26 +154,47 @@ func (m *platformManager) syncRoutes(old *map[netip.Prefix]bool, next []netip.Pr
 		return fmt.Errorf("missing interface LUID for route sync")
 	}
 	add, del, state := DiffPrefixes(*old, next)
-	for _, prefix := range del {
-		if err := deleteRoute(luid, prefix, nextHop); err != nil {
-			return err
-		}
+	owned := make(map[netip.Prefix]bool, len(*old))
+	for prefix := range *old {
+		owned[prefix] = true
 	}
 	for _, prefix := range add {
-		if err := luid.AddRoute(prefix, nextHop, metric); err != nil && !isNotFoundOrExists(err) {
+		if err := luid.AddRoute(prefix, nextHop, metric); err != nil {
+			*old = owned
+			if isAlreadyExists(err) {
+				return fmt.Errorf("route %s already exists and is not owned by this connection", prefix)
+			}
 			return err
 		}
+		owned[prefix] = true
+	}
+	for _, prefix := range del {
+		if err := deleteRoute(luid, prefix, nextHop, metric); err != nil {
+			*old = owned
+			return err
+		}
+		delete(owned, prefix)
 	}
 	*old = state
 	return nil
 }
 
-func deleteRoute(luid winipcfg.LUID, prefix netip.Prefix, nextHop netip.Addr) error {
+func deleteRoute(luid winipcfg.LUID, prefix netip.Prefix, nextHop netip.Addr, expectedMetric uint32) error {
 	if luid == 0 {
 		return fmt.Errorf("missing interface LUID for route cleanup %s", prefix)
 	}
-	err := luid.DeleteRoute(prefix, nextHop)
-	if isNotFoundOrExists(err) {
+	row, err := luid.Route(prefix, nextHop)
+	if errors.Is(err, windows.ERROR_NOT_FOUND) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if row.Metric != expectedMetric {
+		return nil
+	}
+	err = row.Delete()
+	if errors.Is(err, windows.ERROR_NOT_FOUND) {
 		return nil
 	}
 	return err
@@ -199,10 +229,8 @@ func GetLocalInterface(context.Context) (LocalInterface, error) {
 	}, nil
 }
 
-func isNotFoundOrExists(err error) bool {
-	return errors.Is(err, windows.ERROR_NOT_FOUND) ||
-		errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) ||
-		errors.Is(err, windows.ERROR_ALREADY_EXISTS)
+func isAlreadyExists(err error) bool {
+	return errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) || errors.Is(err, windows.ERROR_ALREADY_EXISTS)
 }
 
 func addrsToHostPrefixes(addrs []netip.Addr) []netip.Prefix {

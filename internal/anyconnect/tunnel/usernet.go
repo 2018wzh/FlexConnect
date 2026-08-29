@@ -149,7 +149,7 @@ func (t *userTunnel) userTunToPayloadOut() {
 		if dev == nil {
 			return
 		}
-		pl := getPayloadBuffer()
+		pl := getPayloadBuffer(t.cSess.MTU)
 		bufs := [][]byte{pl.Data}
 		sizes := []int{0}
 		readCount, err := dev.Read(bufs, sizes, 0)
