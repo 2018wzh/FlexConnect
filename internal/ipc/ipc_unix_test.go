@@ -9,7 +9,7 @@ import (
 )
 
 func TestListenUsesRestrictedModeAndCleansUp(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "flexconnect.sock")
+	path := filepath.Join(shortSocketTempDir(t), "flexconnect.sock")
 	listener, err := Listen(path)
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +30,7 @@ func TestListenUsesRestrictedModeAndCleansUp(t *testing.T) {
 }
 
 func TestListenRefusesToReplaceRegularFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "flexconnect.sock")
+	path := filepath.Join(shortSocketTempDir(t), "flexconnect.sock")
 	if err := os.WriteFile(path, []byte("do not replace"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -44,4 +44,18 @@ func TestListenRefusesToReplaceRegularFile(t *testing.T) {
 	if string(data) != "do not replace" {
 		t.Fatalf("regular file changed: %q", data)
 	}
+}
+
+func shortSocketTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "fc-ipc-")
+	if err != nil {
+		t.Fatalf("create socket temp directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove socket temp directory: %v", err)
+		}
+	})
+	return dir
 }
