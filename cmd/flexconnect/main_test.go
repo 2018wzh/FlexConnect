@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"flexconnect/client/local"
+	"flexconnect/internal/loginprobe"
 	"flexconnect/internal/netcheck"
 	"flexconnect/internal/types"
 )
@@ -19,7 +22,30 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func stubLoginProbes(t *testing.T, groups []string, verifyResults []error) *[]loginprobe.Options {
+	t.Helper()
+	previousFetch, previousVerify := loginFetchGroups, loginVerify
+	loginFetchGroups = func(ctx context.Context, serverURL string) ([]string, error) {
+		return groups, nil
+	}
+	var seen []loginprobe.Options
+	loginVerify = func(ctx context.Context, opts loginprobe.Options) error {
+		seen = append(seen, opts)
+		if len(verifyResults) == 0 {
+			return nil
+		}
+		err := verifyResults[0]
+		verifyResults = verifyResults[1:]
+		return err
+	}
+	t.Cleanup(func() {
+		loginFetchGroups, loginVerify = previousFetch, previousVerify
+	})
+	return &seen
+}
+
 func TestInteractiveLoginStartsTimeoutAfterInput(t *testing.T) {
+	stubLoginProbes(t, []string{"engineering", "sales"}, nil)
 	inputReader, inputWriter := io.Pipe()
 	defer inputReader.Close()
 
@@ -49,7 +75,7 @@ func TestInteractiveLoginStartsTimeoutAfterInput(t *testing.T) {
 
 	go func() {
 		time.Sleep(40 * time.Millisecond)
-		_, _ = io.WriteString(inputWriter, "https://vpn.example.com\nalice\npassword\ncorp\nengineering\n")
+		_, _ = io.WriteString(inputWriter, "https://vpn.example.com\n1\nalice\npassword\ncorp\n")
 		_ = inputWriter.Close()
 	}()
 
@@ -68,6 +94,7 @@ func TestInteractiveLoginStartsTimeoutAfterInput(t *testing.T) {
 }
 
 func TestRunChecksDaemonBeforeInteractiveLogin(t *testing.T) {
+	stubLoginProbes(t, []string{"engineering"}, nil)
 	inputReader, inputWriter := io.Pipe()
 	defer inputReader.Close()
 
@@ -95,7 +122,7 @@ func TestRunChecksDaemonBeforeInteractiveLogin(t *testing.T) {
 	})}
 
 	go func() {
-		_, _ = io.WriteString(inputWriter, "https://vpn.example.com\nalice\npassword\ncorp\nengineering\n")
+		_, _ = io.WriteString(inputWriter, "https://vpn.example.com\n1\nalice\npassword\ncorp\n")
 		_ = inputWriter.Close()
 	}()
 
@@ -110,6 +137,132 @@ func TestRunChecksDaemonBeforeInteractiveLogin(t *testing.T) {
 	want := []string{"/v2/live", "/v2/ready", "/v2/profiles", "/v2/status", "/v2/profiles"}
 	if strings.Join(paths, ",") != strings.Join(want, ",") {
 		t.Fatalf("request paths = %v, want %v", paths, want)
+	}
+}
+
+func TestInteractiveLoginVerifiesBeforeSavingProfile(t *testing.T) {
+	seen := stubLoginProbes(t, []string{"engineering", "sales"}, nil)
+	var output strings.Builder
+	req, err := promptLoginRequest(context.Background(),
+		strings.NewReader("https://vpn.example.com\nengineering\nalice\nhunter2\ncorp\n"), &output)
+	if err != nil {
+		t.Fatalf("promptLoginRequest: %v", err)
+	}
+	if req != (types.LoginRequest{
+		Name: "corp", ServerURL: "https://vpn.example.com",
+		Username: "alice", Group: "engineering", Password: "hunter2",
+	}) {
+		t.Fatalf("login request = %+v", req)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("verification calls = %d, want 1", len(*seen))
+	}
+	if got := (*seen)[0]; got.Group != "engineering" || got.Username != "alice" || got.Password != "hunter2" {
+		t.Fatalf("verification options = %+v", got)
+	}
+	for _, want := range []string{
+		"Connection test succeeded. Available user groups:",
+		"1. engineering",
+		"2. sales",
+		"Verifying login...",
+		"Login verified; saving profile",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("output %q missing %q", output.String(), want)
+		}
+	}
+}
+
+func TestInteractiveLoginRetriesFailedVerification(t *testing.T) {
+	rejected := errors.New("Authentication failed")
+	seen := stubLoginProbes(t, []string{"engineering", "sales"}, []error{rejected})
+	var output strings.Builder
+	req, err := promptLoginRequest(context.Background(),
+		strings.NewReader("https://vpn.example.com\n2\nalice\nbadpass\n1\nalice\ngoodpass\ncorp\n"), &output)
+	if err != nil {
+		t.Fatalf("promptLoginRequest: %v", err)
+	}
+	if req.Group != "engineering" || req.Username != "alice" || req.Password != "goodpass" {
+		t.Fatalf("login request = %+v", req)
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("verification calls = %d, want 2", len(*seen))
+	}
+	if (*seen)[0].Password != "badpass" || (*seen)[0].Group != "sales" {
+		t.Fatalf("first verification = %+v", (*seen)[0])
+	}
+	if !strings.Contains(output.String(), "Login verification failed: Authentication failed") {
+		t.Fatalf("output %q missing failure message", output.String())
+	}
+	if !strings.Contains(output.String(), "Re-enter the VPN group, username, and password") {
+		t.Fatalf("output %q missing re-entry prompt", output.String())
+	}
+}
+
+func TestInteractiveLoginRetriesServerConnectionTest(t *testing.T) {
+	previousFetch, previousVerify := loginFetchGroups, loginVerify
+	defer func() { loginFetchGroups, loginVerify = previousFetch, previousVerify }()
+	calls := 0
+	loginFetchGroups = func(ctx context.Context, serverURL string) ([]string, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("dial tcp: connection refused")
+		}
+		return []string{"engineering"}, nil
+	}
+	loginVerify = func(ctx context.Context, opts loginprobe.Options) error { return nil }
+
+	var output strings.Builder
+	req, err := promptLoginRequest(context.Background(),
+		strings.NewReader("https://typo.example.com\nhttps://vpn.example.com\n\nalice\npassword\n\n"), &output)
+	if err != nil {
+		t.Fatalf("promptLoginRequest: %v", err)
+	}
+	if req.ServerURL != "https://vpn.example.com" || req.Group != "engineering" {
+		t.Fatalf("login request = %+v", req)
+	}
+	if !strings.Contains(output.String(), "Connection test failed: dial tcp: connection refused") {
+		t.Fatalf("output %q missing connection failure", output.String())
+	}
+}
+
+func TestPromptGroupSelection(t *testing.T) {
+	tests := []struct {
+		name   string
+		groups []string
+		input  string
+		want   string
+		output []string
+	}{
+		{name: "index selection", groups: []string{"engineering", "sales"}, input: "2\n", want: "sales"},
+		{name: "name selection", groups: []string{"engineering", "sales"}, input: "engineering\n", want: "engineering"},
+		{name: "default first group", groups: []string{"engineering", "sales"}, input: "\n", want: "engineering"},
+		{
+			name:   "unknown group re-prompts",
+			groups: []string{"engineering", "sales"},
+			input:  "bogus\nsales\n",
+			want:   "sales",
+			output: []string{`Unknown group "bogus"; choose one of: engineering, sales`},
+		},
+		{name: "free text without advertised groups", groups: nil, input: "mygroup\n", want: "mygroup"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := bufio.NewReader(strings.NewReader(test.input))
+			var output strings.Builder
+			got, err := promptGroupSelection(reader, &output, test.groups)
+			if err != nil {
+				t.Fatalf("promptGroupSelection: %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("group = %q, want %q", got, test.want)
+			}
+			for _, want := range test.output {
+				if !strings.Contains(output.String(), want) {
+					t.Fatalf("output %q missing %q", output.String(), want)
+				}
+			}
+		})
 	}
 }
 

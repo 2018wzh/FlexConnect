@@ -18,6 +18,7 @@ import (
 	"flexconnect/internal/buildinfo"
 	"flexconnect/internal/ipc"
 	"flexconnect/internal/logging"
+	"flexconnect/internal/loginprobe"
 	"flexconnect/internal/netcheck"
 	"flexconnect/internal/types"
 	"golang.org/x/term"
@@ -347,8 +348,17 @@ func runCommand(ctx context.Context, client *local.Client, args []string) error 
 	}
 }
 
+// loginFetchGroups and loginVerify are package variables so tests can stub
+// the network probes that back the interactive login flow.
+var (
+	loginFetchGroups = loginprobe.FetchGroups
+	loginVerify      = loginprobe.VerifyCredentials
+)
+
+const loginProbeTimeout = 45 * time.Second
+
 func runInteractiveLogin(parent context.Context, client *local.Client, in io.Reader, out io.Writer, timeout time.Duration) error {
-	req, err := promptLoginRequest(in, out)
+	req, err := promptLoginRequest(parent, in, out)
 	if err != nil {
 		return err
 	}
@@ -499,17 +509,47 @@ func readSecretInput(path string, fromStdin bool, in io.Reader) (string, bool, e
 	return secret, true, nil
 }
 
-func promptLoginRequest(in io.Reader, out io.Writer) (types.LoginRequest, error) {
+func promptLoginRequest(ctx context.Context, in io.Reader, out io.Writer) (types.LoginRequest, error) {
 	reader := bufio.NewReader(in)
-	server, err := promptRequiredValue(reader, out, "Server URL")
-	if err != nil {
+
+	var groups []string
+	var server string
+	for {
+		var err error
+		server, err = promptRequiredValue(reader, out, "Server URL")
+		if err != nil {
+			return types.LoginRequest{}, err
+		}
+		if _, err := fmt.Fprintf(out, "Testing connection to %s...\n", server); err != nil {
+			return types.LoginRequest{}, err
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, loginProbeTimeout)
+		groups, err = loginFetchGroups(probeCtx, server)
+		cancel()
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return types.LoginRequest{}, ctx.Err()
+		}
+		if _, err := fmt.Fprintf(out, "Connection test failed: %v\n", err); err != nil {
+			return types.LoginRequest{}, err
+		}
+	}
+	if len(groups) != 0 {
+		if _, err := fmt.Fprintf(out, "Connection test succeeded. Available user groups:\n"); err != nil {
+			return types.LoginRequest{}, err
+		}
+		for i, group := range groups {
+			if _, err := fmt.Fprintf(out, "  %d. %s\n", i+1, group); err != nil {
+				return types.LoginRequest{}, err
+			}
+		}
+	} else if _, err := fmt.Fprintf(out, "Connection test succeeded. The server does not advertise user groups.\n"); err != nil {
 		return types.LoginRequest{}, err
 	}
-	user, err := promptRequiredValue(reader, out, "Username")
-	if err != nil {
-		return types.LoginRequest{}, err
-	}
-	password, err := promptSecretValue(reader, in, out, "Password")
+
+	group, user, password, err := promptVerifiedCredentials(ctx, reader, in, out, server, groups)
 	if err != nil {
 		return types.LoginRequest{}, err
 	}
@@ -517,8 +557,11 @@ func promptLoginRequest(in io.Reader, out io.Writer) (types.LoginRequest, error)
 	if err != nil {
 		return types.LoginRequest{}, err
 	}
-	group, err := promptValue(reader, out, "VPN group", true)
-	if err != nil {
+	saveMessage := "Login verified; saving profile..."
+	if name != "" {
+		saveMessage = fmt.Sprintf("Login verified; saving profile %q...", name)
+	}
+	if _, err := fmt.Fprintf(out, "%s\n", saveMessage); err != nil {
 		return types.LoginRequest{}, err
 	}
 	return types.LoginRequest{
@@ -528,6 +571,82 @@ func promptLoginRequest(in io.Reader, out io.Writer) (types.LoginRequest, error)
 		Group:     group,
 		Password:  password,
 	}, nil
+}
+
+// promptVerifiedCredentials loops until the server accepts the group,
+// username, and password combination, re-prompting all three fields after
+// each failed verification.
+func promptVerifiedCredentials(ctx context.Context, reader *bufio.Reader, in io.Reader, out io.Writer, server string, groups []string) (group, user, password string, err error) {
+	group, err = promptGroupSelection(reader, out, groups)
+	if err != nil {
+		return "", "", "", err
+	}
+	for {
+		user, err = promptRequiredValue(reader, out, "Username")
+		if err != nil {
+			return "", "", "", err
+		}
+		password, err = promptSecretValue(reader, in, out, "Password")
+		if err != nil {
+			return "", "", "", err
+		}
+		if _, err := fmt.Fprintf(out, "Verifying login...\n"); err != nil {
+			return "", "", "", err
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, loginProbeTimeout)
+		verifyErr := loginVerify(probeCtx, loginprobe.Options{
+			ServerURL: server, Group: group, Username: user, Password: password,
+			Timeout: loginProbeTimeout,
+		})
+		cancel()
+		if verifyErr == nil {
+			return group, user, password, nil
+		}
+		if ctx.Err() != nil {
+			return "", "", "", ctx.Err()
+		}
+		if _, err := fmt.Fprintf(out, "Login verification failed: %v\n", verifyErr); err != nil {
+			return "", "", "", err
+		}
+		if _, err := fmt.Fprintf(out, "Re-enter the VPN group, username, and password (Ctrl-C to cancel).\n"); err != nil {
+			return "", "", "", err
+		}
+		group, err = promptGroupSelection(reader, out, groups)
+		if err != nil {
+			return "", "", "", err
+		}
+	}
+}
+
+// promptGroupSelection asks for one of the advertised groups, accepting either
+// the printed index or the exact group name. Without a group list it behaves
+// like an optional free-text prompt.
+func promptGroupSelection(reader *bufio.Reader, out io.Writer, groups []string) (string, error) {
+	if len(groups) == 0 {
+		return promptValue(reader, out, "VPN group", true)
+	}
+	for {
+		value, err := promptValue(reader, out, fmt.Sprintf("VPN group [1-%d, default 1]", len(groups)), false)
+		if err != nil {
+			return "", err
+		}
+		if value == "" {
+			return groups[0], nil
+		}
+		if index, convErr := strconv.Atoi(value); convErr == nil {
+			if index >= 1 && index <= len(groups) {
+				return groups[index-1], nil
+			}
+		}
+		for _, group := range groups {
+			if value == group {
+				return group, nil
+			}
+		}
+		if _, err := fmt.Fprintf(out, "Unknown group %q; choose one of: %s\n", value, strings.Join(groups, ", ")); err != nil {
+			return "", err
+		}
+	}
 }
 
 func promptRequiredValue(reader *bufio.Reader, out io.Writer, label string) (string, error) {
@@ -564,6 +683,8 @@ func promptValue(reader *bufio.Reader, out io.Writer, label string, optional boo
 	return value, nil
 }
 
+// promptSecretValue reads a secret, echoing one '*' per typed character on
+// terminals and falling back to a plain line read when input is piped.
 func promptSecretValue(reader *bufio.Reader, in io.Reader, out io.Writer, label string) (string, error) {
 	file, ok := in.(*os.File)
 	if !ok || !term.IsTerminal(int(file.Fd())) {
@@ -572,14 +693,97 @@ func promptSecretValue(reader *bufio.Reader, in io.Reader, out io.Writer, label 
 	if _, err := fmt.Fprintf(out, "%s: ", label); err != nil {
 		return "", err
 	}
-	line, err := term.ReadPassword(int(file.Fd()))
-	if _, writeErr := fmt.Fprintln(out); writeErr != nil && err == nil {
-		err = writeErr
-	}
+	line, err := readMaskedLine(file, out)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(line)), nil
+	return strings.TrimSpace(line), nil
+}
+
+// readMaskedLine reads one line from a terminal in raw mode, printing '*' for
+// each accepted byte. It supports backspace, Ctrl-U (clear line), Ctrl-C
+// (cancel), and Ctrl-D on an empty line (EOF). Escape sequences such as arrow
+// keys are discarded instead of being mixed into the secret.
+func readMaskedLine(file *os.File, out io.Writer) (string, error) {
+	fd := int(file.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = term.Restore(fd, oldState) }()
+
+	var buf []byte
+	single := make([]byte, 1)
+	for {
+		n, err := file.Read(single)
+		if err != nil {
+			if err == io.EOF && len(buf) > 0 {
+				if _, err := fmt.Fprintln(out); err != nil {
+					return "", err
+				}
+				return string(buf), nil
+			}
+			return "", err
+		}
+		if n == 0 {
+			continue
+		}
+		switch b := single[0]; b {
+		case '\r', '\n':
+			if _, err := fmt.Fprintln(out); err != nil {
+				return "", err
+			}
+			return string(buf), nil
+		case 0x7f, 0x08:
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+				if _, err := out.Write([]byte("\b \b")); err != nil {
+					return "", err
+				}
+			}
+		case 0x03:
+			if _, err := fmt.Fprintln(out, "^C"); err != nil {
+				return "", err
+			}
+			return "", errors.New("input interrupted")
+		case 0x04:
+			if len(buf) == 0 {
+				if _, err := fmt.Fprintln(out); err != nil {
+					return "", err
+				}
+				return "", io.EOF
+			}
+		case 0x15:
+			for len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+				if _, err := out.Write([]byte("\b \b")); err != nil {
+					return "", err
+				}
+			}
+		case 0x1b:
+			// Swallow CSI/SS3 escape sequences (arrow keys, Home, ...) so
+			// their payload bytes never join the secret.
+			if n, err := file.Read(single); err != nil || n == 0 {
+				if err != nil && err != io.EOF {
+					return "", err
+				}
+				continue
+			}
+			if single[0] == '[' || single[0] == 'O' {
+				if _, err := file.Read(single); err != nil && err != io.EOF {
+					return "", err
+				}
+			}
+		case 0x00, 0x01, 0x02, 0x05, 0x06, 0x07, 0x09, 0x0b, 0x0c, 0x0e, 0x0f,
+			0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1c, 0x1d, 0x1e, 0x1f:
+			// Ignore other control characters.
+		default:
+			buf = append(buf, b)
+			if _, err := out.Write([]byte("*")); err != nil {
+				return "", err
+			}
+		}
+	}
 }
 
 func runUp(ctx context.Context, client *local.Client, args []string) error {
@@ -1372,7 +1576,7 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 		"login": {
 			Name:        "login",
 			Usage:       "flexconnect login [--server <url> --user <username> (--password-file <path> | --password-stdin) --name <profile-name> --group <group>]",
-			Description: "Create or update a profile, log in, and keep it as the last used profile. With no flags, prompts for the connection details interactively.",
+			Description: "Create or update a profile, log in, and keep it as the last used profile. With no flags, prompts interactively: the server URL is connection-tested to list the available user groups, then group, username, and password are verified against the server (password input echoes '*') before the profile is saved.",
 			Examples: []string{
 				"flexconnect login",
 				"flexconnect login --server https://vpn.example.com --user alice --password-file ./secrets/flexconnect_password --name corp",

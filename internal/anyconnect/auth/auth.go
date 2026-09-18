@@ -64,6 +64,7 @@ type Client struct {
 	BufR           *bufio.Reader
 	WebVpnCookie   string
 	LocalInterface base.Interface
+	serverGroups   []string
 }
 
 func NewClient(profile Profile, local base.Interface) *Client {
@@ -119,6 +120,13 @@ func (c *Client) Close() error {
 	c.Conn = nil
 	c.BufR = nil
 	return err
+}
+
+// ServerGroups returns the user groups advertised by the server login form
+// during the most recent InitAuth call. The result is empty when the server
+// does not expose a group list.
+func (c *Client) ServerGroups() []string {
+	return append([]string(nil), c.serverGroups...)
 }
 
 const (
@@ -180,6 +188,7 @@ func (c *Client) InitAuth(localAddr net.Addr) error {
 	c.Prof.TunnelGroup = dtd.Opaque.TunnelGroup
 	c.Prof.GroupAlias = dtd.Opaque.GroupAlias
 	c.Prof.ConfigHash = dtd.Opaque.ConfigHash
+	c.serverGroups = append([]string(nil), dtd.Auth.Form.Groups...)
 	if len(dtd.Auth.Form.Groups) != 0 && !utils.InArray(dtd.Auth.Form.Groups, c.Prof.Group) {
 		return fmt.Errorf("available user groups are: %s", strings.Join(dtd.Auth.Form.Groups, " "))
 	}
